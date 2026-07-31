@@ -1,0 +1,175 @@
+"""Wraps the `claude` CLI as a single-invocation-at-a-time subprocess call.
+
+Why single-invocation-at-a-time, system-wide (see _lock below), not just
+per-conversation: the old claude-auth-refresher CronJob died because
+multiple PODS shared one OAuth token file and each refreshed independently
+-- whichever refreshed first invalidated the token for the others. This
+service avoids that by being the only process anywhere that holds the
+credential, but a second risk remains even within one pod: the CLI's own
+token refresh is a side effect of *any* invocation, so two concurrent
+invocations (different conversations, same pod) could still race each
+other on the same underlying refresh. Unverified until live-tested against
+the real subscription -- the lock is the deliberately conservative default
+until that's confirmed safe to relax. Synchronous/blocking throughout,
+matching agora-persona-runner's own style (no asyncio anywhere in that
+codebase) -- serializing on a plain threading.Lock is simpler than
+asyncio.Lock across ThreadingHTTPServer's per-request threads, and there's
+no upside to async here since we want serialization, not parallelism.
+"""
+import json
+import os
+import subprocess
+import threading
+import time
+
+from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
+from bridge.log import log
+
+SESSION_NOT_FOUND = "\x00SESSION_NOT_FOUND"
+
+# Chat mode (2026-07-31 design decision): no filesystem/bash tools for v1 --
+# a dev-agent mode with real git/gh access is a deliberately separate later
+# phase (Evolve-Coder use case), not this. Defense in depth beyond just "we
+# don't need them": explicitly disallowed so a prompt injection or model
+# mistake can't reach the filesystem even by accident. Flag names/values
+# need live verification against the installed CLI version -- see the
+# bench-test task before this is relied on for anything real.
+CHAT_MODE_DISALLOWED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+
+
+class UsageLimitError(Exception):
+    """Real, hours-long subscription usage cap -- distinct from a transient
+    per-call error. Callers should NOT retry immediately."""
+
+
+class ClaudeCliError(Exception):
+    """Any other CLI failure -- transient, a real bug, or unparseable output."""
+
+
+def _detect_usage_limit(text):
+    """Best-effort text match on the CLI's own error output. Unverified
+    against a real usage-cap response -- the raw-API equivalent (old
+    agent-runtime's providers/claude.py) matched "You've hit your limit" in
+    the Messages API's JSON error body, but the CLI's own wording may
+    differ. Update this the first time a real cap is actually hit."""
+    lowered = text.lower()
+    return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
+
+
+def _run_cli_once(message, session_id, model):
+    os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
+    claude_dir = os.path.join(CLAUDE_HOME, ".claude")
+    os.makedirs(claude_dir, exist_ok=True)
+    env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir}
+
+    cmd = [
+        "claude", "-p", message,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--disallowedTools", CHAT_MODE_DISALLOWED_TOOLS,
+    ]
+    if session_id:
+        cmd.extend(["--resume", session_id])
+    if model:
+        cmd.extend(["--model", model])
+
+    log(f"CLI start: session={session_id} model={model} msg={message[:120]!r}")
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=CLAUDE_WORKSPACE,
+        env=env,
+        text=True,
+    )
+
+    text_parts = []
+    thinking_parts = []
+    new_session_id = session_id or ""
+    saw_error = None
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                log(f"CLI non-JSON stdout: {line[:300]!r}")
+                continue
+
+            t = event.get("type", "")
+            if t == "assistant":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "thinking":
+                        thought = block.get("thinking", "").strip()
+                        if thought:
+                            thinking_parts.append(thought)
+                    elif block.get("type") == "text":
+                        chunk = block.get("text", "")
+                        if chunk:
+                            text_parts.append(chunk)
+            elif t in ("result", "system"):
+                sid = event.get("session_id", "")
+                if sid:
+                    new_session_id = sid
+                subtype = event.get("subtype", "")
+                if subtype == "error_during_execution":
+                    errors = event.get("errors", [])
+                    error_text = " ".join(str(e) for e in errors)
+                    log(f"CLI error_during_execution: {error_text[:300]}")
+                    if any("No conversation found" in str(e) for e in errors):
+                        saw_error = (SESSION_NOT_FOUND, "")
+                    elif _detect_usage_limit(error_text):
+                        saw_error = ("usage_limit", error_text[:300])
+                    else:
+                        saw_error = ("error", error_text[:300])
+
+        try:
+            proc.wait(timeout=CLI_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise ClaudeCliError(f"CLI timed out after {CLI_TIMEOUT_SECONDS}s")
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+
+    elapsed = time.monotonic() - t0
+    log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "
+        f"text_len={len(''.join(text_parts))} thinking_len={len(''.join(thinking_parts))} "
+        f"new_session={new_session_id}")
+
+    if saw_error is not None:
+        kind, detail = saw_error
+        if kind == SESSION_NOT_FOUND:
+            raise ClaudeCliError(SESSION_NOT_FOUND)
+        if kind == "usage_limit":
+            raise UsageLimitError(detail)
+        raise ClaudeCliError(detail)
+
+    text = "\n".join(text_parts).strip()
+    thinking = "\n\n".join(thinking_parts).strip()
+    if not text:
+        raise ClaudeCliError("CLI produced no text output")
+    return text, thinking, new_session_id
+
+
+# Serializes every real subprocess invocation across the whole process --
+# see this module's own docstring for why.
+_invocation_lock = threading.Lock()
+
+
+def run_turn(message, session_id=None, model=None):
+    """One turn. Returns (text, thinking, new_session_id).
+
+    Raises UsageLimitError on a real subscription cap, ClaudeCliError on
+    anything else that prevented a usable reply (including the
+    SESSION_NOT_FOUND sentinel message -- callers should clear their stored
+    session_id and retry once with session_id=None on that specific case).
+    """
+    with _invocation_lock:
+        return _run_cli_once(message, session_id, model)
