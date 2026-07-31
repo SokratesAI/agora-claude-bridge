@@ -1,0 +1,107 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: sokratesai/${{ github.event.repository.name }}
+  CONFIG_REPO: SokratesAI/${{ github.event.repository.name }}-config
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan
+        # gitleaks/gitleaks-action@v2 requires a paid GITLEAKS_LICENSE for org repos —
+        # the underlying gitleaks CLI is free/OSS, run that directly instead.
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --no-banner --redact
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: npm run build
+      - run: npm test
+
+  build-push:
+    if: github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # Commits the new image digest to this service's paired config repo, which
+  # ArgoCD's SCM Provider generator auto-deploys — no platform-config PR, no
+  # manual step. Authenticates as a GitHub App installation, scoped by this
+  # step to ONLY this repo's own -config repo (never broader). ORG_APP_ID/
+  # ORG_APP_PRIVATE_KEY are repo-scoped Actions secrets that this Composition
+  # itself provisions on every source repo it creates (see the
+  # source-actions-secret-* resources in this Composition) — not org-level
+  # secrets, which GitHub gates behind a paid plan for private repos. See
+  # Platform-Product-Catalog's _context.md in the vault for why a GitHub App
+  # instead of a PAT. Byte-identical across every service template instance —
+  # nothing here is per-service except GitHub's own repository context, so
+  # nothing needed substituting at repo-creation time.
+  update-manifest:
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate installation token scoped to the config repo only
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ORG_APP_ID }}
+          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+          owner: SokratesAI
+          repositories: ${{ github.event.repository.name }}-config
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CONFIG_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Update image digest in manifest.yaml
+        run: |
+          sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-push.outputs.digest }}|" manifest.yaml
+          git config user.name "sokratesai-repo-committer[bot]"
+          git config user.email "sokratesai-repo-committer[bot]@users.noreply.github.com"
+          git add manifest.yaml
+          if git diff --staged --quiet; then
+            echo "no manifest change, skipping commit"
+          else
+            git commit -m "Update image to ${{ needs.build-push.outputs.digest }}"
+            git push
+          fi
