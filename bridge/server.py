@@ -17,7 +17,7 @@ from bridge.cli import (
 )
 
 
-def generate(conversation_id, system, prompt, model=None, restricted=False):
+def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
     """One turn for one conversation. First turn (no stored session)
     prepends the system/persona prompt to the message -- a resumed session
     already has that context from turn 1, so later turns send just the new
@@ -27,7 +27,25 @@ def generate(conversation_id, system, prompt, model=None, restricted=False):
     known tool roster (DISCOVERED_FULL_TOOL_ROSTER) for this call --
     Edvard's call is that this service should be as capable as an
     interactive Claude Code session by default, with restriction an
-    explicit per-persona opt-in rather than a silent default."""
+    explicit per-persona opt-in rather than a silent default.
+
+    stateless (2026-08-01, off by default): when true, never reads or
+    writes this conversation's stored session_id -- every call gets the
+    full system+prompt and starts a fresh CLI session with no --resume.
+    Built for the Evolve workflow: its steps are deliberately bounded,
+    single-purpose invocations that should only carry the context their
+    own prompt gives them, not an ever-growing CLI-side memory of every
+    prior cycle (that's what the vault journal is for -- see identity.md).
+    An ordinary chat persona wants the opposite (continuity across turns),
+    which is why this is opt-in, not the new default."""
+    if stateless:
+        message = f"{system}\n\n{prompt}"
+        text, thinking, _ = run_turn(
+            message, session_id=None, model=model,
+            disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
+        )
+        return text, thinking
+
     session_id = get_session_id(conversation_id)
     message = f"{system}\n\n{prompt}" if not session_id else prompt
     disallowed_tools = DISCOVERED_FULL_TOOL_ROSTER if restricted else None
@@ -88,8 +106,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             system = payload.get("system", "")
             model = payload.get("model")
             restricted = bool(payload.get("restricted", False))
+            stateless = bool(payload.get("stateless", False))
 
-            text, thinking = generate(conversation_id, system, prompt, model=model, restricted=restricted)
+            text, thinking = generate(
+                conversation_id, system, prompt, model=model, restricted=restricted, stateless=stateless,
+            )
             self._send(200, {"text": text, "thinking": thinking})
         except UsageLimitError as e:
             self._send(429, {"error": "usage_limit", "detail": str(e)[:300]})
