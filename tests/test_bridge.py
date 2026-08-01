@@ -451,6 +451,35 @@ def test_bootstrap_credentials_creates_file_from_env_vars(tmp_path):
     }
 
 
+def test_bootstrap_credentials_accepts_iso_8601_expires_at(tmp_path):
+    """Found live, 2026-08-01: the real claude-auth secret's expires_at is
+    an ISO 8601 string ("2026-08-01T18:22:21Z"), not an epoch-ms integer --
+    crash-looped in production on this exact input before the fix."""
+    env = {
+        "CLAUDE_ACCESS_TOKEN": "a", "CLAUDE_REFRESH_TOKEN": "r",
+        "CLAUDE_EXPIRES_AT": "2026-08-01T18:22:21Z",
+    }
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, env, clear=False):
+        credentials.bootstrap_credentials()
+
+    dest = tmp_path / ".claude" / ".credentials.json"
+    data = json.loads(dest.read_text())
+    assert data["claudeAiOauth"]["expiresAt"] == 1785608541000
+
+
+def test_parse_expires_at_ms_handles_iso_8601():
+    assert credentials._parse_expires_at_ms("2026-08-01T18:22:21Z") == 1785608541000
+
+
+def test_parse_expires_at_ms_handles_epoch_milliseconds():
+    assert credentials._parse_expires_at_ms("1735689600000") == 1735689600000
+
+
+def test_parse_expires_at_ms_handles_epoch_seconds():
+    assert credentials._parse_expires_at_ms("1735689600") == 1735689600000
+
+
 def test_bootstrap_credentials_sets_owner_only_permissions(tmp_path):
     env = {
         "CLAUDE_ACCESS_TOKEN": "a", "CLAUDE_REFRESH_TOKEN": "r", "CLAUDE_EXPIRES_AT": "123",
