@@ -38,6 +38,27 @@ retry immediately -- wait for the interval named in `detail`, or a few
 hours if none was parseable); `502 {"error": "cli_error"}` for anything
 else that prevented a usable reply.
 
+## Credentials
+
+`bridge/credentials.py` bootstraps `~/.claude/.credentials.json` from the
+`CLAUDE_CREDENTIALS_JSON` env var, once, on first boot only -- it never
+overwrites an existing file. Set that env var to the *complete, unmodified*
+contents of a real `~/.claude/.credentials.json` from a machine where
+`claude` is logged in (e.g. `agents/claude-auth`'s `credentials_json` key
+in the cluster). Deliberately no field-by-field reconstruction: an earlier
+version assembled the file from three separate fields (access token,
+refresh token, expiry) and the CLI's own client-side validation rejected
+it instantly ("Not logged in") -- the real file carries additional fields
+(`scopes`, etc.) that reconstruction had silently dropped. Piping the whole
+original file through sidesteps needing to know its exact schema.
+
+Once the CLI does its own real token refresh, the fresh credentials live
+*only* on the `CLAUDE_HOME` PVC -- the source secret's refresh token
+becomes single-use-stale at that point (same reason the old
+`claude-auth-refresher` CronJob died, see above). If credentials ever need
+a hard reset, delete `$CLAUDE_HOME/.claude/.credentials.json` from the PVC
+first, then restart the pod -- restarting alone never re-bootstraps.
+
 ## Local dev
 
 ```

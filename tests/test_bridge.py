@@ -423,69 +423,40 @@ def test_do_post_unknown_path_returns_404():
 
 
 # ---------------------------------------------------------------------------
-# credentials.py -- first-boot-only .credentials.json bootstrap from the
-# claude-auth secret's three separate keys. Deliberately never overwrites
-# an existing file -- see the module's own docstring for why (a live token
-# refresh only ever lands on the PVC, never back in the k8s Secret).
+# credentials.py -- first-boot-only .credentials.json bootstrap, piping the
+# claude-auth secret's raw JSON straight to disk unmodified. Deliberately
+# never overwrites an existing file -- see the module's own docstring for
+# why (a live token refresh only ever lands on the PVC, never back in the
+# k8s Secret).
 # ---------------------------------------------------------------------------
 
-def test_bootstrap_credentials_creates_file_from_env_vars(tmp_path):
-    env = {
-        "CLAUDE_ACCESS_TOKEN": "sk-ant-oat-test",
-        "CLAUDE_REFRESH_TOKEN": "sk-ant-ort-test",
-        "CLAUDE_EXPIRES_AT": "1735689600000",
+REAL_CREDS_JSON = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-ant-oat-test",
+        "refreshToken": "sk-ant-ort-test",
+        "expiresAt": 1785608541000,
+        "scopes": ["user:inference", "user:profile"],
+        "subscriptionType": "max",
     }
+})
+
+
+def test_bootstrap_credentials_writes_raw_json_unmodified(tmp_path):
     with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
-         patch.dict(os.environ, env, clear=False):
+         patch.dict(os.environ, {"CLAUDE_CREDENTIALS_JSON": REAL_CREDS_JSON}, clear=False):
         credentials.bootstrap_credentials()
 
     dest = tmp_path / ".claude" / ".credentials.json"
     assert dest.exists()
-    data = json.loads(dest.read_text())
-    assert data == {
-        "claudeAiOauth": {
-            "accessToken": "sk-ant-oat-test",
-            "refreshToken": "sk-ant-ort-test",
-            "expiresAt": 1735689600000,
-        }
-    }
-
-
-def test_bootstrap_credentials_accepts_iso_8601_expires_at(tmp_path):
-    """Found live, 2026-08-01: the real claude-auth secret's expires_at is
-    an ISO 8601 string ("2026-08-01T18:22:21Z"), not an epoch-ms integer --
-    crash-looped in production on this exact input before the fix."""
-    env = {
-        "CLAUDE_ACCESS_TOKEN": "a", "CLAUDE_REFRESH_TOKEN": "r",
-        "CLAUDE_EXPIRES_AT": "2026-08-01T18:22:21Z",
-    }
-    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
-         patch.dict(os.environ, env, clear=False):
-        credentials.bootstrap_credentials()
-
-    dest = tmp_path / ".claude" / ".credentials.json"
-    data = json.loads(dest.read_text())
-    assert data["claudeAiOauth"]["expiresAt"] == 1785608541000
-
-
-def test_parse_expires_at_ms_handles_iso_8601():
-    assert credentials._parse_expires_at_ms("2026-08-01T18:22:21Z") == 1785608541000
-
-
-def test_parse_expires_at_ms_handles_epoch_milliseconds():
-    assert credentials._parse_expires_at_ms("1735689600000") == 1735689600000
-
-
-def test_parse_expires_at_ms_handles_epoch_seconds():
-    assert credentials._parse_expires_at_ms("1735689600") == 1735689600000
+    # Byte-identical, not re-serialized -- no field-by-field reconstruction
+    # that could silently drop fields the CLI's own validation needs.
+    assert dest.read_text() == REAL_CREDS_JSON
+    assert json.loads(dest.read_text())["claudeAiOauth"]["scopes"] == ["user:inference", "user:profile"]
 
 
 def test_bootstrap_credentials_sets_owner_only_permissions(tmp_path):
-    env = {
-        "CLAUDE_ACCESS_TOKEN": "a", "CLAUDE_REFRESH_TOKEN": "r", "CLAUDE_EXPIRES_AT": "123",
-    }
     with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
-         patch.dict(os.environ, env, clear=False):
+         patch.dict(os.environ, {"CLAUDE_CREDENTIALS_JSON": REAL_CREDS_JSON}, clear=False):
         credentials.bootstrap_credentials()
 
     dest = tmp_path / ".claude" / ".credentials.json"
@@ -499,32 +470,26 @@ def test_bootstrap_credentials_never_overwrites_existing_file(tmp_path):
     dest = claude_dir / ".credentials.json"
     dest.write_text('{"claudeAiOauth": {"accessToken": "already-refreshed-by-cli"}}')
 
-    env = {
-        "CLAUDE_ACCESS_TOKEN": "stale-from-secret", "CLAUDE_REFRESH_TOKEN": "r", "CLAUDE_EXPIRES_AT": "123",
-    }
     with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
-         patch.dict(os.environ, env, clear=False):
+         patch.dict(os.environ, {"CLAUDE_CREDENTIALS_JSON": REAL_CREDS_JSON}, clear=False):
         credentials.bootstrap_credentials()
 
     data = json.loads(dest.read_text())
     assert data["claudeAiOauth"]["accessToken"] == "already-refreshed-by-cli"
 
 
-def test_bootstrap_credentials_skips_when_env_vars_missing(tmp_path):
+def test_bootstrap_credentials_skips_when_env_var_missing(tmp_path):
     with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
          patch.dict(os.environ, {}, clear=False):
-        for key in ("CLAUDE_ACCESS_TOKEN", "CLAUDE_REFRESH_TOKEN", "CLAUDE_EXPIRES_AT"):
-            os.environ.pop(key, None)
+        os.environ.pop("CLAUDE_CREDENTIALS_JSON", None)
         credentials.bootstrap_credentials()
 
     assert not (tmp_path / ".claude" / ".credentials.json").exists()
 
 
-def test_bootstrap_credentials_skips_when_only_some_env_vars_present(tmp_path):
+def test_bootstrap_credentials_skips_on_invalid_json(tmp_path):
     with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
-         patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "a"}, clear=False):
-        os.environ.pop("CLAUDE_REFRESH_TOKEN", None)
-        os.environ.pop("CLAUDE_EXPIRES_AT", None)
+         patch.dict(os.environ, {"CLAUDE_CREDENTIALS_JSON": "not valid json{{{"}, clear=False):
         credentials.bootstrap_credentials()
 
     assert not (tmp_path / ".claude" / ".credentials.json").exists()
