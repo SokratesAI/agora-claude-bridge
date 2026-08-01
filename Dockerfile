@@ -27,8 +27,28 @@ RUN curl -fsSLo /usr/local/bin/kubectl \
     "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
     && chmod +x /usr/local/bin/kubectl
 
+# git + gh -- 2026-08-01: the Evolve workflow's personas now run entirely
+# through this bridge (see the vault's Agora/_context.md) and need the same
+# real git clone/commit/push + gh pr create/diff/checks/merge workflow this
+# very session uses, since Agora's purpose-built github_read/create_pr/
+# merge_pr tools don't apply to a claude-cli persona at all. Credentials
+# come from GH_TOKEN at runtime (bridge/git_setup.py), not baked in here.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+RUN (type -p wget >/dev/null || apt-get update && apt-get install -y --no-install-recommends wget) \
+    && mkdir -p -m 755 /etc/apt/keyrings \
+    && wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# xxhash -- LiveSync's real chunk-id algorithm (bridge/vault_tool.py falls
+# back to sha256 if this is ever missing, same as agora_runner/vault.py).
+RUN pip install --no-cache-dir xxhash
+
 WORKDIR /app
-# No requirements.txt -- the bridge itself is stdlib-only at runtime.
+# No requirements.txt otherwise -- the bridge itself is stdlib-only at runtime.
 COPY bridge/ bridge/
 COPY run.py .
 

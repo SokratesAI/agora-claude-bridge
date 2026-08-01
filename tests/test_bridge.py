@@ -401,6 +401,52 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
     assert captured["disallowed_tools"] == server.DISCOVERED_FULL_TOOL_ROSTER
 
 
+def test_generate_stateless_always_sends_full_system_and_no_resume():
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+        captured["message"] = message
+        captured["session_id"] = session_id
+        return "reply", "", "sess-should-be-ignored"
+
+    with patch.object(server, "get_session_id") as mock_get, \
+         patch.object(server, "set_session_id") as mock_set, \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        text, _ = server.generate("conv-1", "system prompt", "hi", stateless=True)
+
+    assert text == "reply"
+    assert captured["message"] == "system prompt\n\nhi"
+    assert captured["session_id"] is None
+    mock_get.assert_not_called()  # never even looks up a stored session
+    mock_set.assert_not_called()  # and never persists the new one
+
+
+def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+        return "reply", "", "sess-x"
+
+    with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
+         patch.object(server, "set_session_id") as mock_set, \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "second call", stateless=True)
+
+    mock_get.assert_not_called()
+    mock_set.assert_not_called()
+
+
+def test_generate_stateless_can_combine_with_restricted():
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+        captured["disallowed_tools"] = disallowed_tools
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", restricted=True, stateless=True)
+
+    assert captured["disallowed_tools"] == server.DISCOVERED_FULL_TOOL_ROSTER
+
+
 class _FakeRequest:
     """Minimal socket-like object BaseHTTPRequestHandler needs at init."""
     def makefile(self, *a, **k):
@@ -454,7 +500,7 @@ def test_do_post_passes_restricted_flag_through_to_generate():
     )
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False):
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -468,7 +514,7 @@ def test_do_post_restricted_defaults_false_when_omitted():
     handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False):
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -476,6 +522,36 @@ def test_do_post_restricted_defaults_false_when_omitted():
          patch.object(server, "generate", side_effect=fake_generate):
         handler.do_POST()
     assert captured["restricted"] is False
+
+
+def test_do_post_passes_stateless_flag_through_to_generate():
+    handler, sent = _make_handler(
+        {"conversation_id": "c1", "prompt": "hi", "system": "sys", "stateless": True},
+    )
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+        captured["stateless"] = stateless
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=fake_generate):
+        handler.do_POST()
+    assert captured["stateless"] is True
+
+
+def test_do_post_stateless_defaults_false_when_omitted():
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+        captured["stateless"] = stateless
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=fake_generate):
+        handler.do_POST()
+    assert captured["stateless"] is False
 
 
 def test_do_post_usage_limit_returns_429():
