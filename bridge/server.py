@@ -12,25 +12,38 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bridge.config import BRIDGE_TOKEN, PORT
 from bridge.log import log
 from bridge.sessions import clear_session_id, get_session_id, set_session_id
-from bridge.cli import ClaudeCliError, UsageLimitError, SESSION_NOT_FOUND, run_turn
+from bridge.cli import (
+    ClaudeCliError, UsageLimitError, SESSION_NOT_FOUND, DISCOVERED_FULL_TOOL_ROSTER, run_turn,
+)
 
 
-def generate(conversation_id, system, prompt, model=None):
+def generate(conversation_id, system, prompt, model=None, restricted=False):
     """One turn for one conversation. First turn (no stored session)
     prepends the system/persona prompt to the message -- a resumed session
     already has that context from turn 1, so later turns send just the new
-    message, same as the old Slack bridge did."""
+    message, same as the old Slack bridge did.
+
+    restricted (2026-08-01, off by default): when true, blocks the full
+    known tool roster (DISCOVERED_FULL_TOOL_ROSTER) for this call --
+    Edvard's call is that this service should be as capable as an
+    interactive Claude Code session by default, with restriction an
+    explicit per-persona opt-in rather than a silent default."""
     session_id = get_session_id(conversation_id)
     message = f"{system}\n\n{prompt}" if not session_id else prompt
+    disallowed_tools = DISCOVERED_FULL_TOOL_ROSTER if restricted else None
 
     try:
-        text, thinking, new_session_id = run_turn(message, session_id=session_id, model=model)
+        text, thinking, new_session_id = run_turn(
+            message, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
+        )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
             log(f"conversation={conversation_id}: stored session gone, retrying fresh")
             clear_session_id(conversation_id)
             message = f"{system}\n\n{prompt}"
-            text, thinking, new_session_id = run_turn(message, session_id=None, model=model)
+            text, thinking, new_session_id = run_turn(
+                message, session_id=None, model=model, disallowed_tools=disallowed_tools,
+            )
         else:
             raise
 
@@ -74,8 +87,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             system = payload.get("system", "")
             model = payload.get("model")
+            restricted = bool(payload.get("restricted", False))
 
-            text, thinking = generate(conversation_id, system, prompt, model=model)
+            text, thinking = generate(conversation_id, system, prompt, model=model, restricted=restricted)
             self._send(200, {"text": text, "thinking": thinking})
         except UsageLimitError as e:
             self._send(429, {"error": "usage_limit", "detail": str(e)[:300]})

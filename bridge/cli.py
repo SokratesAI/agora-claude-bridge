@@ -27,14 +27,29 @@ from bridge.log import log
 
 SESSION_NOT_FOUND = "\x00SESSION_NOT_FOUND"
 
-# Chat mode (2026-07-31 design decision): no filesystem/bash tools for v1 --
-# a dev-agent mode with real git/gh access is a deliberately separate later
-# phase (Evolve-Coder use case), not this. Defense in depth beyond just "we
-# don't need them": explicitly disallowed so a prompt injection or model
-# mistake can't reach the filesystem even by accident. Flag names/values
-# need live verification against the installed CLI version -- see the
-# bench-test task before this is relied on for anything real.
-CHAT_MODE_DISALLOWED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+# 2026-08-01 design reversal: v1 shipped with a hardcoded, always-on
+# --disallowedTools restriction (the 8 "obvious" tools -- Bash/Read/Write/
+# Edit/Glob/Grep/WebFetch/WebSearch). Live-tested and found genuinely
+# incomplete: Claude Code ships a much larger built-in tool roster
+# (confirmed live via a real session's own system.init event -- the exact
+# list is DISCOVERED_FULL_TOOL_ROSTER below), and the model found and used
+# an unlisted one ("Monitor") to run real shell commands anyway. Edvard's
+# call: this service is meant to be as capable as an interactive Claude
+# Code session, same as this very session building it -- restriction should
+# be an explicit per-call opt-in, not a silent, incomplete default. Pass
+# disallowed_tools to run_turn/_run_cli_once to restrict a specific call;
+# omit it (the default) for full, unrestricted access.
+#
+# Kept here as a reference for anyone who DOES want to restrict a call --
+# this is the complete roster observed live on CLI version 2.1.197, not a
+# guess. Verify against a fresh `system.init` event if the CLI version
+# changes; new tools can be added between versions.
+DISCOVERED_FULL_TOOL_ROSTER = (
+    "Task,CronCreate,CronDelete,CronList,DesignSync,EnterWorktree,ExitWorktree,"
+    "Monitor,NotebookEdit,PushNotification,ReportFindings,ScheduleWakeup,SendMessage,"
+    "Skill,TaskCreate,TaskGet,TaskList,TaskOutput,TaskStop,TaskUpdate,ToolSearch,"
+    "Workflow,Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+)
 
 
 class UsageLimitError(Exception):
@@ -56,7 +71,7 @@ def _detect_usage_limit(text):
     return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
 
 
-def _run_cli_once(message, session_id, model):
+def _run_cli_once(message, session_id, model, disallowed_tools):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
@@ -67,8 +82,9 @@ def _run_cli_once(message, session_id, model):
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
-        "--disallowedTools", CHAT_MODE_DISALLOWED_TOOLS,
     ]
+    if disallowed_tools:
+        cmd.extend(["--disallowedTools", disallowed_tools])
     if session_id:
         cmd.extend(["--resume", session_id])
     if model:
@@ -163,8 +179,12 @@ def _run_cli_once(message, session_id, model):
 _invocation_lock = threading.Lock()
 
 
-def run_turn(message, session_id=None, model=None):
+def run_turn(message, session_id=None, model=None, disallowed_tools=None):
     """One turn. Returns (text, thinking, new_session_id).
+
+    disallowed_tools: comma-separated tool names to block for this call
+    (see DISCOVERED_FULL_TOOL_ROSTER above), or None/empty for full,
+    unrestricted access -- the default.
 
     Raises UsageLimitError on a real subscription cap, ClaudeCliError on
     anything else that prevented a usable reply (including the
@@ -172,4 +192,4 @@ def run_turn(message, session_id=None, model=None):
     session_id and retry once with session_id=None on that specific case).
     """
     with _invocation_lock:
-        return _run_cli_once(message, session_id, model)
+        return _run_cli_once(message, session_id, model, disallowed_tools)
