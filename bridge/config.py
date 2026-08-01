@@ -20,4 +20,9 @@ SESSIONS_FILE = os.path.join(CLAUDE_HOME, "agora-sessions.json")
 # Agora conversation, resumed via --resume across turns AND pod restarts.
 CLAUDE_WORKSPACE = os.environ.get("CLAUDE_WORKSPACE", "/data/workspace")
 
-CLI_TIMEOUT_SECONDS = int(os.environ.get("CLI_TIMEOUT_SECONDS", "300"))
+# 300s was the original default; live-tested 2026-08-01 with the Evolve
+# workflow's Coder step (real git clone + explore + edit + pytest + push +
+# gh pr create in one turn) and it timed out on round 1 -- a real coding
+# task routinely needs more than 5 minutes. 900s leaves headroom without
+# letting one stuck call block the bridge's single-instance lock forever.
+CLI_TIMEOUT_SECONDS = int(os.environ.get("CLI_TIMEOUT_SECONDS", "900"))
