@@ -169,9 +169,11 @@ def test_run_turn_omits_resume_flag_when_no_session_id(tmp_path):
     assert "--resume" not in captured["cmd"]
 
 
-def test_run_turn_always_disallows_filesystem_bash_tools(tmp_path):
-    """Chat mode (v1) -- defense in depth even though there's no other
-    reason for the model to reach for these tools."""
+def test_run_turn_is_unrestricted_by_default(tmp_path):
+    """2026-08-01 design reversal: no --disallowedTools flag at all unless
+    a caller explicitly asks for restriction -- the old always-on denylist
+    was live-tested and found incomplete (the model found and used an
+    unlisted tool, "Monitor", to run real shell commands anyway)."""
     lines = _stream_json_lines(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
         {"type": "result", "session_id": "sess-1", "subtype": "success"},
@@ -186,9 +188,35 @@ def test_run_turn_always_disallows_filesystem_bash_tools(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
         cli.run_turn("hello")
+    assert "--disallowedTools" not in captured["cmd"]
+
+
+def test_run_turn_applies_disallowed_tools_when_given(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", disallowed_tools="Bash,Write")
     assert "--disallowedTools" in captured["cmd"]
     disallowed = captured["cmd"][captured["cmd"].index("--disallowedTools") + 1]
-    assert "Bash" in disallowed and "Write" in disallowed
+    assert disallowed == "Bash,Write"
+
+
+def test_discovered_full_tool_roster_covers_the_tool_found_live():
+    """Monitor is the specific tool the model used live to escape the old
+    incomplete denylist -- must be in the roster anyone restricting a call
+    would actually use."""
+    assert "Monitor" in cli.DISCOVERED_FULL_TOOL_ROSTER
+    assert "Bash" in cli.DISCOVERED_FULL_TOOL_ROSTER
 
 
 def test_run_turn_raises_claude_cli_error_when_no_text_produced(tmp_path):
@@ -277,7 +305,7 @@ def test_run_turn_serializes_via_module_level_lock(tmp_path):
 def test_generate_prepends_system_prompt_on_first_turn():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply", "", "sess-new"
@@ -296,7 +324,7 @@ def test_generate_prepends_system_prompt_on_first_turn():
 def test_generate_sends_only_new_message_on_resumed_turn():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply2", "", "sess-existing"
@@ -313,7 +341,7 @@ def test_generate_sends_only_new_message_on_resumed_turn():
 def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
-    def fake_run_turn(message, session_id=None, model=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
         calls.append((message, session_id))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -334,13 +362,43 @@ def test_generate_retries_fresh_on_session_not_found():
 
 
 def test_generate_propagates_other_cli_errors_without_retry():
-    def fake_run_turn(message, session_id=None, model=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
          patch.object(server, "run_turn", side_effect=fake_run_turn):
         with pytest.raises(server.ClaudeCliError, match="a real bug"):
             server.generate("conv-1", "system", "hi")
+
+
+def test_generate_is_unrestricted_by_default():
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+        captured["disallowed_tools"] = disallowed_tools
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "get_session_id", return_value=None), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi")
+
+    assert captured["disallowed_tools"] is None
+
+
+def test_generate_restricted_true_passes_the_full_tool_roster():
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+        captured["disallowed_tools"] = disallowed_tools
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "get_session_id", return_value=None), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", restricted=True)
+
+    assert captured["disallowed_tools"] == server.DISCOVERED_FULL_TOOL_ROSTER
 
 
 class _FakeRequest:
@@ -388,6 +446,36 @@ def test_do_post_success_returns_text_and_thinking():
         handler.do_POST()
     assert sent["status"] == 200
     assert sent["payload"] == {"text": "the answer", "thinking": "some thought"}
+
+
+def test_do_post_passes_restricted_flag_through_to_generate():
+    handler, sent = _make_handler(
+        {"conversation_id": "c1", "prompt": "hi", "system": "sys", "restricted": True},
+    )
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False):
+        captured["restricted"] = restricted
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=fake_generate):
+        handler.do_POST()
+    assert captured["restricted"] is True
+
+
+def test_do_post_restricted_defaults_false_when_omitted():
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False):
+        captured["restricted"] = restricted
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=fake_generate):
+        handler.do_POST()
+    assert captured["restricted"] is False
 
 
 def test_do_post_usage_limit_returns_429():
