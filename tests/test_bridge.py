@@ -1,12 +1,13 @@
 import json
 import os
+import stat as stat_module
 import tempfile
 import threading
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from bridge import cli, sessions, server
+from bridge import cli, sessions, server, credentials
 
 
 # ---------------------------------------------------------------------------
@@ -419,3 +420,82 @@ def test_do_post_unknown_path_returns_404():
     with patch.object(server, "BRIDGE_TOKEN", ""):
         handler.do_POST()
     assert sent["status"] == 404
+
+
+# ---------------------------------------------------------------------------
+# credentials.py -- first-boot-only .credentials.json bootstrap from the
+# claude-auth secret's three separate keys. Deliberately never overwrites
+# an existing file -- see the module's own docstring for why (a live token
+# refresh only ever lands on the PVC, never back in the k8s Secret).
+# ---------------------------------------------------------------------------
+
+def test_bootstrap_credentials_creates_file_from_env_vars(tmp_path):
+    env = {
+        "CLAUDE_ACCESS_TOKEN": "sk-ant-oat-test",
+        "CLAUDE_REFRESH_TOKEN": "sk-ant-ort-test",
+        "CLAUDE_EXPIRES_AT": "1735689600000",
+    }
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, env, clear=False):
+        credentials.bootstrap_credentials()
+
+    dest = tmp_path / ".claude" / ".credentials.json"
+    assert dest.exists()
+    data = json.loads(dest.read_text())
+    assert data == {
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat-test",
+            "refreshToken": "sk-ant-ort-test",
+            "expiresAt": 1735689600000,
+        }
+    }
+
+
+def test_bootstrap_credentials_sets_owner_only_permissions(tmp_path):
+    env = {
+        "CLAUDE_ACCESS_TOKEN": "a", "CLAUDE_REFRESH_TOKEN": "r", "CLAUDE_EXPIRES_AT": "123",
+    }
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, env, clear=False):
+        credentials.bootstrap_credentials()
+
+    dest = tmp_path / ".claude" / ".credentials.json"
+    mode = stat_module.S_IMODE(os.stat(dest).st_mode)
+    assert mode == 0o600
+
+
+def test_bootstrap_credentials_never_overwrites_existing_file(tmp_path):
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    dest = claude_dir / ".credentials.json"
+    dest.write_text('{"claudeAiOauth": {"accessToken": "already-refreshed-by-cli"}}')
+
+    env = {
+        "CLAUDE_ACCESS_TOKEN": "stale-from-secret", "CLAUDE_REFRESH_TOKEN": "r", "CLAUDE_EXPIRES_AT": "123",
+    }
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, env, clear=False):
+        credentials.bootstrap_credentials()
+
+    data = json.loads(dest.read_text())
+    assert data["claudeAiOauth"]["accessToken"] == "already-refreshed-by-cli"
+
+
+def test_bootstrap_credentials_skips_when_env_vars_missing(tmp_path):
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, {}, clear=False):
+        for key in ("CLAUDE_ACCESS_TOKEN", "CLAUDE_REFRESH_TOKEN", "CLAUDE_EXPIRES_AT"):
+            os.environ.pop(key, None)
+        credentials.bootstrap_credentials()
+
+    assert not (tmp_path / ".claude" / ".credentials.json").exists()
+
+
+def test_bootstrap_credentials_skips_when_only_some_env_vars_present(tmp_path):
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "a"}, clear=False):
+        os.environ.pop("CLAUDE_REFRESH_TOKEN", None)
+        os.environ.pop("CLAUDE_EXPIRES_AT", None)
+        credentials.bootstrap_credentials()
+
+    assert not (tmp_path / ".claude" / ".credentials.json").exists()
