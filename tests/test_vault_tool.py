@@ -105,6 +105,86 @@ def test_delete_returns_absent_when_missing(env):
     assert client.delete("gone.md") == "absent"
 
 
+def _fake_find(docs, captured=None):
+    """Stand in for the module-level _req, answering the _find POST."""
+    def fake_req(method, base, db, auth, path, body=None):
+        assert (method, path) == ("POST", "_find")
+        if captured is not None:
+            captured.append(body)
+        return 200, {"docs": docs}
+    return fake_req
+
+
+def test_recent_drops_livesync_internals_and_backups_newest_first(env):
+    docs = [
+        {"_id": "h:deadbeef", "mtime": 5000},
+        {"_id": "agora/backups/20260803-114439 journal.md", "mtime": 4000},
+        {"_id": "projects/a.md", "mtime": 1000},
+        {"_id": "projects/b.md", "mtime": 3000},
+    ]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_find(docs)):
+        rows, truncated = client.recent(hours=6)
+    assert rows == [(3000, "projects/b.md"), (1000, "projects/a.md")]
+    assert truncated is False
+
+
+def test_recent_includes_backups_only_when_prefix_asks_for_them(env):
+    docs = [
+        {"_id": "agora/backups/20260803-114439 journal.md", "mtime": 4000},
+        {"_id": "projects/a.md", "mtime": 1000},
+    ]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_find(docs)):
+        rows, _ = client.recent(hours=6, prefix="agora/backups/")
+    assert [p for _, p in rows] == ["agora/backups/20260803-114439 journal.md"]
+
+
+def test_recent_selector_window_follows_hours(env):
+    captured = []
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_find([], captured)):
+        client.recent(hours=6)
+    since_six = captured[0]["selector"]["mtime"]["$gt"]
+    captured.clear()
+    with patch.object(vault_tool, "_req", _fake_find([], captured)):
+        client.recent(hours=12)
+    since_twelve = captured[0]["selector"]["mtime"]["$gt"]
+    # A wider window must reach further back -- ~6h more, allowing for the
+    # clock moving between the two calls.
+    assert 5.9 * 3600_000 < since_six - since_twelve < 6.1 * 3600_000
+
+
+def test_recent_reports_truncation_because_the_subset_is_arbitrary(env):
+    docs = [{"_id": f"projects/{i}.md", "mtime": i} for i in range(3)]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_find(docs)):
+        rows, truncated = client.recent(hours=6, limit=3)
+    assert len(rows) == 3
+    assert truncated is True
+
+
+def test_main_recent_warns_loudly_when_the_list_is_incomplete(env, capsys):
+    with patch.object(vault_tool, "VaultClient") as MockClient:
+        MockClient.return_value.recent.return_value = ([(0, "projects/a.md")], True)
+        vault_tool.main(["recent", "6"])
+    out = capsys.readouterr().out
+    assert "INCOMPLETE" in out
+    assert "projects/a.md" in out
+
+
+def test_main_recent_says_so_when_nothing_changed(env, capsys):
+    with patch.object(vault_tool, "VaultClient") as MockClient:
+        MockClient.return_value.recent.return_value = ([], False)
+        vault_tool.main(["recent", "6"])
+    assert "[nothing modified in the last 6h]" in capsys.readouterr().out
+
+
+def test_local_stamp_is_oslo_not_utc(env):
+    # 2026-08-03 11:39:15Z -- the moment PR #34 merged. Oslo is UTC+2 in August.
+    assert vault_tool._local_stamp(1785757155000) == "2026-08-03 13:39"
+
+
 def test_main_get_prints_not_found_marker(env, capsys):
     with patch.object(vault_tool, "VaultClient") as MockClient:
         MockClient.return_value.read.return_value = None
