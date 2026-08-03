@@ -23,6 +23,12 @@ CLAUDE_WORKSPACE = os.environ.get("CLAUDE_WORKSPACE", "/data/workspace")
 # 300s was the original default; live-tested 2026-08-01 with the Evolve
 # workflow's Coder step (real git clone + explore + edit + pytest + push +
 # gh pr create in one turn) and it timed out on round 1 -- a real coding
-# task routinely needs more than 5 minutes. 900s leaves headroom without
-# letting one stuck call block the bridge's single-instance lock forever.
-CLI_TIMEOUT_SECONDS = int(os.environ.get("CLI_TIMEOUT_SECONDS", "900"))
+# task routinely needs more than 5 minutes. 900s covered that one step.
+# Bumped 900 -> 2700 on 2026-08-03: since the v2 single-session redesign,
+# one call now does the Coder step's work PLUS reading state, deciding,
+# reviewing its own diff, merging, health-checking, and journaling --
+# Cycle 8 hit the 900s wall with no PR ever pushed (nothing lost, but a
+# wasted cycle). 2700s (45min) leaves real headroom for that whole arc
+# without letting one truly stuck call hold the bridge's single-instance
+# lock for the better part of an hour.
+CLI_TIMEOUT_SECONDS = int(os.environ.get("CLI_TIMEOUT_SECONDS", "2700"))
