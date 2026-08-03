@@ -13,7 +13,7 @@ Usage (from Bash inside the bridge pod):
   python3 -m bridge.vault_tool put    <path> <local_file>
   python3 -m bridge.vault_tool puts   <path> -              # content from stdin
   python3 -m bridge.vault_tool append <path> <local_file> [after_marker]
-  python3 -m bridge.vault_tool appends <path> - [after_marker]  # content from stdin
+  python3 -m bridge.vault_tool appends <path> [after_marker]    # content from stdin
   python3 -m bridge.vault_tool delete <path>
   python3 -m bridge.vault_tool ls     [prefix]
   python3 -m bridge.vault_tool recent [hours] [prefix]   # what changed lately
@@ -227,6 +227,13 @@ class VaultClient:
                 if line.strip() == after_marker.strip():
                     lines[i + 1:i + 1] = ["", content.strip("\n")]
                     return self.write(path, "\n".join(lines))
+            # Asking for a marker and silently getting the opposite end of the
+            # file is how journal.md scrambled its own order: entries meant for
+            # the top landed at the bottom, for cycles, with nothing reported.
+            # An explicit marker is a positional instruction, so failing to
+            # honour it is an error -- same spirit as the not-found check above.
+            return (f"FAILED(after_marker not found in {path}: {after_marker!r} "
+                    f"-- nothing written; omit after_marker to append at the end)")
         sep = "" if existing_content.endswith("\n\n") else ("\n" if existing_content.endswith("\n") else "\n\n")
         return self.write(path, existing_content + sep + content.strip("\n") + "\n")
 
@@ -269,7 +276,13 @@ def main(argv=None):
         print(f"{client.append(argv[1], content, marker)}: {argv[1]}")
     elif cmd == "appends":
         content = sys.stdin.read()
-        marker = argv[2] if len(argv) > 2 else ""
+        # `puts` spells stdin as a literal "-", and this command's own usage
+        # line did too, so a caller following it passed "-" as the marker --
+        # which matched no line and silently appended at the end instead.
+        rest = argv[2:]
+        if rest and rest[0] == "-":
+            rest = rest[1:]
+        marker = rest[0] if rest else ""
         print(f"{client.append(argv[1], content, marker)}: {argv[1]}")
     elif cmd == "delete":
         print(f"{client.delete(argv[1])}: {argv[1]}")

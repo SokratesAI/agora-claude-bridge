@@ -90,14 +90,31 @@ def test_append_inserts_after_marker(env):
     assert chunk_put[2]["data"].index("## [new] Cycle 2") < chunk_put[2]["data"].index("## [old] Cycle 1")
 
 
-def test_append_falls_back_to_end_when_marker_not_found(env):
+def test_append_appends_at_end_when_no_marker_given(env):
     existing = "line one\nline two\n"
     client, calls = _client_with_fake_req({
         ("GET", "note.md"): (200, {"data": existing, "children": [], "_rev": "1-abc"}),
     })
-    client.append("note.md", "line three", after_marker="## Nonexistent")
+    client.append("note.md", "line three")
     chunk_put = [c for c in calls if c[0] == "PUT" and c[2].get("type") == "leaf"][-1]
     assert chunk_put[2]["data"].strip().endswith("line three")
+
+
+def test_append_fails_loudly_when_explicit_marker_not_found(env):
+    """This used to fall through to a silent append at the END of the file.
+    journal.md asks for insertion after '## Entries' to keep newest-first
+    order; when the marker didn't match, entries landed at the bottom
+    instead, for several cycles, with no error -- so the journal's order
+    silently scrambled and its newest entries became unfindable."""
+    existing = "line one\nline two\n"
+    client, calls = _client_with_fake_req({
+        ("GET", "note.md"): (200, {"data": existing, "children": [], "_rev": "1-abc"}),
+    })
+    result = client.append("note.md", "line three", after_marker="## Nonexistent")
+    assert result.startswith("FAILED")
+    assert "## Nonexistent" in result
+    # Nothing may be written at all -- not even the backup a write would make.
+    assert [c for c in calls if c[0] == "PUT"] == []
 
 
 def test_delete_returns_absent_when_missing(env):
@@ -183,6 +200,37 @@ def test_main_recent_says_so_when_nothing_changed(env, capsys):
 def test_local_stamp_is_oslo_not_utc(env):
     # 2026-08-03 11:39:15Z -- the moment PR #34 merged. Oslo is UTC+2 in August.
     assert vault_tool._local_stamp(1785757155000) == "2026-08-03 13:39"
+
+
+def test_main_appends_treats_leading_dash_as_stdin_not_as_the_marker(env):
+    """The usage line used to read `appends <path> - [after_marker]`, so a
+    caller following it passed "-" through as after_marker. Nothing matches
+    "-", so the entry silently went to the end of the file -- which is how
+    journal.md's newest entries ended up buried at the bottom."""
+    with patch.object(vault_tool, "VaultClient") as MockClient, \
+         patch.object(vault_tool.sys, "stdin") as stdin:
+        stdin.read.return_value = "new entry"
+        vault_tool.main(["appends", "journal.md", "-", "## Entries"])
+    MockClient.return_value.append.assert_called_once_with(
+        "journal.md", "new entry", "## Entries")
+
+
+def test_main_appends_without_the_dash_still_reads_the_marker(env):
+    with patch.object(vault_tool, "VaultClient") as MockClient, \
+         patch.object(vault_tool.sys, "stdin") as stdin:
+        stdin.read.return_value = "new entry"
+        vault_tool.main(["appends", "journal.md", "## Entries"])
+    MockClient.return_value.append.assert_called_once_with(
+        "journal.md", "new entry", "## Entries")
+
+
+def test_main_appends_with_no_marker_at_all_appends_at_the_end(env):
+    with patch.object(vault_tool, "VaultClient") as MockClient, \
+         patch.object(vault_tool.sys, "stdin") as stdin:
+        stdin.read.return_value = "new entry"
+        vault_tool.main(["appends", "notes.md"])
+    MockClient.return_value.append.assert_called_once_with(
+        "notes.md", "new entry", "")
 
 
 def test_main_get_prints_not_found_marker(env, capsys):
