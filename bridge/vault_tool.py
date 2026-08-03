@@ -16,6 +16,7 @@ Usage (from Bash inside the bridge pod):
   python3 -m bridge.vault_tool appends <path> - [after_marker]  # content from stdin
   python3 -m bridge.vault_tool delete <path>
   python3 -m bridge.vault_tool ls     [prefix]
+  python3 -m bridge.vault_tool recent [hours] [prefix]   # what changed lately
 
 Env: CDB_BASE, CDB_USER, CDB_PASS, CDB_DB (default "obsidian").
 
@@ -36,6 +37,27 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+# Obsidian LiveSync's own bookkeeping docs -- chunks, file/index/version
+# entries. Never files a human wrote.
+INTERNAL_PREFIXES = ("_", "h:", "f:", "i:", "v:")
+# Written by this tool's own backup-before-overwrite discipline (see write/
+# delete below), so they're derivative of the edits they'd otherwise drown out.
+BACKUP_PREFIX = "agora/backups/"
+DEFAULT_RECENT_LIMIT = 2000
+# Times shown to a human are Oslo time, not UTC -- Edvard lives there and
+# asked for it directly (evolve/identity.md rule 7).
+LOCAL_TZ = "Europe/Oslo"
+
+
+def _local_stamp(mtime_ms):
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(LOCAL_TZ)
+    except Exception:
+        tz = timezone.utc
+    return datetime.fromtimestamp(mtime_ms / 1000, tz).strftime("%Y-%m-%d %H:%M")
 
 
 def _env(name, default=None):
@@ -91,15 +113,58 @@ class VaultClient:
 
     def list(self, prefix=""):
         status, data = _req("GET", self.base, self.db, self.auth, "_all_docs")
-        skip = ("_", "h:", "f:", "i:", "v:")
         out = []
         for row in data.get("rows", []):
             doc_id = row["id"]
-            if doc_id.startswith(skip):
+            if doc_id.startswith(INTERNAL_PREFIXES):
                 continue
             if doc_id.lower().startswith(prefix.lower()):
                 out.append(doc_id)
         return sorted(out)
+
+    def recent(self, hours=24, prefix="", limit=DEFAULT_RECENT_LIMIT):
+        """Files modified in the last `hours`, newest first.
+
+        Returns `(rows, truncated)` where rows is a list of
+        `(mtime_ms, path)`. `truncated` matters: CouchDB applies `limit`
+        before this filters anything and `_find` has no ordering
+        guarantee, so a truncated result is an arbitrary subset rather
+        than the newest ones. A caller that quietly believed such a list
+        was complete would be worse off than having no tool at all --
+        which is the exact failure this command exists to prevent -- so
+        the flag is returned rather than swallowed.
+
+        Uses Mango `_find` with a field projection, not
+        `_all_docs?include_docs=true`: the vault is tens of MB of content
+        across thousands of docs, and only the _id/mtime pair is needed.
+        Unindexed, so CouchDB scans -- a few seconds on a vault this size,
+        which is cheap enough not to warrant adding a design doc to
+        someone else's database.
+
+        `agora/backups/` is excluded unless `prefix` explicitly asks for
+        it: every overwrite writes one, so they'd bury the real edits.
+        """
+        since_ms = int((time.time() - hours * 3600) * 1000)
+        status, data = _req(
+            "POST", self.base, self.db, self.auth, "_find",
+            {"selector": {"mtime": {"$gt": since_ms}},
+             "fields": ["_id", "mtime"], "limit": limit},
+        )
+        if status != 200:
+            raise SystemExit(f"vault_tool: _find failed ({status}): {data}")
+        docs = data.get("docs", [])
+        prefix = prefix.lower()
+        out = []
+        for doc in docs:
+            path = doc["_id"]
+            if path.startswith(INTERNAL_PREFIXES):
+                continue
+            if not path.lower().startswith(prefix):
+                continue
+            if path.lower().startswith(BACKUP_PREFIX) and not prefix.startswith(BACKUP_PREFIX):
+                continue
+            out.append((doc.get("mtime", 0), path))
+        return sorted(out, reverse=True), len(docs) >= limit
 
     def _chunk_id_for(self, content_bytes):
         try:
@@ -211,6 +276,17 @@ def main(argv=None):
     elif cmd == "ls":
         for p in client.list(argv[1] if len(argv) > 1 else ""):
             print(p)
+    elif cmd == "recent":
+        hours = float(argv[1]) if len(argv) > 1 else 24
+        prefix = argv[2] if len(argv) > 2 else ""
+        rows, truncated = client.recent(hours, prefix)
+        if truncated:
+            print(f"[INCOMPLETE: hit the {DEFAULT_RECENT_LIMIT}-doc cap, so this is an "
+                  f"arbitrary subset, NOT the newest. Use a shorter window.]")
+        for mtime_ms, path in rows:
+            print(f"{_local_stamp(mtime_ms)}  {path}")
+        if not rows:
+            print(f"[nothing modified in the last {hours:g}h]")
     else:
         print(__doc__)
         return 1
