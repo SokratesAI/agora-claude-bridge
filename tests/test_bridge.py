@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from bridge import cli, sessions, server, credentials
+from bridge import activity, cli, sessions, server, credentials
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +305,7 @@ def test_run_turn_serializes_via_module_level_lock(tmp_path):
 def test_generate_prepends_system_prompt_on_first_turn():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply", "", "sess-new"
@@ -324,7 +324,7 @@ def test_generate_prepends_system_prompt_on_first_turn():
 def test_generate_sends_only_new_message_on_resumed_turn():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply2", "", "sess-existing"
@@ -341,7 +341,7 @@ def test_generate_sends_only_new_message_on_resumed_turn():
 def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         calls.append((message, session_id))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -362,7 +362,7 @@ def test_generate_retries_fresh_on_session_not_found():
 
 
 def test_generate_propagates_other_cli_errors_without_retry():
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -374,7 +374,7 @@ def test_generate_propagates_other_cli_errors_without_retry():
 def test_generate_is_unrestricted_by_default():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -389,7 +389,7 @@ def test_generate_is_unrestricted_by_default():
 def test_generate_restricted_true_passes_the_full_tool_roster():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -404,7 +404,7 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
 def test_generate_stateless_always_sends_full_system_and_no_resume():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply", "", "sess-should-be-ignored"
@@ -422,7 +422,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
 
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -437,7 +437,7 @@ def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation()
 def test_generate_stateless_can_combine_with_restricted():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -500,7 +500,8 @@ def test_do_post_passes_restricted_flag_through_to_generate():
     )
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      activity=None):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -514,7 +515,8 @@ def test_do_post_restricted_defaults_false_when_omitted():
     handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      activity=None):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -530,7 +532,8 @@ def test_do_post_passes_stateless_flag_through_to_generate():
     )
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      activity=None):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -544,7 +547,8 @@ def test_do_post_stateless_defaults_false_when_omitted():
     handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      activity=None):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -657,3 +661,252 @@ def test_bootstrap_credentials_skips_on_invalid_json(tmp_path):
         credentials.bootstrap_credentials()
 
     assert not (tmp_path / ".claude" / ".credentials.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# activity.py -- live tool-use narration back to agora-persona-runner
+# ---------------------------------------------------------------------------
+
+def test_summarize_uses_the_field_that_says_what_the_call_did():
+    assert activity.summarize("Bash", {"command": "ls -la", "description": "list"}) == "ls -la"
+    assert activity.summarize("Read", {"file_path": "/etc/hosts", "limit": 5}) == "/etc/hosts"
+    assert activity.summarize("Grep", {"pattern": "TODO", "path": "."}) == "TODO"
+
+
+def test_summarize_collapses_whitespace_so_a_chip_stays_one_line():
+    """A heredoc or a formatted patch would otherwise blow out a chat bubble."""
+    assert activity.summarize("Bash", {"command": "git commit -m 'a\n\nb'   c"}) == \
+        "git commit -m 'a b' c"
+
+
+def test_summarize_truncates_to_the_chip_budget():
+    summary = activity.summarize("Bash", {"command": "x" * 5000})
+    assert len(summary) == activity.DETAIL_CHARS_MAX
+
+
+def test_summarize_falls_back_to_the_whole_input_for_an_unknown_tool():
+    """New tools appear between CLI versions -- an unlisted one must still
+    say something useful rather than rendering a blank chip."""
+    summary = activity.summarize("SomeToolShippedNextVersion", {"target": "prod", "n": 3})
+    assert "prod" in summary
+
+
+def test_summarize_returns_empty_for_a_tool_with_no_input():
+    assert activity.summarize("TodoWrite", {}) == ""
+    assert activity.summarize("Bash", None) == ""
+
+
+def test_reporter_is_disabled_without_an_activity_block():
+    """An older runner sends no activity block at all -- that must be a
+    silent no-op, not a crash and not a post to nowhere."""
+    for block in (None, {}, {"url": "http://x/y"}, {"token": "t"}):
+        reporter = activity.ActivityReporter(block)
+        assert not reporter.enabled
+        reporter.start()
+        reporter.report("Bash", {"command": "ls"})
+        reporter.close()  # must not hang or raise
+
+
+def test_reporter_posts_each_tool_call_with_its_token():
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append((url, payload)) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/tool-activity", "token": "tok"})
+        reporter.start()
+        reporter.report("Bash", {"command": "pytest"})
+        reporter.report("Read", {"file_path": "/tmp/f"})
+        reporter.close()
+
+    assert [p[0] for p in posted] == ["http://runner/tool-activity"] * 2
+    assert [p[1] for p in posted] == [
+        {"token": "tok", "capability": "Bash", "detail": "pytest"},
+        {"token": "tok", "capability": "Read", "detail": "/tmp/f"},
+    ]
+
+
+def test_reporter_preserves_tool_call_order():
+    """Order is the entire point of narrating live rather than dumping at
+    the end -- a thread per report would race and shuffle them."""
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload["detail"]) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        for i in range(50):
+            reporter.report("Bash", {"command": f"step-{i}"})
+        reporter.close()
+    assert posted == [f"step-{i}" for i in range(50)]
+
+
+def test_reporter_survives_a_runner_that_is_down():
+    """The turn being narrated matters more than the narration."""
+    with patch.object(activity, "_post", side_effect=RuntimeError("connection refused")):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report("Bash", {"command": "ls"})
+        reporter.close()  # must not raise
+
+
+def test_post_returns_false_instead_of_raising_on_a_dead_runner():
+    with patch.object(activity.urllib.request, "urlopen", side_effect=OSError("no route")):
+        assert activity._post("http://runner/x", {"token": "t"}) is False
+
+
+def test_reporter_keeps_narrating_after_one_post_fails():
+    """A single bad post must not end the session's narration -- the worker
+    dying quietly is the exact fails-invisibly shape this feature removes."""
+    posted = []
+    calls = {"n": 0}
+
+    def flaky_post(url, payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("connection reset")
+        posted.append(payload["detail"])
+        return True
+
+    with patch.object(activity, "_post", flaky_post):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report("Bash", {"command": "first"})
+        reporter.report("Bash", {"command": "second"})
+        reporter.report("Bash", {"command": "third"})
+        reporter.close()
+
+    assert posted == ["second", "third"]
+
+
+# ---------------------------------------------------------------------------
+# cli.py + server.py -- activity plumbed through a real turn
+# ---------------------------------------------------------------------------
+
+def test_run_turn_reports_each_tool_use_block(tmp_path):
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "pytest tests/"}},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/app/x.py"}},
+            {"type": "text", "text": "done"},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn(
+            "hello", activity={"url": "http://runner/tool-activity", "token": "tok"})
+
+    assert text == "done"
+    assert [(p["capability"], p["detail"]) for p in posted] == [
+        ("Bash", "pytest tests/"),
+        ("Read", "/app/x.py"),
+    ]
+
+
+def test_run_turn_reports_nothing_when_no_activity_block_is_given(tmp_path):
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "text", "text": "ok"},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello")
+
+    assert text == "ok"
+    assert posted == []
+
+
+def test_tool_use_is_reported_while_the_session_is_still_running(tmp_path):
+    """The whole point. A chip that lands after the turn returns is the
+    'displayed after the process is finished... hindsight logging' Edvard
+    complained about -- so assert the post happens before the CLI has even
+    emitted its next event, not merely that it happens at some point."""
+    posted = []
+    first_post_landed = threading.Event()
+
+    def fake_post(url, payload):
+        posted.append(payload["detail"])
+        first_post_landed.set()
+        return True
+
+    def lazy_stream():
+        yield json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "slow-thing"}},
+        ]}}) + "\n"
+        assert first_post_landed.wait(timeout=10), "tool call was not reported live"
+        yield json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "finished"},
+        ]}}) + "\n"
+        yield json.dumps({"type": "result", "session_id": "s", "subtype": "success"}) + "\n"
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", fake_post), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lazy_stream())):
+        text, _, _ = cli.run_turn(
+            "hello", activity={"url": "http://runner/x", "token": "tok"})
+
+    assert text == "finished"
+    assert posted == ["slow-thing"]
+
+
+def test_a_broken_activity_endpoint_does_not_break_the_turn(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "text", "text": "the answer"},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity.urllib.request, "urlopen", side_effect=OSError("refused")), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, session_id = cli.run_turn(
+            "hello", activity={"url": "http://runner/x", "token": "tok"})
+
+    assert text == "the answer"
+    assert session_id == "sess-1"
+
+
+def test_do_post_passes_activity_through_to_generate():
+    handler, sent = _make_handler({
+        "conversation_id": "c1", "prompt": "hi", "system": "sys",
+        "activity": {"url": "http://runner/tool-activity", "token": "tok"},
+    })
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False,
+                      stateless=False, activity=None):
+        captured["activity"] = activity
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    assert sent["status"] == 200
+    assert captured["activity"] == {"url": "http://runner/tool-activity", "token": "tok"}
+
+
+def test_do_post_activity_defaults_to_none_when_omitted():
+    """An older runner sends no activity block; the bridge must still work."""
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi", "system": "sys"})
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False,
+                      stateless=False, activity=None):
+        captured["activity"] = activity
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    assert sent["status"] == 200
+    assert captured["activity"] is None
