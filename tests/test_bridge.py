@@ -1061,3 +1061,133 @@ def test_run_turn_reports_a_failed_tool_call_as_an_error(tmp_path):
 
     assert posted[1]["isError"] is True
     assert posted[1]["output"] == "nope: command not found"
+
+
+# ---------------------------------------------------------------------------
+# The narrative between the tool calls (Edvard, 2026-08-04: "how would you
+# like to be presented a story? ... first a narrative, then an action, then a
+# narrative, then an action"). Every passage but the last is narration and
+# goes out live; the last one is the reply.
+# ---------------------------------------------------------------------------
+
+def _story_lines():
+    return _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "First I look at the pods."},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_a", "name": "Bash",
+             "input": {"command": "kubectl get pods"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a", "content": "all Running\n"},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "They are all up."},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+
+
+def _run_story(tmp_path, posted, **kwargs):
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(_story_lines())):
+        return cli.run_turn("hello", **kwargs)
+
+
+def test_run_turn_streams_each_passage_in_the_order_it_was_written(tmp_path):
+    posted = []
+    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    assert [p["capability"] for p in posted] == ["assistant_text", "Bash", "Bash"]
+    assert posted[0]["detail"] == "First I look at the pods."
+
+
+def test_run_turn_returns_only_the_closing_passage_as_the_reply(tmp_path):
+    """The rest is already in the conversation as narration -- returning the
+    join too would print the whole run again inside the reply bubble."""
+    posted = []
+    text, _, _ = _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "They are all up."
+    assert "First I look at the pods." not in text
+
+
+def test_run_turn_does_not_narrate_the_closing_passage(tmp_path):
+    """It is the reply, and it is about to be posted as one. Sending it as
+    narration as well would show it twice, once in the drawer and once in
+    the bubble underneath."""
+    posted = []
+    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    assert all(p.get("detail") != "They are all up." for p in posted)
+
+
+def test_run_turn_returns_every_passage_when_nothing_is_narrated(tmp_path):
+    """The /invoke path, or a runner too old to send an activity block. With
+    nowhere to stream to, dropping the earlier passages would lose them."""
+    posted = []
+    text, _, _ = _run_story(tmp_path, posted)
+    assert text == "First I look at the pods.\nThey are all up."
+    assert posted == []
+
+
+def test_run_turn_keeps_a_lone_passage_intact(tmp_path):
+    """One text block and no tools: nothing precedes it, so nothing is
+    narrated and the reply is exactly what it always was."""
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "just an answer"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "just an answer"
+    assert posted == []
+
+
+def test_run_turn_falls_back_rather_than_replying_with_nothing(tmp_path):
+    """A session that ends on a tool call has no closing passage. Every
+    passage has then been narrated, so the join repeats them -- accepted,
+    because the alternative is an empty reply, which fails the whole turn."""
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "on it"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_z", "name": "Bash", "input": {"command": "ls"}},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "on it"
+
+
+def test_report_text_does_not_truncate_a_passage(tmp_path):
+    """A chip label is clipped at DETAIL_CHARS_MAX because it is a label.
+    This is prose, and clipping it mid-sentence is exactly the "block of
+    text" complaint in a new place."""
+    posted = []
+    long_passage = "word " * 400
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_text(long_passage)
+        reporter.close()
+    assert posted[0]["detail"] == long_passage.strip()
+    assert len(posted[0]["detail"]) > activity.DETAIL_CHARS_MAX
+
+
+def test_report_text_skips_a_blank_passage():
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_text("   \n  ")
+        reporter.close()
+    assert posted == []

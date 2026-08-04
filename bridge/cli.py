@@ -128,6 +128,21 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
     # flight (normally one) rather than the whole session's history.
     tool_names = {}
 
+    # The newest text block, held back by exactly one event.
+    #
+    # A passage the persona writes is narration if more work follows it and
+    # the reply if nothing does, and which one it is is not knowable when it
+    # arrives -- only when the next thing does. So the newest one waits here,
+    # and the one before it is released as narration the moment anything else
+    # shows up. Whatever is still sitting here when the stream ends is the
+    # last thing written, which is the reply.
+    pending = []
+
+    def release_narrative():
+        """Send the held passage, now that we know it wasn't the last."""
+        if pending:
+            reporter.report_text(pending.pop())
+
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -149,8 +164,11 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
                     elif block.get("type") == "text":
                         chunk = block.get("text", "")
                         if chunk:
+                            release_narrative()
+                            pending.append(chunk)
                             text_parts.append(chunk)
                     elif block.get("type") == "tool_use":
+                        release_narrative()
                         name = block.get("name", "")
                         tool_use_id = str(block.get("id", ""))
                         if tool_use_id:
@@ -224,7 +242,25 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
             raise UsageLimitError(detail)
         raise ClaudeCliError(detail)
 
-    text = "\n".join(text_parts).strip()
+    # Everything the persona wrote except the last passage has already been
+    # sent as narration and is already in the conversation, in order, where
+    # it happened. Returning the joined whole on top of that would print the
+    # entire run a second time inside the reply bubble -- which is what it
+    # used to do, and is why Edvard's phone kept buzzing with a wall of "let
+    # me check the deploy first" instead of an answer. So the reply is the
+    # last passage: the thing written once there was nothing left to do.
+    #
+    # Both fallbacks matter and both mean "nothing was narrated, so nothing
+    # is duplicated": no reporter (the /invoke path, or a runner too old to
+    # send an activity block), and a session that ended on a tool call with
+    # no closing passage at all. In the second case every passage HAS been
+    # sent, so the join does repeat them -- accepted deliberately, because
+    # the alternative is an empty reply, and an empty reply raises below and
+    # fails the whole turn.
+    if reporter.enabled and pending:
+        text = pending[-1].strip()
+    else:
+        text = "\n".join(text_parts).strip()
     thinking = "\n\n".join(thinking_parts).strip()
     if not text:
         raise ClaudeCliError("CLI produced no text output")

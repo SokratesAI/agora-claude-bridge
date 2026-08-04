@@ -49,6 +49,11 @@ DETAIL_CHARS_MAX = 300
 # Keep this in step with that constant if it ever moves.
 OUTPUT_CHARS_MAX = 20_000
 
+# The capability name a written passage travels under. Not a tool, and Agora
+# renders it as prose rather than as a chip -- see that repo's public/app.js
+# NARRATION_TEXT, which has to agree with this string.
+NARRATION_TEXT = "assistant_text"
+
 # Per tool, the input fields that actually say what the call DID, in
 # preference order. A tool that isn't listed -- or a call that has none of
 # its listed fields -- falls back to a compact dump of the whole input,
@@ -172,6 +177,28 @@ class ActivityReporter:
             if tool_use_id:
                 payload["toolUseId"] = tool_use_id
             self._queue.put(payload)
+
+    def report_text(self, text):
+        """A passage the persona wrote on its way to the answer.
+
+        The reply used to be every text block the session produced, joined
+        together and handed over at the end -- so Edvard's phone got the
+        whole internal monologue in one lump, after the fact, with the tool
+        chips it belonged between already sitting above it. His words
+        (2026-08-04): "how would you like to be presented a story? One does
+        not describe all actions in the story first, and then the narrative.
+        They are in between each other, first a narrative, then an action,
+        then a narrative, then an action."
+
+        So each passage goes down the same queue as the chips, in the same
+        order the CLI emitted it, and lands in the conversation where it
+        actually happened. No truncation here, unlike a chip label: this is
+        prose meant to be read, and the runner stopped clipping narration
+        text at 500 characters to match (agora-persona-runner#41).
+        """
+        passage = (text or "").strip()
+        if self.enabled and passage:
+            self._queue.put({"capability": NARRATION_TEXT, "detail": passage})
 
     def report_result(self, name, tool_use_id, output, is_error=False):
         """What the call returned, once it has.
