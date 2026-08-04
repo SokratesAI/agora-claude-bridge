@@ -35,6 +35,20 @@ CLOSE_WAIT_SECONDS = 5
 # runner truncates at 500 server-side anyway (agora_runner/audit.py).
 DETAIL_CHARS_MAX = 300
 
+# What a tool RETURNED, which is a transcript and is meant to be read in the
+# expandable detail view, not in the chip label -- so it gets a budget three
+# orders of magnitude larger than DETAIL_CHARS_MAX and no whitespace
+# collapsing.
+#
+# This is not a new limit, it is Agora's existing one applied one hop
+# earlier: AuditStore.CONTENT_CHARS_MAX (agora/src/chat/audit-store.ts) is
+# 20_000 and slices anything longer on arrival. Sending more than this would
+# push bytes across two HTTP hops to be provably discarded at the far end --
+# and unlike a vault file (before/after, bounded and human-written), tool
+# output is routinely enormous: one `cat` of a log, one unbounded `git log`.
+# Keep this in step with that constant if it ever moves.
+OUTPUT_CHARS_MAX = 20_000
+
 # Per tool, the input fields that actually say what the call DID, in
 # preference order. A tool that isn't listed -- or a call that has none of
 # its listed fields -- falls back to a compact dump of the whole input,
@@ -72,6 +86,31 @@ def summarize(name, tool_input):
         return json.dumps(tool_input, ensure_ascii=False)[:DETAIL_CHARS_MAX]
     except (TypeError, ValueError):
         return str(tool_input)[:DETAIL_CHARS_MAX]
+
+
+def result_text(block):
+    """The text a tool returned, from one CLI `tool_result` content block.
+
+    The CLI gives `content` either as a plain string or as a list of typed
+    blocks (text, and for screenshot-style tools, images). Only text is
+    readable as output; a non-text block is named rather than dropped, so a
+    screenshot reads as `[image]` instead of as an empty result, which would
+    be indistinguishable from a tool that genuinely returned nothing.
+    """
+    content = block.get("content")
+    if isinstance(content, str):
+        return content[:OUTPUT_CHARS_MAX]
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            parts.append(str(item.get("text", "")))
+        elif item.get("type"):
+            parts.append(f"[{item['type']}]")
+    return "\n".join(parts)[:OUTPUT_CHARS_MAX]
 
 
 def _post(url, payload):
@@ -120,9 +159,37 @@ class ActivityReporter:
         self._thread = threading.Thread(target=self._drain, daemon=True)
         self._thread.start()
 
-    def report(self, name, tool_input):
+    def report(self, name, tool_input, tool_use_id=""):
+        """The call, at the moment it starts.
+
+        Still posted before the tool has run, which is what makes the
+        narration live -- a `pytest` that takes four minutes must show up
+        when it starts, not when it finishes. `tool_use_id` is what lets
+        report_result() below catch up with this chip afterwards.
+        """
         if self.enabled and name:
-            self._queue.put((name, summarize(name, tool_input)))
+            payload = {"capability": name, "detail": summarize(name, tool_input)}
+            if tool_use_id:
+                payload["toolUseId"] = tool_use_id
+            self._queue.put(payload)
+
+    def report_result(self, name, tool_use_id, output, is_error=False):
+        """What the call returned, once it has.
+
+        A second report rather than an amendment of the first, because the
+        first is already sent and already on screen. The reader sees one
+        chip: Agora's client pairs the two by `toolUseId` at render time.
+        Nothing is correlated here, and nothing needs to be -- if the pair's
+        other half never arrives (a failed post, a killed session), each
+        half still stands on its own.
+        """
+        if self.enabled and name and tool_use_id:
+            self._queue.put({
+                "capability": name,
+                "toolUseId": tool_use_id,
+                "output": output or "",
+                "isError": bool(is_error),
+            })
 
     def close(self):
         if self._thread is None:
@@ -137,13 +204,12 @@ class ActivityReporter:
             item = self._queue.get()
             if item is None:
                 return
-            name, detail = item
             # _post swallows its own errors, but an unexpected one from
             # anywhere here would kill this thread and silently end the
             # narration for the rest of the session -- the exact
             # fails-invisibly shape this whole feature exists to remove.
             try:
-                ok = _post(self._url, {"token": self._token, "capability": name, "detail": detail})
+                ok = _post(self._url, dict(item, token=self._token))
             except Exception:
                 ok = False
             if not ok:
@@ -153,5 +219,5 @@ class ActivityReporter:
                 # session, and one broken chip must not bury the CLI's own
                 # logs under hundreds of identical lines.
                 if failures == 1:
-                    log(f"activity report failed for {name!r} "
+                    log(f"activity report failed for {item.get('capability')!r} "
                         f"(further failures this session silenced)")
