@@ -17,7 +17,8 @@ from bridge.cli import (
 )
 
 
-def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False):
+def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+             activity=None):
     """One turn for one conversation. First turn (no stored session)
     prepends the system/persona prompt to the message -- a resumed session
     already has that context from turn 1, so later turns send just the new
@@ -37,12 +38,17 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     own prompt gives them, not an ever-growing CLI-side memory of every
     prior cycle (that's what the vault journal is for -- see identity.md).
     An ordinary chat persona wants the opposite (continuity across turns),
-    which is why this is opt-in, not the new default."""
+    which is why this is opt-in, not the new default.
+
+    activity (2026-08-03, absent by default): {"url", "token"} the caller
+    wants every tool call reported to as it happens, so a session that runs
+    for 45 minutes isn't a black box until it returns. See activity.py."""
     if stateless:
         message = f"{system}\n\n{prompt}"
         text, thinking, _ = run_turn(
             message, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
+            activity=activity,
         )
         return text, thinking
 
@@ -53,6 +59,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     try:
         text, thinking, new_session_id = run_turn(
             message, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
+            activity=activity,
         )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
@@ -61,6 +68,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             message = f"{system}\n\n{prompt}"
             text, thinking, new_session_id = run_turn(
                 message, session_id=None, model=model, disallowed_tools=disallowed_tools,
+                activity=activity,
             )
         else:
             raise
@@ -107,9 +115,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             model = payload.get("model")
             restricted = bool(payload.get("restricted", False))
             stateless = bool(payload.get("stateless", False))
+            activity = payload.get("activity")
 
             text, thinking = generate(
                 conversation_id, system, prompt, model=model, restricted=restricted, stateless=stateless,
+                activity=activity,
             )
             self._send(200, {"text": text, "thinking": thinking})
         except UsageLimitError as e:

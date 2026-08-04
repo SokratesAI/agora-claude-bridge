@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 
+from bridge.activity import ActivityReporter
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
 
@@ -71,7 +72,7 @@ def _detect_usage_limit(text):
     return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
 
 
-def _run_cli_once(message, session_id, model, disallowed_tools):
+def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
@@ -106,6 +107,12 @@ def _run_cli_once(message, session_id, model, disallowed_tools):
     new_session_id = session_id or ""
     saw_error = None
 
+    # Narrates each tool call to the caller as it happens (activity.py).
+    # A no-op when the caller didn't ask for it, which is why there's no
+    # branch around every .report() below.
+    reporter = ActivityReporter(activity)
+    reporter.start()
+
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -128,6 +135,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools):
                         chunk = block.get("text", "")
                         if chunk:
                             text_parts.append(chunk)
+                    elif block.get("type") == "tool_use":
+                        reporter.report(block.get("name", ""), block.get("input"))
             elif t in ("result", "system"):
                 sid = event.get("session_id", "")
                 if sid:
@@ -153,6 +162,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools):
     finally:
         if proc.stdout:
             proc.stdout.close()
+        reporter.close()
 
     elapsed = time.monotonic() - t0
     log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "
@@ -179,12 +189,16 @@ def _run_cli_once(message, session_id, model, disallowed_tools):
 _invocation_lock = threading.Lock()
 
 
-def run_turn(message, session_id=None, model=None, disallowed_tools=None):
+def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
     """One turn. Returns (text, thinking, new_session_id).
 
     disallowed_tools: comma-separated tool names to block for this call
     (see DISCOVERED_FULL_TOOL_ROSTER above), or None/empty for full,
     unrestricted access -- the default.
+
+    activity: optional {"url", "token"} the caller wants each tool call
+    reported to, live, while this turn runs (see activity.py). Omit it and
+    nothing is reported.
 
     Raises UsageLimitError on a real subscription cap, ClaudeCliError on
     anything else that prevented a usable reply (including the
@@ -192,4 +206,4 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None):
     session_id and retry once with session_id=None on that specific case).
     """
     with _invocation_lock:
-        return _run_cli_once(message, session_id, model, disallowed_tools)
+        return _run_cli_once(message, session_id, model, disallowed_tools, activity)
