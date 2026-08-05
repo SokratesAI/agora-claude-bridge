@@ -1,0 +1,17 @@
+# Config for the `gitleaks detect` step in .github/workflows/build.yaml.
+#
+# Keeps every default rule (useDefault) and adds exactly one exception:
+# tests/test_redact.py exists to hold credential-shaped strings, because a
+# redactor can only be tested against the thing it is meant to catch. The
+# strings in it are fabricated -- the scan cannot know that, so it flags
+# them, correctly by its own lights.
+#
+# Scoped to that one file on purpose. A blanket allowlist would turn the
+# scan off for the repo, and this scan is the reason the fixtures are
+# fabricated rather than copied from the real leak they are modelled on.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fabricated credential fixtures for the redactor's own tests"
+paths = ['''tests/test_redact\.py''']

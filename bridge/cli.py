@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 
-from bridge.activity import ActivityReporter
+from bridge.activity import ActivityReporter, result_text
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
 from bridge.quota import QuotaWatcher, write_hook_settings
@@ -123,6 +123,26 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
     watcher = QuotaWatcher()
     watcher.start()
 
+    # tool_use_id -> tool name, for the `user` branch below. Entries are
+    # removed as their results arrive, so this holds only calls currently in
+    # flight (normally one) rather than the whole session's history.
+    tool_names = {}
+
+    # The newest text block, held back by exactly one event.
+    #
+    # A passage the persona writes is narration if more work follows it and
+    # the reply if nothing does, and which one it is is not knowable when it
+    # arrives -- only when the next thing does. So the newest one waits here,
+    # and the one before it is released as narration the moment anything else
+    # shows up. Whatever is still sitting here when the stream ends is the
+    # last thing written, which is the reply.
+    pending = []
+
+    def release_narrative():
+        """Send the held passage, now that we know it wasn't the last."""
+        if pending:
+            reporter.report_text(pending.pop())
+
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -144,9 +164,38 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
                     elif block.get("type") == "text":
                         chunk = block.get("text", "")
                         if chunk:
+                            release_narrative()
+                            pending.append(chunk)
                             text_parts.append(chunk)
                     elif block.get("type") == "tool_use":
-                        reporter.report(block.get("name", ""), block.get("input"))
+                        release_narrative()
+                        name = block.get("name", "")
+                        tool_use_id = str(block.get("id", ""))
+                        if tool_use_id:
+                            tool_names[tool_use_id] = name
+                        reporter.report(name, block.get("input"), tool_use_id)
+            elif t == "user":
+                # What each tool RETURNED. Edvard has asked for this three
+                # times -- "I need to see the command with all metadata and
+                # also the output from that command, such as the return of a
+                # echo command" -- and until now this branch did not exist at
+                # all: the CLI streams results on `user` events, and the loop
+                # only ever looked at `assistant` ones, so every result was
+                # read off the pipe and dropped.
+                #
+                # The tool's name is only on the `tool_use` block that opened
+                # the call, so it is carried across in tool_names. Popped, not
+                # read: one result per call, and a cycle makes hundreds.
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") != "tool_result":
+                        continue
+                    tool_use_id = str(block.get("tool_use_id", ""))
+                    name = tool_names.pop(tool_use_id, "")
+                    if name:
+                        reporter.report_result(
+                            name, tool_use_id, result_text(block),
+                            is_error=bool(block.get("is_error")),
+                        )
             elif t == "rate_limit_event":
                 # The API's own view of the cap, carried on the stream for
                 # free. No percentage in it -- it triggers a fresh reading
@@ -193,7 +242,25 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
             raise UsageLimitError(detail)
         raise ClaudeCliError(detail)
 
-    text = "\n".join(text_parts).strip()
+    # Everything the persona wrote except the last passage has already been
+    # sent as narration and is already in the conversation, in order, where
+    # it happened. Returning the joined whole on top of that would print the
+    # entire run a second time inside the reply bubble -- which is what it
+    # used to do, and is why Edvard's phone kept buzzing with a wall of "let
+    # me check the deploy first" instead of an answer. So the reply is the
+    # last passage: the thing written once there was nothing left to do.
+    #
+    # Both fallbacks matter and both mean "nothing was narrated, so nothing
+    # is duplicated": no reporter (the /invoke path, or a runner too old to
+    # send an activity block), and a session that ended on a tool call with
+    # no closing passage at all. In the second case every passage HAS been
+    # sent, so the join does repeat them -- accepted deliberately, because
+    # the alternative is an empty reply, and an empty reply raises below and
+    # fails the whole turn.
+    if reporter.enabled and pending:
+        text = pending[-1].strip()
+    else:
+        text = "\n".join(text_parts).strip()
     thinking = "\n\n".join(thinking_parts).strip()
     if not text:
         raise ClaudeCliError("CLI produced no text output")

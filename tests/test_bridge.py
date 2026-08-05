@@ -910,3 +910,284 @@ def test_do_post_activity_defaults_to_none_when_omitted():
         handler.do_POST()
     assert sent["status"] == 200
     assert captured["activity"] is None
+
+
+# ---------------------------------------------------------------------------
+# activity.py -- what a tool RETURNED (Edvard's issue 1, asked three times:
+# "I need to see the command with all metadata and also the output from that
+# command, such as the return of a echo command")
+# ---------------------------------------------------------------------------
+
+def test_result_text_reads_a_plain_string_result():
+    assert activity.result_text({"content": "hello from echo\n"}) == "hello from echo\n"
+
+
+def test_result_text_joins_the_blocks_of_a_structured_result():
+    block = {"content": [
+        {"type": "text", "text": "line one"},
+        {"type": "text", "text": "line two"},
+    ]}
+    assert activity.result_text(block) == "line one\nline two"
+
+
+def test_result_text_names_a_non_text_block_instead_of_dropping_it():
+    """An empty result and a screenshot must not look identical -- dropping
+    the block would make a tool that returned an image indistinguishable
+    from one that returned nothing at all."""
+    block = {"content": [{"type": "image", "source": {"data": "..."}}]}
+    assert activity.result_text(block) == "[image]"
+
+
+def test_result_text_truncates_to_agoras_own_content_ceiling():
+    """Not a limit of ours: anything past this is sliced off by
+    AuditStore.CONTENT_CHARS_MAX on arrival, so sending it would push bytes
+    across two hops to be provably discarded."""
+    out = activity.result_text({"content": "x" * 50_000})
+    assert len(out) == activity.OUTPUT_CHARS_MAX
+
+
+def test_result_text_is_empty_for_a_result_with_no_content():
+    assert activity.result_text({}) == ""
+    assert activity.result_text({"content": None}) == ""
+
+
+def test_report_result_carries_the_output_and_its_correlation_id():
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_result("Bash", "toolu_1", "hello\n", is_error=False)
+        reporter.close()
+    assert posted == [{
+        "token": "tok", "capability": "Bash", "toolUseId": "toolu_1",
+        "output": "hello\n", "isError": False,
+    }]
+
+
+def test_report_result_marks_a_failed_tool_call():
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_result("Bash", "toolu_9", "command not found", is_error=True)
+        reporter.close()
+    assert posted[0]["isError"] is True
+
+
+def test_report_result_without_a_correlation_id_is_dropped():
+    """Nothing downstream could pair it with its call, so it would render as
+    a second, orphaned chip with no label."""
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_result("Bash", "", "output", is_error=False)
+        reporter.close()
+    assert posted == []
+
+
+def test_run_turn_pairs_each_tool_result_with_the_call_that_made_it(tmp_path):
+    """The end-to-end shape: the call is reported when it starts (so the
+    chip is live) and its output follows under the same toolUseId."""
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_a", "name": "Bash",
+             "input": {"command": "echo hi"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a", "content": "hi\n"},
+        ]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn(
+            "hello", activity={"url": "http://runner/x", "token": "tok"})
+
+    assert text == "done"
+    assert posted == [
+        {"token": "tok", "capability": "Bash", "detail": "echo hi", "toolUseId": "toolu_a"},
+        {"token": "tok", "capability": "Bash", "toolUseId": "toolu_a",
+         "output": "hi\n", "isError": False},
+    ]
+
+
+def test_run_turn_ignores_a_tool_result_it_never_saw_the_call_for(tmp_path):
+    """A resumed session replays results whose tool_use block was streamed
+    to a previous process. With no name to label it, an orphan result would
+    render as a blank chip."""
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_from_last_session",
+             "content": "stale"},
+        ]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+
+    assert text == "ok"
+    assert posted == []
+
+
+def test_run_turn_reports_a_failed_tool_call_as_an_error(tmp_path):
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_b", "name": "Bash",
+             "input": {"command": "nope"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_b",
+             "content": "nope: command not found", "is_error": True},
+        ]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+
+    assert posted[1]["isError"] is True
+    assert posted[1]["output"] == "nope: command not found"
+
+
+# ---------------------------------------------------------------------------
+# The narrative between the tool calls (Edvard, 2026-08-04: "how would you
+# like to be presented a story? ... first a narrative, then an action, then a
+# narrative, then an action"). Every passage but the last is narration and
+# goes out live; the last one is the reply.
+# ---------------------------------------------------------------------------
+
+def _story_lines():
+    return _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "First I look at the pods."},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_a", "name": "Bash",
+             "input": {"command": "kubectl get pods"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a", "content": "all Running\n"},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "They are all up."},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+
+
+def _run_story(tmp_path, posted, **kwargs):
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(_story_lines())):
+        return cli.run_turn("hello", **kwargs)
+
+
+def test_run_turn_streams_each_passage_in_the_order_it_was_written(tmp_path):
+    posted = []
+    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    assert [p["capability"] for p in posted] == ["assistant_text", "Bash", "Bash"]
+    assert posted[0]["detail"] == "First I look at the pods."
+
+
+def test_run_turn_returns_only_the_closing_passage_as_the_reply(tmp_path):
+    """The rest is already in the conversation as narration -- returning the
+    join too would print the whole run again inside the reply bubble."""
+    posted = []
+    text, _, _ = _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "They are all up."
+    assert "First I look at the pods." not in text
+
+
+def test_run_turn_does_not_narrate_the_closing_passage(tmp_path):
+    """It is the reply, and it is about to be posted as one. Sending it as
+    narration as well would show it twice, once in the drawer and once in
+    the bubble underneath."""
+    posted = []
+    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    assert all(p.get("detail") != "They are all up." for p in posted)
+
+
+def test_run_turn_returns_every_passage_when_nothing_is_narrated(tmp_path):
+    """The /invoke path, or a runner too old to send an activity block. With
+    nowhere to stream to, dropping the earlier passages would lose them."""
+    posted = []
+    text, _, _ = _run_story(tmp_path, posted)
+    assert text == "First I look at the pods.\nThey are all up."
+    assert posted == []
+
+
+def test_run_turn_keeps_a_lone_passage_intact(tmp_path):
+    """One text block and no tools: nothing precedes it, so nothing is
+    narrated and the reply is exactly what it always was."""
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "just an answer"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "just an answer"
+    assert posted == []
+
+
+def test_run_turn_falls_back_rather_than_replying_with_nothing(tmp_path):
+    """A session that ends on a tool call has no closing passage. Every
+    passage has then been narrated, so the join repeats them -- accepted,
+    because the alternative is an empty reply, which fails the whole turn."""
+    posted = []
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "on it"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_z", "name": "Bash", "input": {"command": "ls"}},
+        ]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "on it"
+
+
+def test_report_text_does_not_truncate_a_passage(tmp_path):
+    """A chip label is clipped at DETAIL_CHARS_MAX because it is a label.
+    This is prose, and clipping it mid-sentence is exactly the "block of
+    text" complaint in a new place."""
+    posted = []
+    long_passage = "word " * 400
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_text(long_passage)
+        reporter.close()
+    assert posted[0]["detail"] == long_passage.strip()
+    assert len(posted[0]["detail"]) > activity.DETAIL_CHARS_MAX
+
+
+def test_report_text_skips_a_blank_passage():
+    posted = []
+    with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
+        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter.start()
+        reporter.report_text("   \n  ")
+        reporter.close()
+    assert posted == []
