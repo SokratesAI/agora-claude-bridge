@@ -1,8 +1,10 @@
 import json
 import os
+import signal
 import stat as stat_module
 import tempfile
 import threading
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -580,7 +582,10 @@ def test_do_get_health_returns_ok():
     handler, sent = _make_handler({}, path="/health")
     handler.do_GET()
     assert sent["status"] == 200
-    assert sent["payload"] == {"status": "ok"}
+    # 200 is the whole contract as far as the readiness probe is concerned;
+    # "draining" was added alongside the SIGTERM drain below so the state is
+    # queryable without shell access to the pod's logs.
+    assert sent["payload"]["status"] == "ok"
 
 
 def test_do_post_unknown_path_returns_404():
@@ -1191,3 +1196,153 @@ def test_report_text_skips_a_blank_passage():
         reporter.report_text("   \n  ")
         reporter.close()
     assert posted == []
+
+
+# --- Draining on SIGTERM (2026-08-05) -------------------------------------
+# The runner learned this in #32; the bridge never did, and kept dying
+# mid-turn whenever merging a bridge PR rolled the pod hosting the Claude
+# Code session that merged it. Four cycles lost their reply that way.
+
+
+@pytest.fixture
+def drainable_server():
+    """Restores the real signal handlers and the module's drain state, so a
+    genuine SIGTERM fired at the pytest process can't leak into later tests
+    or leave _shutdown_requested stuck on."""
+    previous_term = signal.getsignal(signal.SIGTERM)
+    previous_int = signal.getsignal(signal.SIGINT)
+    server._shutdown_requested = False
+    server._in_flight = 0
+    try:
+        yield server
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+        server._shutdown_requested = False
+        server._in_flight = 0
+
+
+def test_start_server_drains_the_in_flight_turn_after_a_real_sigterm(drainable_server):
+    """The actual regression, with a real signal rather than a faked flag.
+
+    Without the handler, SIGTERM's default disposition kills the process
+    outright and this test can't even run to its assertions.
+    """
+    drainable_server.install_signal_handlers()
+    returned = threading.Event()
+
+    def run():
+        drainable_server.start_server()
+        returned.set()
+
+    # PORT 0 -> the OS picks a free port; the bridge's real 8090 is in use
+    # by the pod these tests run inside.
+    with patch.object(drainable_server, "PORT", 0), \
+         patch.object(drainable_server, "log", lambda *a, **k: None):
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        time.sleep(0.3)  # let it bind and enter its wait loop
+        assert not returned.is_set(), "server exited before any signal arrived"
+
+        drainable_server._enter_turn()  # a turn is now mid-flight
+        os.kill(os.getpid(), signal.SIGTERM)  # the pod is rolled
+
+        time.sleep(1.0)
+        assert drainable_server.shutdown_requested() is True
+        assert not returned.is_set(), \
+            "server exited while a turn was still in flight -- the reply would be lost"
+
+        drainable_server._leave_turn()  # the turn finishes and returns its text
+        assert returned.wait(timeout=10), "server did not exit after the drain completed"
+
+
+def test_start_server_keeps_serving_when_no_signal_arrives(drainable_server):
+    """The other half: the drain must not fire on its own."""
+    returned = threading.Event()
+
+    def run():
+        drainable_server.start_server()
+        returned.set()
+
+    with patch.object(drainable_server, "PORT", 0), \
+         patch.object(drainable_server, "log", lambda *a, **k: None):
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        time.sleep(1.0)
+        assert not returned.is_set()
+        drainable_server._shutdown_requested = True  # let the thread finish
+        assert returned.wait(timeout=10)
+
+
+def test_do_post_refuses_a_new_turn_while_draining(drainable_server):
+    """Accepting a 45-minute turn on a pod that is already shutting down
+    guarantees losing it. Fail fast instead."""
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
+    drainable_server._shutdown_requested = True
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=AssertionError("must not start a turn")):
+        handler.do_POST()
+    assert sent["status"] == 503
+    assert sent["payload"]["error"] == "shutting_down"
+
+
+def test_do_post_counts_a_turn_as_in_flight_only_while_generate_runs(drainable_server):
+    seen = {}
+
+    def fake_generate(conversation_id, system, prompt, **kwargs):
+        seen["during"] = server._in_flight
+        return "answer", ""
+
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=fake_generate):
+        handler.do_POST()
+
+    assert seen["during"] == 1
+    assert server._in_flight == 0
+    assert sent["status"] == 200
+
+
+def test_a_failing_turn_still_decrements_the_in_flight_count(drainable_server):
+    """Otherwise one crashed turn makes every later drain hang until the
+    grace period runs out and Kubernetes SIGKILLs the pod anyway."""
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", side_effect=server.ClaudeCliError("boom")):
+        handler.do_POST()
+    assert sent["status"] == 502
+    assert server._in_flight == 0
+
+
+def test_await_drain_returns_immediately_when_nothing_is_in_flight(drainable_server):
+    started = time.monotonic()
+    with patch.object(server, "log", lambda *a, **k: None):
+        server._await_drain()
+    assert time.monotonic() - started < 1.0
+
+
+def test_health_reports_whether_the_pod_is_draining(drainable_server):
+    handler, sent = _make_handler({}, path="/health")
+    handler.do_GET()
+    assert sent["payload"] == {"status": "ok", "draining": False}
+
+    server._shutdown_requested = True
+    handler, sent = _make_handler({}, path="/health")
+    handler.do_GET()
+    assert sent["payload"]["draining"] is True
+
+
+def test_enter_turn_refuses_once_draining_has_started(drainable_server):
+    """The check and the increment must be atomic. If a turn could register
+    itself after the flag was set, _await_drain could already have seen zero
+    and let the process exit on top of it."""
+    server._shutdown_requested = True
+    assert server._enter_turn() is False
+    assert server._in_flight == 0
+
+
+def test_enter_turn_admits_a_turn_while_serving_normally(drainable_server):
+    assert server._enter_turn() is True
+    assert server._in_flight == 1
+    server._leave_turn()
+    assert server._in_flight == 0
