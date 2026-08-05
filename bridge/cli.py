@@ -25,6 +25,7 @@ import time
 from bridge.activity import ActivityReporter
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
+from bridge.quota import QuotaWatcher, write_hook_settings
 
 SESSION_NOT_FOUND = "\x00SESSION_NOT_FOUND"
 
@@ -84,6 +85,11 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
         "--verbose",
         "--dangerously-skip-permissions",
     ]
+    # Lets the session see its own remaining quota while it runs, so it can
+    # wrap up deliberately instead of being cut off mid-sentence (quota.py).
+    hook_settings = write_hook_settings()
+    if hook_settings:
+        cmd.extend(["--settings", hook_settings])
     if disallowed_tools:
         cmd.extend(["--disallowedTools", disallowed_tools])
     if session_id:
@@ -113,6 +119,10 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
     reporter = ActivityReporter(activity)
     reporter.start()
 
+    # Polls remaining quota into a snapshot file the hook above reads.
+    watcher = QuotaWatcher()
+    watcher.start()
+
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -137,6 +147,11 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
                             text_parts.append(chunk)
                     elif block.get("type") == "tool_use":
                         reporter.report(block.get("name", ""), block.get("input"))
+            elif t == "rate_limit_event":
+                # The API's own view of the cap, carried on the stream for
+                # free. No percentage in it -- it triggers a fresh reading
+                # rather than being reported directly (quota.py).
+                watcher.note_rate_limit_event(event.get("rate_limit_info"))
             elif t in ("result", "system"):
                 sid = event.get("session_id", "")
                 if sid:
@@ -163,6 +178,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
         if proc.stdout:
             proc.stdout.close()
         reporter.close()
+        watcher.close()
 
     elapsed = time.monotonic() - t0
     log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "

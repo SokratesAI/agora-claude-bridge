@@ -1,0 +1,295 @@
+"""Covers the quota warning path: reading usage, turning it into a
+remaining-percentage snapshot, and the hook that reports it to a running
+session.
+
+The thing actually being protected here is that a cycle finds out it is
+nearly out of quota *while it can still act*. So the tests that matter
+most are the ones about when the hook stays quiet -- a warning that fires
+on all 300 tool calls is as useless as one that never fires, just
+expensive instead of silent.
+"""
+import io
+import json
+import time
+from unittest.mock import patch
+
+import pytest
+
+from bridge import quota
+from bridge.hooks import quota_notice
+
+
+# A real response, trimmed: the several always-null experiment windows are
+# kept because ignoring them correctly is one of the things under test.
+USAGE_PAYLOAD = {
+    "five_hour": {"utilization": 90.0, "resets_at": "2026-08-05T04:50:00.711083+00:00"},
+    "seven_day": {"utilization": 57.0, "resets_at": "2026-08-05T17:00:00.711105+00:00"},
+    "seven_day_opus": None,
+    "tangelo": None,
+}
+
+
+# ---------------------------------------------------------------------------
+# summarize -- utilization (used) -> remaining, and which window binds
+# ---------------------------------------------------------------------------
+
+def test_summarize_converts_utilization_to_remaining():
+    summary = quota.summarize(USAGE_PAYLOAD)
+    by_name = {w["window"]: w for w in summary["windows"]}
+    assert by_name["five_hour"]["remaining_pct"] == 10.0
+    assert by_name["seven_day"]["remaining_pct"] == 43.0
+
+
+def test_summarize_tightest_is_the_window_with_least_left():
+    summary = quota.summarize(USAGE_PAYLOAD)
+    assert summary["tightest"]["window"] == "five_hour"
+
+
+def test_summarize_tightest_can_be_the_seven_day_window():
+    """The five-hour window resets constantly; the seven-day one is what
+    actually stops a run of cycles. Reading only the first would report
+    "plenty left" on a nearly-spent week."""
+    payload = {
+        "five_hour": {"utilization": 5.0, "resets_at": ""},
+        "seven_day": {"utilization": 96.0, "resets_at": ""},
+    }
+    assert quota.summarize(payload)["tightest"]["window"] == "seven_day"
+
+
+def test_summarize_ignores_null_experiment_windows():
+    assert {w["window"] for w in quota.summarize(USAGE_PAYLOAD)["windows"]} == {
+        "five_hour", "seven_day"}
+
+
+def test_summarize_returns_none_when_nothing_usable():
+    assert quota.summarize({"seven_day_opus": None}) is None
+    assert quota.summarize({"five_hour": {"utilization": None}}) is None
+    assert quota.summarize(None) is None
+
+
+def test_summarize_clamps_overspent_window_to_zero():
+    """The endpoint reports over 100 once a window is blown, and a
+    "-4% remaining" in a warning reads as a bug rather than as danger."""
+    summary = quota.summarize({"five_hour": {"utilization": 104.0}})
+    assert summary["tightest"]["remaining_pct"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# fetch_usage -- best-effort, never raises into the turn it is watching
+# ---------------------------------------------------------------------------
+
+def test_fetch_usage_returns_none_without_a_token():
+    with patch.object(quota, "_read_access_token", return_value=""):
+        assert quota.fetch_usage() is None
+
+
+def test_fetch_usage_swallows_network_errors():
+    with patch.object(quota, "_read_access_token", return_value="tok"), \
+         patch("urllib.request.urlopen", side_effect=OSError("no route to host")):
+        assert quota.fetch_usage() is None
+
+
+def test_read_access_token_is_reread_each_call(tmp_path):
+    """The CLI rotates this file mid-session; a cached token goes 401
+    exactly when the warning matters most."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    creds = home / ".claude" / ".credentials.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "first"}}))
+    with patch.object(quota, "CLAUDE_HOME", str(home)):
+        assert quota._read_access_token() == "first"
+        creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "second"}}))
+        assert quota._read_access_token() == "second"
+
+
+def test_read_access_token_survives_a_missing_file(tmp_path):
+    with patch.object(quota, "CLAUDE_HOME", str(tmp_path)):
+        assert quota._read_access_token() == ""
+
+
+# ---------------------------------------------------------------------------
+# snapshot file -- the handoff between the bridge process and the hook
+# ---------------------------------------------------------------------------
+
+def test_snapshot_roundtrip(tmp_path):
+    path = str(tmp_path / "snap.json")
+    assert quota.write_snapshot(quota.summarize(USAGE_PAYLOAD), path)
+    loaded = quota.read_snapshot(path)
+    assert loaded["tightest"]["remaining_pct"] == 10.0
+    assert loaded["fetched_at"] > 0
+
+
+def test_read_snapshot_returns_none_when_absent_or_junk(tmp_path):
+    missing = str(tmp_path / "nope.json")
+    assert quota.read_snapshot(missing) is None
+    junk = tmp_path / "junk.json"
+    junk.write_text("{not json")
+    assert quota.read_snapshot(str(junk)) is None
+    empty = tmp_path / "empty.json"
+    empty.write_text("{}")
+    assert quota.read_snapshot(str(empty)) is None
+
+
+def test_write_snapshot_leaves_no_partial_file_behind(tmp_path):
+    """Written via a temp file and os.replace: the hook can read at any
+    instant, and a half-written snapshot parses as absent -- silently
+    turning the warning off at random."""
+    path = str(tmp_path / "snap.json")
+    quota.write_snapshot(quota.summarize(USAGE_PAYLOAD), path)
+    assert [p.name for p in tmp_path.iterdir()] == ["snap.json"]
+
+
+def test_refresh_writes_nothing_when_the_endpoint_is_unusable(tmp_path):
+    path = str(tmp_path / "snap.json")
+    with patch.object(quota, "fetch_usage", return_value=None):
+        assert quota.refresh(path) is False
+    assert quota.read_snapshot(path) is None
+
+
+# ---------------------------------------------------------------------------
+# QuotaWatcher -- the rate_limit_event trigger
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status,should_wake", [
+    ("allowed", False),
+    ("allowed_warning", True),
+    ("rejected", True),
+])
+def test_rate_limit_event_wakes_the_poller_only_when_not_allowed(status, should_wake):
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+    watcher.note_rate_limit_event({"status": status})
+    assert watcher._wake.is_set() is should_wake
+
+
+def test_rate_limit_event_tolerates_a_missing_or_odd_payload():
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+    watcher.note_rate_limit_event(None)
+    watcher.note_rate_limit_event("nonsense")
+    watcher.note_rate_limit_event({})
+    assert not watcher._wake.is_set()
+
+
+# ---------------------------------------------------------------------------
+# hook -- bands, and when it stays quiet
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("remaining,band", [
+    (100.0, 0), (50.0, 0), (10.1, 0),
+    (10.0, 1), (5.1, 1),
+    (5.0, 2), (0.6, 2),
+    (0.5, 3), (0.0, 3),
+])
+def test_band_boundaries(remaining, band):
+    assert quota_notice.band_for(remaining) == band
+
+
+def drive_hook(stdin_text, tmp_path, snapshot):
+    """Drive the hook exactly as the CLI does -- JSON on stdin, one line of
+    JSON or nothing on stdout. Returns the additionalContext, or None.
+
+    Real stdin rather than a patched json.load: the hook also reads its own
+    dedupe state with json.load, and patching that globally quietly
+    disables the very deduplication these tests exist to check.
+    """
+    printed = []
+    with patch.object(quota_notice.quota, "read_snapshot", return_value=snapshot), \
+         patch.object(quota_notice, "STATE_FILE", str(tmp_path / "announced.json")), \
+         patch("sys.stdin", io.StringIO(stdin_text)), \
+         patch("builtins.print", side_effect=lambda s: printed.append(s)):
+        quota_notice.main()
+    if not printed:
+        return None
+    return json.loads(printed[0])["hookSpecificOutput"]["additionalContext"]
+
+
+def run_hook(tmp_path, remaining, event, session_id="sess-1", fetched_at=None, resets=""):
+    snapshot = {
+        "tightest": {"window": "five_hour", "remaining_pct": remaining, "resets_at": resets},
+        "fetched_at": fetched_at if fetched_at is not None else time.time(),
+    }
+    stdin = json.dumps({"hook_event_name": event, "session_id": session_id})
+    return drive_hook(stdin, tmp_path, snapshot)
+
+
+def test_prompt_submit_always_reports_even_with_plenty_left(tmp_path):
+    """A cycle gets exactly one of these, and knowing it starts at 43%
+    changes what it should attempt."""
+    out = run_hook(tmp_path, 43.0, "UserPromptSubmit")
+    assert "43% of your 5-hour Claude quota remains" in out
+    assert "QUOTA" not in out
+
+
+def test_post_tool_use_is_silent_while_there_is_room(tmp_path):
+    assert run_hook(tmp_path, 43.0, "PostToolUse") is None
+
+
+def test_post_tool_use_warns_at_edvards_ten_percent(tmp_path):
+    out = run_hook(tmp_path, 9.0, "PostToolUse")
+    assert out.startswith("QUOTA LOW")
+    assert "journal.md" in out and "reply to Edvard" in out
+
+
+def test_a_band_is_announced_once_not_on_every_tool_call(tmp_path):
+    """The reason this dedupe exists: ~60 tokens on each of ~300 tool
+    calls is ~18k tokens spent restating one warning, in a session whose
+    problem is that it is running out of budget."""
+    assert run_hook(tmp_path, 9.0, "PostToolUse") is not None
+    assert run_hook(tmp_path, 9.0, "PostToolUse") is None
+    assert run_hook(tmp_path, 8.0, "PostToolUse") is None
+
+
+def test_getting_worse_escalates_to_the_next_band(tmp_path):
+    assert run_hook(tmp_path, 9.0, "PostToolUse").startswith("QUOTA LOW")
+    assert run_hook(tmp_path, 4.0, "PostToolUse").startswith("QUOTA CRITICAL")
+    assert run_hook(tmp_path, 0.0, "PostToolUse").startswith("QUOTA SPENT")
+
+
+def test_a_new_session_hears_the_warning_again(tmp_path):
+    """Bands announced to the previous cycle were heard by a process that
+    no longer exists."""
+    assert run_hook(tmp_path, 9.0, "PostToolUse", session_id="sess-1") is not None
+    assert run_hook(tmp_path, 9.0, "PostToolUse", session_id="sess-2") is not None
+
+
+def test_reset_time_is_reported_in_oslo_not_utc(tmp_path):
+    """Rule 7. 04:50 UTC is 06:50 in Oslo on this date."""
+    out = run_hook(tmp_path, 9.0, "PostToolUse", resets="2026-08-05T04:50:00.711083+00:00")
+    assert "resets 06:50 Oslo" in out
+
+
+def test_a_stale_reading_is_reported_with_its_age_not_suppressed(tmp_path):
+    """Silence is the failure this whole feature exists to remove; a
+    number 12 minutes old still says whether it is 80% or 4%."""
+    stale = time.time() - (12 * 60)
+    out = run_hook(tmp_path, 9.0, "PostToolUse", fetched_at=stale)
+    assert "12 min old" in out
+
+
+def test_hook_is_silent_when_there_is_no_snapshot(tmp_path):
+    stdin = json.dumps({"hook_event_name": "PostToolUse", "session_id": "s"})
+    assert drive_hook(stdin, tmp_path, None) is None
+
+
+def test_hook_is_silent_on_unreadable_stdin(tmp_path):
+    snapshot = {"tightest": {"window": "five_hour", "remaining_pct": 1.0, "resets_at": ""},
+                "fetched_at": time.time()}
+    assert drive_hook("not json at all", tmp_path, snapshot) is None
+
+
+# ---------------------------------------------------------------------------
+# hook settings -- what actually attaches the hook to the CLI invocation
+# ---------------------------------------------------------------------------
+
+def test_hook_settings_registers_both_events(tmp_path):
+    path = quota.write_hook_settings(str(tmp_path / "s.json"))
+    hooks = json.load(open(path))["hooks"]
+    assert set(hooks) == {"UserPromptSubmit", "PostToolUse"}
+    assert hooks["PostToolUse"][0]["matcher"] == "*"
+    assert quota.HOOK_SCRIPT in hooks["PostToolUse"][0]["hooks"][0]["command"]
+
+
+def test_hook_settings_failure_degrades_to_no_hook(tmp_path):
+    """cli.py treats "" as "run without the hook" -- an unwritable config
+    dir must not stop a cycle from running at all."""
+    with patch("json.dump", side_effect=OSError("read-only fs")):
+        assert quota.write_hook_settings(str(tmp_path / "s.json")) == ""
