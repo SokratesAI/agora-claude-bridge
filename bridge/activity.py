@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 
 from bridge.log import log
+from bridge.redact import redact
 
 POST_TIMEOUT_SECONDS = 5
 
@@ -116,6 +117,27 @@ def result_text(block):
         elif item.get("type"):
             parts.append(f"[{item['type']}]")
     return "\n".join(parts)[:OUTPUT_CHARS_MAX]
+
+
+# The fields carrying text a human will read. `token` is deliberately not
+# among them: it is this post's own credential, issued by the runner for
+# this one conversation, and redacting it would break the report rather
+# than protect anything.
+_READABLE_FIELDS = ("detail", "output")
+
+
+def _scrubbed(payload):
+    """`payload` with credentials stripped out of its human-read fields.
+
+    Done here, at the one point everything leaves for the runner, rather
+    than in each report method -- narration and results both had to be
+    covered, and a third call site added later would otherwise ship
+    unfiltered by simply not knowing about this (redact.py).
+    """
+    for field in _READABLE_FIELDS:
+        if field in payload:
+            payload[field] = redact(payload[field])
+    return payload
 
 
 def _post(url, payload):
@@ -236,7 +258,7 @@ class ActivityReporter:
             # narration for the rest of the session -- the exact
             # fails-invisibly shape this whole feature exists to remove.
             try:
-                ok = _post(self._url, dict(item, token=self._token))
+                ok = _post(self._url, _scrubbed(dict(item, token=self._token)))
             except Exception:
                 ok = False
             if not ok:
