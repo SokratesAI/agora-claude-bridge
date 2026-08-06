@@ -109,7 +109,7 @@ def _await_drain():
 
 
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
-             activity=None):
+             activity=None, mcp=None):
     """One turn for one conversation. First turn (no stored session)
     prepends the system/persona prompt to the message -- a resumed session
     already has that context from turn 1, so later turns send just the new
@@ -133,13 +133,20 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
 
     activity (2026-08-03, absent by default): {"url", "token"} the caller
     wants every tool call reported to as it happens, so a session that runs
-    for 45 minutes isn't a black box until it returns. See activity.py."""
+    for 45 minutes isn't a black box until it returns. See activity.py.
+
+    mcp (2026-08-06, absent by default): {"url", "token"} for an HTTP MCP
+    server the caller is hosting for the length of this turn -- how the
+    runner hands a claude-cli persona the same capability tools every
+    other provider already has (agora-persona-runner/tools_mcp.py). Absent
+    means no --mcp-config flag at all, which is what every caller did
+    before this existed."""
     if stateless:
         message = f"{system}\n\n{prompt}"
         text, thinking, _ = run_turn(
             message, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
-            activity=activity,
+            activity=activity, mcp=mcp,
         )
         return text, thinking
 
@@ -150,7 +157,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     try:
         text, thinking, new_session_id = run_turn(
             message, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
-            activity=activity,
+            activity=activity, mcp=mcp,
         )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
@@ -159,7 +166,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             message = f"{system}\n\n{prompt}"
             text, thinking, new_session_id = run_turn(
                 message, session_id=None, model=model, disallowed_tools=disallowed_tools,
-                activity=activity,
+                activity=activity, mcp=mcp,
             )
         else:
             raise
@@ -211,6 +218,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             restricted = bool(payload.get("restricted", False))
             stateless = bool(payload.get("stateless", False))
             activity = payload.get("activity")
+            mcp = payload.get("mcp")
 
             if not _enter_turn():
                 # Starting a 45-minute turn on a pod that is already
@@ -221,7 +229,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             try:
                 text, thinking = generate(
                     conversation_id, system, prompt, model=model, restricted=restricted,
-                    stateless=stateless, activity=activity,
+                    stateless=stateless, activity=activity, mcp=mcp,
                 )
             finally:
                 _leave_turn()

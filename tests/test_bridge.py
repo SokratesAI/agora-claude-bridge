@@ -307,7 +307,8 @@ def test_run_turn_serializes_via_module_level_lock(tmp_path):
 def test_generate_prepends_system_prompt_on_first_turn():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply", "", "sess-new"
@@ -326,7 +327,8 @@ def test_generate_prepends_system_prompt_on_first_turn():
 def test_generate_sends_only_new_message_on_resumed_turn():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply2", "", "sess-existing"
@@ -343,7 +345,8 @@ def test_generate_sends_only_new_message_on_resumed_turn():
 def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         calls.append((message, session_id))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -364,7 +367,8 @@ def test_generate_retries_fresh_on_session_not_found():
 
 
 def test_generate_propagates_other_cli_errors_without_retry():
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -376,7 +380,8 @@ def test_generate_propagates_other_cli_errors_without_retry():
 def test_generate_is_unrestricted_by_default():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -391,7 +396,8 @@ def test_generate_is_unrestricted_by_default():
 def test_generate_restricted_true_passes_the_full_tool_roster():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -406,7 +412,8 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
 def test_generate_stateless_always_sends_full_system_and_no_resume():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         captured["message"] = message
         captured["session_id"] = session_id
         return "reply", "", "sess-should-be-ignored"
@@ -424,7 +431,8 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
 
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -439,7 +447,8 @@ def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation()
 def test_generate_stateless_can_combine_with_restricted():
     captured = {}
 
-    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -503,6 +512,7 @@ def test_do_post_passes_restricted_flag_through_to_generate():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      mcp=None,
                       activity=None):
         captured["restricted"] = restricted
         return "answer", ""
@@ -518,6 +528,7 @@ def test_do_post_restricted_defaults_false_when_omitted():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      mcp=None,
                       activity=None):
         captured["restricted"] = restricted
         return "answer", ""
@@ -535,6 +546,7 @@ def test_do_post_passes_stateless_flag_through_to_generate():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      mcp=None,
                       activity=None):
         captured["stateless"] = stateless
         return "answer", ""
@@ -550,6 +562,7 @@ def test_do_post_stateless_defaults_false_when_omitted():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
+                      mcp=None,
                       activity=None):
         captured["stateless"] = stateless
         return "answer", ""
@@ -888,7 +901,7 @@ def test_do_post_passes_activity_through_to_generate():
     })
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False,
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
                       stateless=False, activity=None):
         captured["activity"] = activity
         return "answer", ""
@@ -905,7 +918,7 @@ def test_do_post_activity_defaults_to_none_when_omitted():
     handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi", "system": "sys"})
     captured = {}
 
-    def fake_generate(conversation_id, system, prompt, model=None, restricted=False,
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
                       stateless=False, activity=None):
         captured["activity"] = activity
         return "answer", ""
@@ -1346,3 +1359,113 @@ def test_enter_turn_admits_a_turn_while_serving_normally(drainable_server):
     assert server._in_flight == 1
     server._leave_turn()
     assert server._in_flight == 0
+
+
+# ---------------------------------------------------------------------------
+# --mcp-config: Agora's own capability tools, handed to the CLI session
+# (2026-08-06). Edvard: "There are different tools for you and Gemini? That
+# should not be the case." The runner hosts them; this side only has to
+# render the flag, and above all has to never render a broken one.
+# ---------------------------------------------------------------------------
+
+MCP_BLOCK = {"url": "http://runner.agents.svc:8082/mcp", "token": "tok-abc"}
+
+
+def _cli_run_capturing_cmd(tmp_path, **run_turn_kwargs):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # Read the config while the subprocess would still exist -- it is
+        # deleted in the finally, so afterwards there is nothing to read.
+        if "--mcp-config" in cmd:
+            path = cmd[cmd.index("--mcp-config") + 1]
+            captured["config_path"] = path
+            with open(path) as handle:
+                captured["config"] = json.load(handle)
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "MCP_CONFIG_FILE", str(tmp_path / "home" / "mcp.json")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", **run_turn_kwargs)
+    return captured
+
+
+def test_run_turn_sends_no_mcp_flag_when_the_caller_asks_for_none(tmp_path):
+    """Every caller before 2026-08-06 sent no `mcp` block, and must keep
+    getting exactly the invocation it used to."""
+    captured = _cli_run_capturing_cmd(tmp_path)
+    assert "--mcp-config" not in captured["cmd"]
+    assert "--strict-mcp-config" not in captured["cmd"]
+
+
+def test_run_turn_passes_a_strict_mcp_config_when_given_a_block(tmp_path):
+    captured = _cli_run_capturing_cmd(tmp_path, mcp=MCP_BLOCK)
+    assert "--mcp-config" in captured["cmd"]
+    # Without --strict, the CLI would ALSO load whatever is registered in
+    # the PVC's ~/.claude.json -- persistent state no caller asked for.
+    assert "--strict-mcp-config" in captured["cmd"]
+    assert captured["config"] == {"mcpServers": {"agora": {
+        "type": "http",
+        "url": "http://runner.agents.svc:8082/mcp",
+        "headers": {"Authorization": "Bearer tok-abc"},
+    }}}
+
+
+def test_run_turn_deletes_the_mcp_config_when_the_turn_ends(tmp_path):
+    """It holds the turn's bearer token; the turn is over."""
+    captured = _cli_run_capturing_cmd(tmp_path, mcp=MCP_BLOCK)
+    assert not os.path.exists(captured["config_path"])
+
+
+def test_write_mcp_config_is_always_valid_json(tmp_path):
+    """The one hazard worth a test of its own. Measured on CLI 2.1.197: an
+    unreachable MCP server is harmless (the turn completes, exit 0), but a
+    --mcp-config file that is not valid JSON aborts the CLI before the
+    model is called at all. A token carrying a quote or a newline must
+    therefore never be able to break the file -- which is what building it
+    with json.dump instead of interpolation buys."""
+    path = str(tmp_path / "mcp.json")
+    written = cli.write_mcp_config(
+        {"url": 'http://x/mcp?a="b"', "token": 'tok"with\nnasty\\chars'}, path=path)
+    assert written == path
+    with open(path) as handle:
+        config = json.load(handle)  # raises if this ever stops being valid JSON
+    server = config["mcpServers"]["agora"]
+    assert server["headers"]["Authorization"] == 'Bearer tok"with\nnasty\\chars'
+
+
+@pytest.mark.parametrize("block", [
+    None, {}, "not-a-dict",
+    {"url": "http://x/mcp"},              # no token: would connect anonymously
+    {"token": "tok"},                     # no url
+    {"url": "  ", "token": "tok"},        # blank url
+])
+def test_write_mcp_config_returns_empty_for_anything_unusable(block, tmp_path):
+    """Every rejection path returns "" (run without MCP) rather than
+    raising or writing a half-formed server."""
+    path = str(tmp_path / "mcp.json")
+    assert cli.write_mcp_config(block, path=path) == ""
+    assert not os.path.exists(path)
+
+
+def test_write_mcp_config_returns_empty_when_it_cannot_write(tmp_path):
+    """A failed write must degrade to "no MCP tools this turn", never to a
+    flag pointing at a file that isn't there -- the CLI treats that as an
+    invalid configuration and refuses to start."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a directory")
+    assert cli.write_mcp_config(MCP_BLOCK, path=str(blocker / "sub" / "mcp.json")) == ""
+
+
+def test_run_turn_still_runs_when_the_mcp_config_cannot_be_written(tmp_path):
+    """The degradation path, end to end: no flag, turn completes."""
+    with patch.object(cli, "write_mcp_config", return_value=""):
+        captured = _cli_run_capturing_cmd(tmp_path, mcp=MCP_BLOCK)
+    assert "--mcp-config" not in captured["cmd"]
