@@ -18,6 +18,7 @@ no upside to async here since we want serialization, not parallelism.
 """
 import json
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -105,6 +106,11 @@ def write_mcp_config(mcp, path=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
             json.dump(config, handle)
+        # 600 -- for the length of the turn this file is a live bearer
+        # token for the runner's tool endpoint, so it gets the same
+        # treatment credentials.py gives .credentials.json rather than the
+        # 644 the quota hook's settings file is fine with.
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         return path
     except Exception as exc:
         log(f"mcp config write failed: {type(exc).__name__}: {exc}")

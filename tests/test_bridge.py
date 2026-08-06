@@ -1469,3 +1469,11 @@ def test_run_turn_still_runs_when_the_mcp_config_cannot_be_written(tmp_path):
     with patch.object(cli, "write_mcp_config", return_value=""):
         captured = _cli_run_capturing_cmd(tmp_path, mcp=MCP_BLOCK)
     assert "--mcp-config" not in captured["cmd"]
+
+
+def test_write_mcp_config_is_not_world_readable(tmp_path):
+    """For the length of the turn it is a live bearer token for the
+    runner's tool endpoint, on a shared PVC."""
+    path = str(tmp_path / "mcp.json")
+    cli.write_mcp_config(MCP_BLOCK, path=path)
+    assert stat_module.S_IMODE(os.stat(path).st_mode) == 0o600
