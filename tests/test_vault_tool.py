@@ -12,6 +12,19 @@ def env(monkeypatch):
     monkeypatch.setenv("CDB_PASS", "p")
     monkeypatch.setenv("CDB_DB", "obsidian")
 
+    # _client_with_fake_req only replaces VaultClient._doc; anything calling
+    # the module-level _req directly (delete's DELETE, recent's _find) went
+    # to the network unfaked. That is harmless on a laptop and not harmless
+    # here -- the bridge pod resolves CDB_BASE, so such a test runs against
+    # the REAL vault. Found 2026-08-06 when a new delete test passed in-pod
+    # and failed in CI, where there is no DNS. Fail loudly instead.
+    def _no_network(method, base, db, auth, path, body=None):
+        raise AssertionError(
+            f"test made a real _req call ({method} {path}) -- patch "
+            "vault_tool._req for this test instead"
+        )
+    monkeypatch.setattr(vault_tool, "_req", _no_network)
+
 
 def _client_with_fake_req(responses):
     """responses: dict of (method, doc_id) -> (status, body), consumed via a
@@ -71,10 +84,18 @@ def test_delete_does_not_copy_content_into_the_vault(env):
     backups folder itself created new backups of it."""
     client, calls = _client_with_fake_req({
         ("GET", "doomed.md"): (200, {"data": "content", "children": [], "_rev": "1-abc"}),
-        ("DELETE", "doomed.md"): (200, {}),
     })
-    client.delete("doomed.md")
+    sent = []
+
+    def fake_req(method, base, db, auth, path, body=None):
+        sent.append((method, path))
+        return 200, {"ok": True}
+
+    with patch.object(vault_tool, "_req", fake_req):
+        assert client.delete("doomed.md") == "deleted"
+
     assert [c for c in calls if c[0] == "PUT"] == []
+    assert [m for m, _ in sent] == ["DELETE"]
 
 
 def test_append_fails_when_file_does_not_exist(env):
