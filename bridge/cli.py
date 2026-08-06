@@ -18,6 +18,7 @@ no upside to async here since we want serialization, not parallelism.
 """
 import json
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -54,6 +55,68 @@ DISCOVERED_FULL_TOOL_ROSTER = (
 )
 
 
+# Where the per-call --mcp-config file is written, alongside the quota
+# hook's --settings file and for the same reason (quota.py:190): a flag is
+# scoped to the invocation, while registering the server in ~/.claude.json
+# would leave it on the PVC long after the turn that wanted it is gone.
+MCP_CONFIG_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-mcp.config.json")
+
+# What the runner's MCP server is called on the CLI side. Its tools reach
+# the model as mcp__agora__<tool_name>.
+MCP_SERVER_NAME = "agora"
+
+
+def write_mcp_config(mcp, path=None):
+    """Render the caller's {"url", "token"} into a --mcp-config file and
+    return its path, or "" meaning "run this turn without it".
+
+    Every failure mode here returns "" rather than raising, and that is
+    the entire job of this function. Measured against CLI 2.1.197 on
+    2026-08-06, because the two halves are not symmetric:
+
+      * An MCP server that cannot be reached is harmless -- the CLI logs
+        the failed server and completes the turn normally, exit 0. So a
+        runner that stops serving /mcp costs a session its capability
+        tools and nothing else.
+      * A --mcp-config file that is not valid JSON is NOT harmless. The
+        CLI refuses to start at all ("Error: Invalid MCP configuration:
+        MCP config is not a valid JSON", exit 1), before the model is
+        ever called. Every turn would die, including ones that would have
+        been perfectly fine with no MCP server at all.
+
+    That asymmetry is why the config is built with json.dump from a dict
+    instead of interpolated, why the write is guarded, and why an
+    incomplete `mcp` block (missing url or token) returns "" rather than
+    writing a server the CLI would then connect to unauthenticated.
+    """
+    if not isinstance(mcp, dict) or not mcp:
+        return ""
+    url = str(mcp.get("url", "")).strip()
+    token = str(mcp.get("token", "")).strip()
+    if not url or not token:
+        log(f"mcp config skipped: need both url and token (url={bool(url)} token={bool(token)})")
+        return ""
+    config = {"mcpServers": {MCP_SERVER_NAME: {
+        "type": "http",
+        "url": url,
+        "headers": {"Authorization": f"Bearer {token}"},
+    }}}
+    path = path or MCP_CONFIG_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump(config, handle)
+        # 600 -- for the length of the turn this file is a live bearer
+        # token for the runner's tool endpoint, so it gets the same
+        # treatment credentials.py gives .credentials.json rather than the
+        # 644 the quota hook's settings file is fine with.
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        return path
+    except Exception as exc:
+        log(f"mcp config write failed: {type(exc).__name__}: {exc}")
+        return ""
+
+
 class UsageLimitError(Exception):
     """Real, hours-long subscription usage cap -- distinct from a transient
     per-call error. Callers should NOT retry immediately."""
@@ -73,7 +136,7 @@ def _detect_usage_limit(text):
     return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
 
 
-def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
+def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
@@ -90,6 +153,25 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
     hook_settings = write_hook_settings()
     if hook_settings:
         cmd.extend(["--settings", hook_settings])
+    # Agora's own capability tools (vault_read, kubectl_read, create_pr,
+    # ...), served by the caller over MCP so a claude-cli persona runs the
+    # same toolset every other provider does. --strict-mcp-config keeps
+    # this to exactly the caller's server: without it the CLI would also
+    # pick up whatever is registered in the PVC's ~/.claude.json, which is
+    # persistent state no caller asked for and nobody audits.
+    #
+    # Expect the `system`/`init` event to report this server as
+    # "status": "pending" with zero mcp__agora__* tools in the roster. That
+    # is NOT a failure and does not need diagnosing again: init is emitted
+    # before the handshake finishes. Measured in this pod, 2026-08-06, over
+    # three runs -- initialize lands at 1.20/1.28/1.34s and tools/list at
+    # 1.38/1.44/1.60s after the process starts, so the tools are live from
+    # roughly 1.5s in. The only turn that can miss them is one whose first
+    # and last action both happen inside that window; a persona cycle runs
+    # for tens of minutes and cannot.
+    mcp_config = write_mcp_config(mcp)
+    if mcp_config:
+        cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
     if disallowed_tools:
         cmd.extend(["--disallowedTools", disallowed_tools])
     if session_id:
@@ -228,6 +310,16 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
             proc.stdout.close()
         reporter.close()
         watcher.close()
+        # The config file holds this turn's bearer token, and the turn is
+        # over -- the caller revokes the grant as its own call returns, so
+        # what is left on the PVC is inert, but there is no reason to leave
+        # a credential-shaped file lying on a persistent volume. The
+        # subprocess read it at startup and has already exited.
+        if mcp_config:
+            try:
+                os.remove(mcp_config)
+            except OSError as exc:
+                log(f"mcp config cleanup failed: {type(exc).__name__}: {exc}")
 
     elapsed = time.monotonic() - t0
     log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "
@@ -272,7 +364,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None):
 _invocation_lock = threading.Lock()
 
 
-def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None):
+def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+             mcp=None):
     """One turn. Returns (text, thinking, new_session_id).
 
     disallowed_tools: comma-separated tool names to block for this call
@@ -283,10 +376,14 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
     reported to, live, while this turn runs (see activity.py). Omit it and
     nothing is reported.
 
+    mcp: optional {"url", "token"} for an HTTP MCP server the caller wants
+    this turn's model to have (see write_mcp_config). Omit it and the CLI
+    is invoked with no MCP configuration at all, exactly as before.
+
     Raises UsageLimitError on a real subscription cap, ClaudeCliError on
     anything else that prevented a usable reply (including the
     SESSION_NOT_FOUND sentinel message -- callers should clear their stored
     session_id and retry once with session_id=None on that specific case).
     """
     with _invocation_lock:
-        return _run_cli_once(message, session_id, model, disallowed_tools, activity)
+        return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp)
