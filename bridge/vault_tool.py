@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """vault_tool -- CouchDB (Obsidian LiveSync) read/write, for use from
-inside a claude-cli session's own Bash tool. Same wire format and same
-backup-before-overwrite discipline as agora_runner/vault.py (the tool
-belt agora-persona-runner's gemini/anthropic personas already use) and
-~/vault-tools/vault_tool.py (the interactive-session equivalent) --
-kept as a third, independent copy rather than an import because this
-image has no dependency on either of those repos and shouldn't grow one
-just for this.
+inside a claude-cli session's own Bash tool. Same wire format as
+agora_runner/vault.py (the tool belt agora-persona-runner's
+gemini/anthropic personas already use) and ~/vault-tools/vault_tool.py
+(the interactive-session equivalent) -- kept as a third, independent
+copy rather than an import because this image has no dependency on
+either of those repos and shouldn't grow one just for this.
 
 Usage (from Bash inside the bridge pod):
   python3 -m bridge.vault_tool get    <path>
@@ -22,11 +21,15 @@ Env: CDB_BASE, CDB_USER, CDB_PASS, CDB_DB (default "obsidian").
 
 All paths are lowercased before use, always (standing vault-wide
 convention -- see CLAUDE.md/memory `feedback-always-use-lowercase-vault-paths`).
-Every overwrite/delete backs up the previous content into the vault
-itself first, under `agora/backups/<timestamp> <basename>` -- mirrors
-agora_runner/vault.py's vault_write_path, not the interactive tool's
-local-disk backup dir, since this pod has no host filesystem a human
-would ever look at.
+
+Overwrites and deletes are NOT backed up into the vault. They used to
+be, under `agora/backups/<timestamp> <basename>`, which cost one extra
+document per write and grew to 272 of them before Edvard asked for it
+to stop (2026-08-05): "since the switch to Nova, this is just noise."
+The real safety net was never this copy -- it is the daily snapshot of
+the whole vault into the `SokratesAI/vault` GitHub repo, which keeps
+every version in git history rather than beside the original. Use
+`vault_git_revision_history` to recover a previous version.
 """
 import base64
 import json
@@ -42,8 +45,12 @@ from pathlib import Path
 # Obsidian LiveSync's own bookkeeping docs -- chunks, file/index/version
 # entries. Never files a human wrote.
 INTERNAL_PREFIXES = ("_", "h:", "f:", "i:", "v:")
-# Written by this tool's own backup-before-overwrite discipline (see write/
-# delete below), so they're derivative of the edits they'd otherwise drown out.
+# Historical: this tool used to write one of these per overwrite, and the
+# whole `agora/` folder was deleted on 2026-08-06 once it stopped. The
+# filter stays because deleting a folder from CouchDB does not stop an
+# Obsidian client holding stale state from pushing it back -- exactly how
+# `evolve/` reappeared with twelve files a day after being renamed
+# (2026-08-05). If that happens here, `recent` should stay readable.
 BACKUP_PREFIX = "agora/backups/"
 DEFAULT_RECENT_LIMIT = 2000
 # Times shown to a human are Oslo time, not UTC -- Edvard lives there and
@@ -142,7 +149,7 @@ class VaultClient:
         someone else's database.
 
         `agora/backups/` is excluded unless `prefix` explicitly asks for
-        it: every overwrite writes one, so they'd bury the real edits.
+        it -- see BACKUP_PREFIX above for why it still exists.
         """
         since_ms = int((time.time() - hours * 3600) * 1000)
         status, data = _req(
@@ -202,16 +209,10 @@ class VaultClient:
         return "written" if status in (200, 201) else f"FAILED({status})"
 
     def write(self, path, content):
-        """Overwrite (or create) a file -- backs up any previous content
-        into agora/backups/ first, same convention agora_runner/vault.py
-        uses for its own writes."""
+        """Overwrite (or create) a file. Previous content is not copied
+        anywhere first -- the daily GitHub snapshot is the recovery
+        path (see module docstring)."""
         status, existing = self.get_doc(path.lower())
-        if status == 200:
-            previous = self.assemble(existing)
-            if previous.strip():
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                base = path.rsplit("/", 1)[-1]
-                self._put_raw(f"agora/backups/{stamp} {base}", previous)
         return self._put_raw(path, content, existing if status == 200 else None)
 
     def append(self, path, content, after_marker=""):
@@ -244,9 +245,6 @@ class VaultClient:
             return "absent"
         if status != 200:
             return f"FAILED_GET({status})"
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        base = path.rsplit("/", 1)[-1]
-        self._put_raw(f"agora/backups/{stamp} {base}", self.assemble(existing))
         status, _ = _req(
             "DELETE", self.base, self.db, self.auth,
             f"{urllib.parse.quote(path, safe='')}?rev={existing['_rev']}",
