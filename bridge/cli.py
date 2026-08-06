@@ -159,6 +159,16 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # this to exactly the caller's server: without it the CLI would also
     # pick up whatever is registered in the PVC's ~/.claude.json, which is
     # persistent state no caller asked for and nobody audits.
+    #
+    # Expect the `system`/`init` event to report this server as
+    # "status": "pending" with zero mcp__agora__* tools in the roster. That
+    # is NOT a failure and does not need diagnosing again: init is emitted
+    # before the handshake finishes. Measured in this pod, 2026-08-06, over
+    # three runs -- initialize lands at 1.20/1.28/1.34s and tools/list at
+    # 1.38/1.44/1.60s after the process starts, so the tools are live from
+    # roughly 1.5s in. The only turn that can miss them is one whose first
+    # and last action both happen inside that window; a persona cycle runs
+    # for tens of minutes and cannot.
     mcp_config = write_mcp_config(mcp)
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
