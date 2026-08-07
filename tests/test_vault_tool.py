@@ -168,7 +168,7 @@ def test_recent_drops_livesync_internals_and_backups_newest_first(env):
     client = vault_tool.VaultClient()
     with patch.object(vault_tool, "_req", _fake_find(docs)):
         rows, truncated = client.recent(hours=6)
-    assert rows == [(3000, "projects/b.md"), (1000, "projects/a.md")]
+    assert rows == [(3000, "projects/b.md", False), (1000, "projects/a.md", False)]
     assert truncated is False
 
 
@@ -180,7 +180,7 @@ def test_recent_includes_backups_only_when_prefix_asks_for_them(env):
     client = vault_tool.VaultClient()
     with patch.object(vault_tool, "_req", _fake_find(docs)):
         rows, _ = client.recent(hours=6, prefix="agora/backups/")
-    assert [p for _, p in rows] == ["agora/backups/20260803-114439 journal.md"]
+    assert [p for _, p, _d in rows] == ["agora/backups/20260803-114439 journal.md"]
 
 
 def test_recent_selector_window_follows_hours(env):
@@ -209,7 +209,7 @@ def test_recent_reports_truncation_because_the_subset_is_arbitrary(env):
 
 def test_main_recent_warns_loudly_when_the_list_is_incomplete(env, capsys):
     with patch.object(vault_tool, "VaultClient") as MockClient:
-        MockClient.return_value.recent.return_value = ([(0, "projects/a.md")], True)
+        MockClient.return_value.recent.return_value = ([(0, "projects/a.md", False)], True)
         vault_tool.main(["recent", "6"])
     out = capsys.readouterr().out
     assert "INCOMPLETE" in out
@@ -264,3 +264,113 @@ def test_main_get_prints_not_found_marker(env, capsys):
         MockClient.return_value.read.return_value = None
         vault_tool.main(["get", "missing.md"])
     assert "[not found: missing.md]" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# LiveSync tombstones (2026-08-07). Deleting a note in Obsidian does not
+# remove the CouchDB document -- it sets `deleted: true` and leaves the
+# content chunks attached, which is how other clients learn to drop their
+# local copy. Nothing here knew the flag existed, so `ls` listed deleted
+# files and `get` rebuilt their text.
+#
+# Measured on the live vault the day this was found: 309 of 897 documents
+# were tombstones. Most were pre-move copies left by a vault reorganisation,
+# sitting one prefix away from their live replacement. One was `kanban.md`,
+# deleted outright with no replacement -- while `prompt.md` still told every
+# cycle to read it as "Edvard's own real backlog", handing four cycles a day
+# a board frozen on 2026-07-29 with no way to tell it was gone.
+#
+# `list`/`read` treat deleted as gone. `recent` deliberately does not: it
+# answers "what changed", and a deletion is the change that invalidates
+# every path still pointing at it. Not seeing it is what made this take a
+# day to notice.
+# ---------------------------------------------------------------------------
+def _fake_all_docs(docs):
+    """Fake _req covering the two calls file_docs makes: the id sweep and
+    the batched include_docs re-fetch."""
+    def fake(method, base, db, auth, path, body=None):
+        if path == "_all_docs" and method == "GET":
+            return 200, {"rows": [{"id": d["_id"]} for d in docs]}
+        if path.startswith("_all_docs?include_docs=true") and method == "POST":
+            by_id = {d["_id"]: d for d in docs}
+            return 200, {"rows": [{"id": k, "doc": by_id[k]}
+                                  for k in body["keys"] if k in by_id]}
+        raise AssertionError(f"unexpected request: {method} {path}")
+    return fake
+
+
+def test_read_returns_none_for_a_deleted_file(env):
+    """The live case is the control -- without it this passes on a fake
+    that simply serves nothing."""
+    client, _ = _client_with_fake_req({
+        ("GET", "notes/live.md"): (200, {"data": "still here", "children": []}),
+        ("GET", "notes/gone.md"): (200, {"data": "old text", "children": [],
+                                         "deleted": True}),
+    })
+    assert client.read("notes/live.md") == "still here"
+    assert client.read("notes/gone.md") is None
+
+
+def test_list_omits_deleted_files(env):
+    docs = [
+        {"_id": "notes/live.md"},
+        {"_id": "notes/gone.md", "deleted": True},
+        {"_id": "h:chunk", "data": "x"},
+    ]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_all_docs(docs)):
+        assert client.list("notes/") == ["notes/live.md"]
+
+
+def test_append_to_a_deleted_file_refuses_instead_of_reviving_it(env):
+    """Before the flag was understood, append read the tombstone's text,
+    glued the new content on, and wrote the note back to life."""
+    client, calls = _client_with_fake_req({
+        ("GET", "notes/gone.md"): (200, {"data": "old text", "children": [],
+                                         "deleted": True}),
+    })
+    result = client.append("notes/gone.md", "new line")
+
+    assert result.startswith("FAILED(not found")
+    assert not [c for c in calls if c[0] == "PUT"], (
+        f"a refused append still wrote: {calls}"
+    )
+
+
+def test_recent_keeps_deleted_files_and_flags_them(env):
+    """The opposite rule from list/read, on purpose: a deletion is news."""
+    docs = [
+        {"_id": "projects/a.md", "mtime": 3000},
+        {"_id": "projects/kanban.md", "mtime": 4000, "deleted": True},
+    ]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_find(docs)):
+        rows, _ = client.recent(hours=6)
+    assert rows == [(4000, "projects/kanban.md", True), (3000, "projects/a.md", False)]
+
+
+def test_recent_asks_couch_for_the_deleted_field(env):
+    """It can only report the flag if it projects it -- _find returns only
+    the fields named, so dropping it from the projection would silently
+    make every row read as not-deleted."""
+    captured = []
+
+    def capture(method, base, db, auth, path, body=None):
+        captured.append(body)
+        return 200, {"docs": []}
+
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", capture):
+        client.recent(hours=6)
+    assert "deleted" in captured[0]["fields"]
+
+
+def test_main_recent_marks_a_deleted_file_in_its_output(env, capsys):
+    with patch.object(vault_tool, "VaultClient") as MockClient:
+        MockClient.return_value.recent.return_value = (
+            [(0, "projects/kanban.md", True), (0, "projects/a.md", False)], False,
+        )
+        vault_tool.main(["recent", "6"])
+    out = capsys.readouterr().out
+    assert "projects/kanban.md  [DELETED]" in out
+    assert "projects/a.md" in out and "projects/a.md  [DELETED]" not in out

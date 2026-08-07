@@ -116,18 +116,67 @@ class VaultClient:
         status, doc = self.get_doc(path.lower())
         if status != 200:
             return None
+        # A LiveSync tombstone keeps its content chunks, so assemble()
+        # happily rebuilds the text of a note that no longer exists --
+        # see file_docs(). Deleted means gone; recover from the daily
+        # GitHub snapshot, not from here.
+        if doc.get("deleted"):
+            return None
         return self.assemble(doc)
 
-    def list(self, prefix=""):
+    def file_docs(self, prefix=""):
+        """{doc_id: doc} for every file under `prefix` that still exists.
+
+        Obsidian LiveSync does not remove a document when a note is
+        deleted -- it sets `deleted: true` and leaves everything else in
+        place, which is how other clients learn to drop their copy. So a
+        deleted note stays in `_all_docs` forever with its content intact,
+        and a tool that reads ids without reading the flag hands back
+        files Edvard has thrown away.
+
+        Measured on the live vault 2026-08-07: 309 of 897 documents were
+        tombstones -- a third of everything this tool could see. Most were
+        pre-move copies left by a vault reorganisation, sitting one prefix
+        away from their live replacements; `kanban.md` was deleted with no
+        replacement at all, and `prompt.md` was still sending every cycle
+        to read it as the backlog.
+
+        `_all_docs` returns ids and revs but not fields, so the ids get
+        re-fetched with `include_docs=true` in batches. Cost scales with
+        the prefix asked for: 0.46s for a project folder, 5.0s for the
+        whole vault. A Mango `_find` on the flag is worse -- unindexed, it
+        scans all 10939 docs in 8.5s whatever the prefix.
+        """
         status, data = _req("GET", self.base, self.db, self.auth, "_all_docs")
-        out = []
-        for row in data.get("rows", []):
-            doc_id = row["id"]
-            if doc_id.startswith(INTERNAL_PREFIXES):
+        if status != 200:
+            return {}
+        prefix = prefix.lower()
+        keys = [
+            row["id"] for row in data.get("rows", [])
+            if not row["id"].startswith(INTERNAL_PREFIXES)
+            and row["id"].lower().startswith(prefix)
+        ]
+        out = {}
+        for i in range(0, len(keys), 500):
+            status, res = _req(
+                "POST", self.base, self.db, self.auth,
+                "_all_docs?include_docs=true", {"keys": keys[i:i + 500]},
+            )
+            if status != 200:
+                # Silently dropping the batch would make live files vanish
+                # from `ls` with no signal, and "that file does not exist"
+                # is a thing a cycle writes into the journal as fact.
+                print(f"vault_tool: WARNING include_docs batch failed ({status}); "
+                      f"up to 500 file(s) omitted from this listing", file=sys.stderr)
                 continue
-            if doc_id.lower().startswith(prefix.lower()):
-                out.append(doc_id)
-        return sorted(out)
+            for row in res.get("rows", []):
+                doc = row.get("doc")
+                if doc and not doc.get("deleted"):
+                    out[row["id"]] = doc
+        return out
+
+    def list(self, prefix=""):
+        return sorted(self.file_docs(prefix))
 
     def recent(self, hours=24, prefix="", limit=DEFAULT_RECENT_LIMIT):
         """Files modified in the last `hours`, newest first.
@@ -150,12 +199,20 @@ class VaultClient:
 
         `agora/backups/` is excluded unless `prefix` explicitly asks for
         it -- see BACKUP_PREFIX above for why it still exists.
+
+        Deleted files are *kept* here and flagged, unlike in `list`/`read`
+        where deleted means gone. This command answers "what changed",
+        and a deletion is a change -- arguably the most important kind,
+        since it is the one that invalidates a path some other file still
+        points at. Hiding it is how a `kanban.md` deleted on 2026-08-06
+        went a full day unnoticed while four cycles a day were told to
+        read it. Rows come back as `(mtime_ms, path, deleted)`.
         """
         since_ms = int((time.time() - hours * 3600) * 1000)
         status, data = _req(
             "POST", self.base, self.db, self.auth, "_find",
             {"selector": {"mtime": {"$gt": since_ms}},
-             "fields": ["_id", "mtime"], "limit": limit},
+             "fields": ["_id", "mtime", "deleted"], "limit": limit},
         )
         if status != 200:
             raise SystemExit(f"vault_tool: _find failed ({status}): {data}")
@@ -170,7 +227,7 @@ class VaultClient:
                 continue
             if path.lower().startswith(BACKUP_PREFIX) and not prefix.startswith(BACKUP_PREFIX):
                 continue
-            out.append((doc.get("mtime", 0), path))
+            out.append((doc.get("mtime", 0), path, bool(doc.get("deleted"))))
         return sorted(out, reverse=True), len(docs) >= limit
 
     def _chunk_id_for(self, content_bytes):
@@ -294,8 +351,9 @@ def main(argv=None):
         if truncated:
             print(f"[INCOMPLETE: hit the {DEFAULT_RECENT_LIMIT}-doc cap, so this is an "
                   f"arbitrary subset, NOT the newest. Use a shorter window.]")
-        for mtime_ms, path in rows:
-            print(f"{_local_stamp(mtime_ms)}  {path}")
+        for mtime_ms, path, deleted in rows:
+            mark = "  [DELETED]" if deleted else ""
+            print(f"{_local_stamp(mtime_ms)}  {path}{mark}")
         if not rows:
             print(f"[nothing modified in the last {hours:g}h]")
     else:
