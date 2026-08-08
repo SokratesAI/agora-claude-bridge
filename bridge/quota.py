@@ -53,6 +53,15 @@ FETCH_TIMEOUT_SECONDS = 10
 # one still learns it is resuming into a nearly-spent window.
 SNAPSHOT_FILE = os.path.join(CLAUDE_HOME, "quota-snapshot.json")
 
+# The snapshot is overwritten on every poll, so it answers "how much is
+# left right now" and nothing else -- no burn rate, no per-cycle cost, no
+# way to tell a spending week from a quiet one. Edvard asked (2026-08-08)
+# for weekly spend logged so the cycle rate can be tuned on data rather
+# than argument, and that needs a series, not a sample. This is the
+# append-only companion: one JSON object per changed reading, alongside
+# the snapshot on the same PVC so it outlives the pod.
+HISTORY_FILE = os.path.join(CLAUDE_HOME, "quota-history.jsonl")
+
 # The windows a Claude subscription actually enforces. Anything else the
 # endpoint returns (the several null experiment keys) is ignored rather
 # than guessed at -- an unknown window with a null utilization must not be
@@ -175,12 +184,79 @@ def read_snapshot(path=None):
         return None
 
 
+def history_path_for(snapshot_path=None):
+    """The history file that belongs beside a given snapshot file. Derived
+    rather than fixed so a test pointing the watcher at a tmp dir gets its
+    history there too, instead of appending to the real one."""
+    if not snapshot_path or snapshot_path == SNAPSHOT_FILE:
+        return HISTORY_FILE
+    return os.path.join(os.path.dirname(snapshot_path), "quota-history.jsonl")
+
+
+def _history_row(summary):
+    """One flat row: {"at": epoch, "five_hour": pct_used, ...}. Flat rather
+    than the nested snapshot shape because the consumer is a chart, and a
+    row per reading with a column per window is what plots."""
+    row = {"at": round(time.time(), 3)}
+    for window in (summary or {}).get("windows", []):
+        name = window.get("window")
+        if name:
+            row[name] = window.get("used_pct")
+            row[f"{name}_resets_at"] = window.get("resets_at") or ""
+    return row
+
+
+def append_history(summary, path=None):
+    """Append a reading, unless it is identical to the previous one.
+
+    Skipping unchanged readings is not a cap on the data -- an unchanged
+    row carries no information a chart can use, and the poll runs once a
+    minute for as long as a turn lasts. Nothing is truncated or rotated:
+    the file grows for as long as the loop runs, which at ~15 rows per
+    cycle is a rounding error against the PVC.
+    """
+    path = path or HISTORY_FILE
+    row = _history_row(summary)
+    comparable = {k: v for k, v in row.items() if k != "at"}
+    try:
+        if comparable == _last_history_reading(path):
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as handle:
+            handle.write(json.dumps(row) + "\n")
+        return True
+    except Exception as exc:
+        log(f"quota history append failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _last_history_reading(path):
+    """The previous row minus its timestamp, or None. Reads the tail rather
+    than the file: this is called once a minute and the file only grows."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - 4096))
+            tail = handle.read().decode("utf-8", "replace").strip().splitlines()
+        if not tail:
+            return None
+        row = json.loads(tail[-1])
+        return {k: v for k, v in row.items() if k != "at"}
+    except Exception:
+        return None
+
+
 def refresh(path=None):
-    """One fetch -> one snapshot. True if a usable snapshot was written."""
+    """One fetch -> one snapshot (+ a history row if the reading moved).
+    True if a usable snapshot was written."""
     summary = summarize(fetch_usage())
     if summary is None:
         return False
-    return write_snapshot(summary, path)
+    written = write_snapshot(summary, path)
+    # After the snapshot, and never gating on it: the history is the
+    # nice-to-have and the snapshot is what the low-quota warning reads.
+    append_history(summary, history_path_for(path))
+    return written
 
 
 HOOK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "quota_notice.py")
