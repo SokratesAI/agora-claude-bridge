@@ -316,9 +316,14 @@ def main(argv=None):
             return 2
 
     rows = scan(projects_dir)
-    if cycles_only:
-        rows = [r for r in rows if r["kind"] == "cycle"]
-    report = {"sessions": rows, "summary": summarize(rows), "weights": COST_WEIGHTS}
+    # Summarize over everything even when the table is filtered -- summarize()
+    # already excludes non-cycles from the averages, and passing it the
+    # filtered rows would make "other_sessions" report 0 every time.
+    report = {
+        "sessions": [r for r in rows if r["kind"] == "cycle"] if cycles_only else rows,
+        "summary": summarize(rows),
+        "weights": COST_WEIGHTS,
+    }
 
     if as_json:
         print(json.dumps(report, indent=2))
