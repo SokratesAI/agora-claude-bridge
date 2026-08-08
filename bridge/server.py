@@ -110,10 +110,16 @@ def _await_drain():
 
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
              activity=None, mcp=None):
-    """One turn for one conversation. First turn (no stored session)
-    prepends the system/persona prompt to the message -- a resumed session
-    already has that context from turn 1, so later turns send just the new
-    message, same as the old Slack bridge did.
+    """One turn for one conversation. The system/persona prompt goes to the
+    CLI as --append-system-prompt on every turn, resumed or not (see
+    cli.run_turn) -- it reaches the model as an operator instruction rather
+    than as text the user appears to have typed.
+
+    Until 2026-08-08 this concatenated it into the message instead
+    ("{system}\\n\\n{prompt}") and only on the first turn, on the assumption
+    that a resumed session still carried it. It did carry it, but as a user
+    message from turn 1 -- which is the wrong channel, and the reason a
+    persona's own constitution competed with the conversation for authority.
 
     restricted (2026-08-01, off by default): when true, blocks the full
     known tool roster (DISCOVERED_FULL_TOOL_ROSTER) for this call --
@@ -142,31 +148,28 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     means no --mcp-config flag at all, which is what every caller did
     before this existed."""
     if stateless:
-        message = f"{system}\n\n{prompt}"
         text, thinking, _ = run_turn(
-            message, session_id=None, model=model,
+            prompt, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
-            activity=activity, mcp=mcp,
+            activity=activity, mcp=mcp, system=system,
         )
         return text, thinking
 
     session_id = get_session_id(conversation_id)
-    message = f"{system}\n\n{prompt}" if not session_id else prompt
     disallowed_tools = DISCOVERED_FULL_TOOL_ROSTER if restricted else None
 
     try:
         text, thinking, new_session_id = run_turn(
-            message, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
-            activity=activity, mcp=mcp,
+            prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
+            activity=activity, mcp=mcp, system=system,
         )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
             log(f"conversation={conversation_id}: stored session gone, retrying fresh")
             clear_session_id(conversation_id)
-            message = f"{system}\n\n{prompt}"
             text, thinking, new_session_id = run_turn(
-                message, session_id=None, model=model, disallowed_tools=disallowed_tools,
-                activity=activity, mcp=mcp,
+                prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
+                activity=activity, mcp=mcp, system=system,
             )
         else:
             raise
