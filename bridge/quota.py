@@ -83,6 +83,19 @@ POLL_SECONDS = 60
 # the hook says how old its number is rather than pretending it is fresh.
 POLL_BACKOFF_MAX_SECONDS = 300
 
+# Backoff starts here rather than at POLL_SECONDS, because the failure
+# this watcher actually meets is transient and self-healing. The first
+# poll of a session races the CLI's own OAuth refresh and loses: measured
+# 2026-08-08, the poll fired at 22:24:06.20 and the CLI rewrote
+# .credentials.json at 22:24:09.34, so the watcher read a token that was
+# three seconds from being replaced and got a 401. Doubling from 60s meant
+# the first usable reading landed 120s into the session, and every cycle
+# spent its opening minutes sizing its work against a snapshot taken
+# before the *previous* cycle ran. Retrying in five seconds costs one
+# request and clears the race; an endpoint that has genuinely moved still
+# reaches the five-minute cap, on the seventh failure.
+POLL_BACKOFF_START_SECONDS = 5
+
 
 def _read_access_token():
     """The CLI rotates this file on its own refresh schedule, so it is read
@@ -206,6 +219,13 @@ def _history_row(summary):
     return row
 
 
+def _reading_only(row):
+    """The part of a history row that is a measurement: the utilizations,
+    without the timestamp or the server's per-request `resets_at`."""
+    return {k: v for k, v in (row or {}).items()
+            if k != "at" and not k.endswith("_resets_at")}
+
+
 def append_history(summary, path=None):
     """Append a reading, unless it is identical to the previous one.
 
@@ -214,10 +234,20 @@ def append_history(summary, path=None):
     minute for as long as a turn lasts. Nothing is truncated or rotated:
     the file grows for as long as the loop runs, which at ~15 rows per
     cycle is a rounding error against the PVC.
+
+    "Identical" means the utilizations, not the whole row. The endpoint
+    computes `resets_at` per request, so it comes back with fresh
+    sub-second jitter every time -- 00:29:59.498355 then 00:29:59.027533,
+    four seconds apart, same window. Comparing the whole row made this
+    guard inert: 5 of the first 9 rows written on the live pod carried a
+    reading already on the line above. The unit test did not catch it
+    because its fixture held `resets_at` fixed, which real responses
+    never do. A window actually rolling over still writes a row, because
+    utilization drops when it does.
     """
     path = path or HISTORY_FILE
     row = _history_row(summary)
-    comparable = {k: v for k, v in row.items() if k != "at"}
+    comparable = _reading_only(row)
     try:
         if comparable == _last_history_reading(path):
             return False
@@ -240,8 +270,7 @@ def _last_history_reading(path):
             tail = handle.read().decode("utf-8", "replace").strip().splitlines()
         if not tail:
             return None
-        row = json.loads(tail[-1])
-        return {k: v for k, v in row.items() if k != "at"}
+        return _reading_only(json.loads(tail[-1]))
     except Exception:
         return None
 
@@ -348,14 +377,32 @@ class QuotaWatcher:
                 ok = False
             if ok:
                 wait = self._poll_seconds
+                failures = 0
             else:
-                wait = min(wait * 2, POLL_BACKOFF_MAX_SECONDS)
+                wait = min(POLL_BACKOFF_START_SECONDS * 2 ** failures,
+                           POLL_BACKOFF_MAX_SECONDS)
                 failures += 1
-                # First one only: an endpoint that has moved or a token
-                # that cannot refresh fails every poll for the rest of the
-                # session, and 45 identical lines would bury the CLI's own
-                # logs (activity.py learned this the same way).
+                # First of each outage: an endpoint that has moved or a
+                # token that cannot refresh fails every poll for the rest
+                # of the session, and 45 identical lines would bury the
+                # CLI's own logs (activity.py learned this the same way).
+                # Counted per outage rather than per session because a
+                # recovery resets `failures` -- so a flapping endpoint says
+                # so once per outage, and a dead one still says it once.
                 if failures == 1:
-                    log("quota poll failed (further failures this session silenced)")
+                    log("quota poll failed (further failures silenced until it recovers)")
             self._wake.wait(wait)
             self._wake.clear()
+        # One last reading on the way out, because the interesting one is
+        # the reading nobody was awake for. The poll only runs while a turn
+        # runs, so without this the final row in the history is wherever
+        # the last 60s tick happened to land -- never where the cycle
+        # actually ended. The whole point of the history is to answer "what
+        # did that cycle cost", and every row was systematically short of
+        # the answer by up to a minute of the most expensive part of a run.
+        # Best-effort like everything else here: this is a daemon thread
+        # and nobody is waiting on it, so a slow endpoint delays no reply.
+        try:
+            refresh(self._path)
+        except Exception:
+            pass

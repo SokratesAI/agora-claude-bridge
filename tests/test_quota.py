@@ -170,6 +170,104 @@ def test_rate_limit_event_tolerates_a_missing_or_odd_payload():
 
 
 # ---------------------------------------------------------------------------
+# QuotaWatcher -- the poll loop: how fast it retries, and the last reading
+# ---------------------------------------------------------------------------
+
+class _FakeWake:
+    """Stands in for the watcher's wake Event so `_run` can be driven
+    synchronously: records the timeout of each wait, and trips the real
+    stop flag once enough of the schedule has been observed. Without this
+    a backoff test would have to actually sleep through the backoff."""
+
+    def __init__(self, stop, stop_after):
+        self.waits = []
+        self._stop = stop
+        self._stop_after = stop_after
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if len(self.waits) >= self._stop_after:
+            self._stop.set()
+        return False
+
+    def clear(self):
+        pass
+
+
+def _drive(watcher, stop_after, refresh):
+    watcher._wake = _FakeWake(watcher._stop, stop_after)
+    with patch.object(quota, "refresh", refresh):
+        watcher._run()
+    return watcher._wake.waits
+
+
+def test_a_failing_poll_retries_in_seconds_rather_than_backing_off_from_a_minute():
+    """The failure this actually meets is the first poll of a session
+    racing the CLI's OAuth refresh, which clears in about three seconds.
+    Doubling from the 60s poll interval turned that into a two-minute hole
+    at the start of every cycle -- the exact window in which a cycle reads
+    the snapshot to decide how much work to take on."""
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+
+    waits = _drive(watcher, 4, lambda path: False)
+
+    assert waits == [5, 10, 20, 40]
+
+
+def test_a_poll_that_keeps_failing_still_backs_off_to_the_cap():
+    """The short first retry must not turn a moved endpoint into a
+    five-second hammer for the rest of the session."""
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+
+    waits = _drive(watcher, 8, lambda path: False)
+
+    assert waits == [5, 10, 20, 40, 80, 160, 300, 300]
+
+
+def test_a_recovered_poll_goes_back_to_the_normal_interval():
+    results = [False, True, True]
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+
+    waits = _drive(watcher, 3, lambda path: results.pop(0))
+
+    assert waits == [5, quota.POLL_SECONDS, quota.POLL_SECONDS]
+
+
+def test_a_recovery_re_arms_the_failure_log():
+    """`failures` resets on success, so a flapping endpoint reports each
+    outage once instead of going quiet forever after the first."""
+    results = [False, True, False]
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+
+    with patch.object(quota, "log") as logged:
+        _drive(watcher, 3, lambda path: results.pop(0))
+
+    assert logged.call_count == 2
+
+
+def test_the_last_reading_is_taken_after_the_watcher_is_told_to_stop():
+    """The reading that matters most is the one nobody is awake for. The
+    poll only runs while a turn runs, so without a reading on the way out
+    the history's final row for a cycle is wherever the last 60s tick
+    landed -- never where the cycle actually ended."""
+    calls = []
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+
+    _drive(watcher, 1, lambda path: calls.append(path) or True)
+
+    assert calls == ["/tmp/unused-snapshot.json"] * 2
+
+
+def test_a_failing_last_reading_does_not_escape_the_thread():
+    def explode(path):
+        raise RuntimeError("endpoint gone")
+
+    watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
+
+    _drive(watcher, 1, explode)  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # hook -- bands, and when it stays quiet
 # ---------------------------------------------------------------------------
 
@@ -331,6 +429,38 @@ def test_history_row_carries_every_tracked_window(tmp_path):
     assert row["five_hour"] == 12.0
     assert row["seven_day"] == 1.0
     assert row["seven_day_resets_at"] == "b"
+
+
+def test_an_unchanged_reading_is_skipped_even_though_resets_at_jitters(tmp_path):
+    """The endpoint computes `resets_at` per request, so it comes back with
+    fresh sub-second jitter every poll. Comparing the whole row made the
+    dedup inert -- 5 of the first 9 rows on the live pod repeated the
+    reading above them. These two timestamps are the real ones, four
+    seconds apart, from the same window."""
+    path = str(tmp_path / "quota-history.jsonl")
+
+    def reading(resets_at):
+        return {"windows": [{"window": "five_hour", "used_pct": 29.0,
+                             "resets_at": resets_at}]}
+
+    assert quota.append_history(reading("2026-08-09T00:29:59.498355+00:00"), path) is True
+    assert quota.append_history(reading("2026-08-09T00:29:59.027533+00:00"), path) is False
+
+    assert len(open(path).read().strip().splitlines()) == 1
+
+
+def test_a_window_that_rolls_over_still_writes_a_row(tmp_path):
+    """Ignoring `resets_at` must not swallow a real window boundary. It
+    doesn't: utilization drops when a window resets, and that is the
+    change being compared."""
+    path = str(tmp_path / "quota-history.jsonl")
+    before = {"windows": [{"window": "five_hour", "used_pct": 96.0, "resets_at": "a"}]}
+    after = {"windows": [{"window": "five_hour", "used_pct": 0.0, "resets_at": "b"}]}
+
+    assert quota.append_history(before, path) is True
+    assert quota.append_history(after, path) is True
+
+    assert len(open(path).read().strip().splitlines()) == 2
 
 
 def test_history_path_is_derived_from_the_snapshot_path(tmp_path):
