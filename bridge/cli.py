@@ -136,7 +136,8 @@ def _detect_usage_limit(text):
     return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
 
 
-def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None):
+def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
+                  system=None):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
@@ -174,6 +175,22 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
     if disallowed_tools:
         cmd.extend(["--disallowedTools", disallowed_tools])
+    # The persona's constitution belongs in the operator channel, not in the
+    # user turn. Until 2026-08-08 server.py concatenated it into the message
+    # ("{system}\n\n{prompt}"), so a persona read its own identity as if the
+    # human had typed it, and only on turn 1.
+    #
+    # Must be re-passed on EVERY invocation, including resumed ones -- the CLI
+    # does not carry it in the session. Measured in this pod, 2026-08-08, with
+    # a codeword planted in the system prompt only: fresh session reveals it;
+    # --resume without the flag answers "NONE"; --resume with the flag
+    # re-passed reveals it again. (A first attempt at that third case also
+    # said "NONE" and nearly went into the record as "the flag is ignored on
+    # resume" -- the session had been polluted by the second probe's own
+    # "NONE" answer, and the model stayed consistent with its own transcript.
+    # Re-run on a clean session before believing otherwise.)
+    if system:
+        cmd.extend(["--append-system-prompt", system])
     if session_id:
         cmd.extend(["--resume", session_id])
     if model:
@@ -365,8 +382,14 @@ _invocation_lock = threading.Lock()
 
 
 def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-             mcp=None):
+             mcp=None, system=None):
     """One turn. Returns (text, thinking, new_session_id).
+
+    system: optional persona/system prompt, passed to the CLI as
+    --append-system-prompt so it reaches the model as an operator
+    instruction rather than as part of the user's message. Must be supplied
+    on every turn, resumed or not -- the CLI does not persist it in the
+    session. Omit it and no --append-system-prompt flag is passed at all.
 
     disallowed_tools: comma-separated tool names to block for this call
     (see DISCOVERED_FULL_TOOL_ROSTER above), or None/empty for full,
@@ -386,4 +409,5 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
     session_id and retry once with session_id=None on that specific case).
     """
     with _invocation_lock:
-        return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp)
+        return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
+                             system)

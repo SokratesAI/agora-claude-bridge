@@ -171,6 +171,68 @@ def test_run_turn_omits_resume_flag_when_no_session_id(tmp_path):
     assert "--resume" not in captured["cmd"]
 
 
+def test_run_turn_passes_system_as_append_system_prompt(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", system="You are Nova.")
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--append-system-prompt") + 1] == "You are Nova."
+    # and it must NOT have been smuggled into the user turn as well
+    assert cmd[cmd.index("-p") + 1] == "hello"
+
+
+def test_run_turn_still_passes_system_on_a_resumed_turn(tmp_path):
+    """The CLI does not carry --append-system-prompt across --resume
+    (measured 2026-08-08). Dropping it on resumed turns would leave every
+    turn after the first running with no persona at all."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", session_id="sess-existing", system="You are Nova.")
+    cmd = captured["cmd"]
+    assert "--resume" in cmd
+    assert cmd[cmd.index("--append-system-prompt") + 1] == "You are Nova."
+
+
+def test_run_turn_omits_the_flag_entirely_when_no_system_given(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello")
+    assert "--append-system-prompt" not in captured["cmd"]
+
+
 def test_run_turn_is_unrestricted_by_default(tmp_path):
     """2026-08-01 design reversal: no --disallowedTools flag at all unless
     a caller explicitly asks for restriction -- the old always-on denylist
@@ -304,13 +366,14 @@ def test_run_turn_serializes_via_module_level_lock(tmp_path):
 # server.py -- generate() orchestration + HTTP handler
 # ---------------------------------------------------------------------------
 
-def test_generate_prepends_system_prompt_on_first_turn():
+def test_generate_sends_system_prompt_out_of_band_not_in_the_message():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         captured["message"] = message
         captured["session_id"] = session_id
+        captured["system"] = system
         return "reply", "", "sess-new"
 
     with patch.object(server, "get_session_id", return_value=None), \
@@ -318,19 +381,25 @@ def test_generate_prepends_system_prompt_on_first_turn():
          patch.object(server, "run_turn", side_effect=fake_run_turn):
         text, thinking = server.generate("conv-1", "You are helpful.", "hi there")
 
-    assert captured["message"] == "You are helpful.\n\nhi there"
+    # The persona text must reach the model as an operator instruction, never
+    # as something the user appears to have typed.
+    assert captured["message"] == "hi there"
+    assert captured["system"] == "You are helpful."
     assert captured["session_id"] is None
     assert text == "reply"
     mock_set.assert_called_once_with("conv-1", "sess-new")
 
 
-def test_generate_sends_only_new_message_on_resumed_turn():
+def test_generate_resends_the_system_prompt_on_a_resumed_turn():
+    """The CLI does not carry --append-system-prompt across --resume, so a
+    resumed turn that omitted it would run with no constitution at all."""
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         captured["message"] = message
         captured["session_id"] = session_id
+        captured["system"] = system
         return "reply2", "", "sess-existing"
 
     with patch.object(server, "get_session_id", return_value="sess-existing"), \
@@ -339,6 +408,7 @@ def test_generate_sends_only_new_message_on_resumed_turn():
         server.generate("conv-1", "You are helpful.", "second message")
 
     assert captured["message"] == "second message"
+    assert captured["system"] == "You are helpful."
     assert captured["session_id"] == "sess-existing"
 
 
@@ -346,8 +416,8 @@ def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
-        calls.append((message, session_id))
+                      mcp=None, system=None):
+        calls.append((message, session_id, system))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
         return "recovered reply", "", "sess-brand-new"
@@ -360,15 +430,15 @@ def test_generate_retries_fresh_on_session_not_found():
 
     assert text == "recovered reply"
     assert len(calls) == 2
-    assert calls[0] == ("hi", "sess-gone")
-    assert calls[1] == ("system\n\nhi", None)  # retried fresh, system re-sent
+    assert calls[0] == ("hi", "sess-gone", "system")
+    assert calls[1] == ("hi", None, "system")  # retried fresh, system still out of band
     mock_clear.assert_called_once_with("conv-1")
     mock_set.assert_called_once_with("conv-1", "sess-brand-new")
 
 
 def test_generate_propagates_other_cli_errors_without_retry():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -381,7 +451,7 @@ def test_generate_is_unrestricted_by_default():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -397,7 +467,7 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -413,9 +483,10 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         captured["message"] = message
         captured["session_id"] = session_id
+        captured["system"] = system
         return "reply", "", "sess-should-be-ignored"
 
     with patch.object(server, "get_session_id") as mock_get, \
@@ -424,7 +495,8 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
         text, _ = server.generate("conv-1", "system prompt", "hi", stateless=True)
 
     assert text == "reply"
-    assert captured["message"] == "system prompt\n\nhi"
+    assert captured["message"] == "hi"
+    assert captured["system"] == "system prompt"
     assert captured["session_id"] is None
     mock_get.assert_not_called()  # never even looks up a stored session
     mock_set.assert_not_called()  # and never persists the new one
@@ -432,7 +504,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -448,7 +520,7 @@ def test_generate_stateless_can_combine_with_restricted():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None):
+                      mcp=None, system=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
