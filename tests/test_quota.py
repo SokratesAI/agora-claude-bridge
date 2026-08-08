@@ -293,3 +293,50 @@ def test_hook_settings_failure_degrades_to_no_hook(tmp_path):
     dir must not stop a cycle from running at all."""
     with patch("json.dump", side_effect=OSError("read-only fs")):
         assert quota.write_hook_settings(str(tmp_path / "s.json")) == ""
+
+
+def test_history_appends_a_row_when_the_reading_moves(tmp_path):
+    path = str(tmp_path / "quota-history.jsonl")
+    first = {"windows": [{"window": "five_hour", "used_pct": 10.0, "resets_at": "x"}]}
+    second = {"windows": [{"window": "five_hour", "used_pct": 12.0, "resets_at": "x"}]}
+
+    assert quota.append_history(first, path) is True
+    assert quota.append_history(second, path) is True
+
+    rows = [json.loads(line) for line in open(path)]
+    assert [r["five_hour"] for r in rows] == [10.0, 12.0]
+    assert all("at" in r for r in rows)
+
+
+def test_history_skips_an_unchanged_reading(tmp_path):
+    path = str(tmp_path / "quota-history.jsonl")
+    summary = {"windows": [{"window": "seven_day", "used_pct": 1.0, "resets_at": "y"}]}
+
+    assert quota.append_history(summary, path) is True
+    assert quota.append_history(summary, path) is False
+
+    assert len(open(path).read().strip().splitlines()) == 1
+
+
+def test_history_row_carries_every_tracked_window(tmp_path):
+    path = str(tmp_path / "quota-history.jsonl")
+    summary = {"windows": [
+        {"window": "five_hour", "used_pct": 12.0, "resets_at": "a"},
+        {"window": "seven_day", "used_pct": 1.0, "resets_at": "b"},
+    ]}
+
+    quota.append_history(summary, path)
+
+    row = json.loads(open(path).read().strip())
+    assert row["five_hour"] == 12.0
+    assert row["seven_day"] == 1.0
+    assert row["seven_day_resets_at"] == "b"
+
+
+def test_history_path_is_derived_from_the_snapshot_path(tmp_path):
+    """A test pointing the watcher at a tmp dir must not append to the
+    real history file on the PVC."""
+    snapshot = str(tmp_path / "quota-snapshot.json")
+
+    assert quota.history_path_for(snapshot) == str(tmp_path / "quota-history.jsonl")
+    assert quota.history_path_for(None) == quota.HISTORY_FILE
