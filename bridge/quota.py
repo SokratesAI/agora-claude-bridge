@@ -219,6 +219,13 @@ def _history_row(summary):
     return row
 
 
+def _reading_only(row):
+    """The part of a history row that is a measurement: the utilizations,
+    without the timestamp or the server's per-request `resets_at`."""
+    return {k: v for k, v in (row or {}).items()
+            if k != "at" and not k.endswith("_resets_at")}
+
+
 def append_history(summary, path=None):
     """Append a reading, unless it is identical to the previous one.
 
@@ -227,10 +234,20 @@ def append_history(summary, path=None):
     minute for as long as a turn lasts. Nothing is truncated or rotated:
     the file grows for as long as the loop runs, which at ~15 rows per
     cycle is a rounding error against the PVC.
+
+    "Identical" means the utilizations, not the whole row. The endpoint
+    computes `resets_at` per request, so it comes back with fresh
+    sub-second jitter every time -- 00:29:59.498355 then 00:29:59.027533,
+    four seconds apart, same window. Comparing the whole row made this
+    guard inert: 5 of the first 9 rows written on the live pod carried a
+    reading already on the line above. The unit test did not catch it
+    because its fixture held `resets_at` fixed, which real responses
+    never do. A window actually rolling over still writes a row, because
+    utilization drops when it does.
     """
     path = path or HISTORY_FILE
     row = _history_row(summary)
-    comparable = {k: v for k, v in row.items() if k != "at"}
+    comparable = _reading_only(row)
     try:
         if comparable == _last_history_reading(path):
             return False
@@ -253,8 +270,7 @@ def _last_history_reading(path):
             tail = handle.read().decode("utf-8", "replace").strip().splitlines()
         if not tail:
             return None
-        row = json.loads(tail[-1])
-        return {k: v for k, v in row.items() if k != "at"}
+        return _reading_only(json.loads(tail[-1]))
     except Exception:
         return None
 

@@ -431,6 +431,38 @@ def test_history_row_carries_every_tracked_window(tmp_path):
     assert row["seven_day_resets_at"] == "b"
 
 
+def test_an_unchanged_reading_is_skipped_even_though_resets_at_jitters(tmp_path):
+    """The endpoint computes `resets_at` per request, so it comes back with
+    fresh sub-second jitter every poll. Comparing the whole row made the
+    dedup inert -- 5 of the first 9 rows on the live pod repeated the
+    reading above them. These two timestamps are the real ones, four
+    seconds apart, from the same window."""
+    path = str(tmp_path / "quota-history.jsonl")
+
+    def reading(resets_at):
+        return {"windows": [{"window": "five_hour", "used_pct": 29.0,
+                             "resets_at": resets_at}]}
+
+    assert quota.append_history(reading("2026-08-09T00:29:59.498355+00:00"), path) is True
+    assert quota.append_history(reading("2026-08-09T00:29:59.027533+00:00"), path) is False
+
+    assert len(open(path).read().strip().splitlines()) == 1
+
+
+def test_a_window_that_rolls_over_still_writes_a_row(tmp_path):
+    """Ignoring `resets_at` must not swallow a real window boundary. It
+    doesn't: utilization drops when a window resets, and that is the
+    change being compared."""
+    path = str(tmp_path / "quota-history.jsonl")
+    before = {"windows": [{"window": "five_hour", "used_pct": 96.0, "resets_at": "a"}]}
+    after = {"windows": [{"window": "five_hour", "used_pct": 0.0, "resets_at": "b"}]}
+
+    assert quota.append_history(before, path) is True
+    assert quota.append_history(after, path) is True
+
+    assert len(open(path).read().strip().splitlines()) == 2
+
+
 def test_history_path_is_derived_from_the_snapshot_path(tmp_path):
     """A test pointing the watcher at a tmp dir must not append to the
     real history file on the PVC."""
