@@ -93,7 +93,7 @@ POLL_BACKOFF_MAX_SECONDS = 300
 # spent its opening minutes sizing its work against a snapshot taken
 # before the *previous* cycle ran. Retrying in five seconds costs one
 # request and clears the race; an endpoint that has genuinely moved still
-# reaches the five-minute cap after six failures.
+# reaches the five-minute cap, on the seventh failure.
 POLL_BACKOFF_START_SECONDS = 5
 
 
