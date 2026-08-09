@@ -58,12 +58,14 @@ def test_a_window_reset_breaks_the_anchor():
     assert is_first is True, "the first tick after a reset is unanchored too"
 
 
-def test_fable_intervals_are_excluded_rather_than_averaged_in():
-    """The bug this module was written for. COST_WEIGHTS are Opus price
-    ratios, so an interval whose spend came from another model is not
-    comparable -- measured live, Fable ticks scored ~0.9M weighted per point
-    against ~2.6M for Opus. Averaging the two produced the 1.68x
-    disagreement that stood as an open question for two cycles."""
+def test_a_fable_interval_is_a_sample_now_that_fable_has_a_price():
+    """The inversion of the rule this module shipped with. Fable ticks used
+    to be discarded because everything was priced as Opus and they scored
+    ~0.9M weighted per point against ~2.6M. `analytics.py` now scales each
+    event by its own model's ratio before it ever reaches here, so a Fable
+    interval agrees with the Opus ones instead of reading 3x cheap -- and a
+    sample that agrees is a sample worth keeping. Half the tokens at twice
+    the price is the same quota point, which is the whole claim."""
     history = [
         _reading(T0, 1.0),
         _reading(T0 + HOUR, 2.0),
@@ -73,37 +75,78 @@ def test_fable_intervals_are_excluded_rather_than_averaged_in():
     events = [
         _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
         _event(_iso(T0 + 1.5 * HOUR), 2_400_000),
-        _event(_iso(T0 + 2.5 * HOUR), 900_000, model="claude-fable-5"),
+        # 1.2M Fable tokens, already scaled by 2.0 upstream.
+        _event(_iso(T0 + 2.5 * HOUR), 2_400_000, model="claude-fable-5"),
     ]
     result = calibration.calibrate(events, history)
 
-    assert result["samples"] == 1, "first tick unanchored, third tick is Fable"
-    assert result["weighted_per_point"] == 2_400_000
+    assert result["samples"] == 2, "only the unanchored first tick is dropped"
     fable_interval = result["intervals"][-1]
-    assert fable_interval["used"] is False
-    assert fable_interval["foreign_weighted"] == 900_000
-    assert fable_interval["foreign_models"] == ["claude-fable-5"]
-    assert "claude-fable-5" in fable_interval["excluded_because"], \
-        "an empty calibration must be able to say what emptied it"
+    assert fable_interval["used"] is True
+    assert fable_interval["foreign_weighted"] == 0
+    assert fable_interval["weighted_per_point"] == 2_400_000
+    assert result["weighted_per_point"] == 2_400_000
 
 
-def test_a_mixed_interval_is_dropped_even_though_it_has_priced_spend():
-    """A Fable call landing in the middle of an otherwise-Opus interval
-    contaminates the whole interval: the point was paid for partly at
-    prices these weights do not describe. Keeping the Opus half would
-    understate the constant, which reads as 'cycles are cheaper than they
-    are' -- the dangerous direction for a budget."""
+def test_a_mixed_model_interval_is_kept_and_summed():
+    """Subagents run on Sonnet and Haiku, so an interval containing more
+    than one model is the normal case, not the contaminated one. Dropping
+    these would mean routine subagent use disabling the instrument meant to
+    measure whether subagents were worth it."""
     history = [_reading(T0, 1.0), _reading(T0 + HOUR, 2.0), _reading(T0 + 2 * HOUR, 3.0)]
     events = [
         _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
         _event(_iso(T0 + 1.2 * HOUR), 2_000_000),
-        _event(_iso(T0 + 1.5 * HOUR), 50_000, model="claude-fable-5"),
+        _event(_iso(T0 + 1.4 * HOUR), 300_000, model="claude-sonnet-5"),
+        _event(_iso(T0 + 1.5 * HOUR), 100_000, model="claude-haiku-4-5-20251001"),
     ]
     result = calibration.calibrate(events, history)
+
+    assert result["samples"] == 1
+    assert result["intervals"][-1]["used"] is True
+    assert result["intervals"][-1]["priced_weighted"] == 2_400_000
+    assert result["intervals"][-1]["foreign_weighted"] == 0
+    assert result["weighted_per_point"] == 2_400_000
+
+
+def test_an_unpriced_model_still_drops_the_interval():
+    """The half of the old rule that must survive. A model with no known
+    ratio cannot be converted, and pricing it as Opus by default is exactly
+    the error that produced the 1.68x disagreement. So a model this table
+    has not been taught yet excludes its interval and says its own name --
+    the next release should announce itself, not skew the constant."""
+    history = [_reading(T0, 1.0), _reading(T0 + HOUR, 2.0), _reading(T0 + 2 * HOUR, 3.0)]
+    events = [
+        _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
+        _event(_iso(T0 + 1.2 * HOUR), 2_000_000),
+        _event(_iso(T0 + 1.5 * HOUR), 50_000, model="claude-something-6"),
+    ]
+    result = calibration.calibrate(events, history)
+
     assert result["samples"] == 0
     assert result["weighted_per_point"] is None
-    assert result["intervals"][-1]["priced_weighted"] == 2_000_000
     assert result["intervals"][-1]["used"] is False
+    assert result["intervals"][-1]["priced_weighted"] == 2_000_000
+    assert result["intervals"][-1]["foreign_models"] == ["claude-something-6"]
+    assert "claude-something-6" in result["intervals"][-1]["excluded_because"], \
+        "an empty calibration must be able to say what emptied it"
+
+
+def test_a_zero_cost_synthetic_turn_does_not_drop_the_interval():
+    """`<synthetic>` is stamped on locally-generated turns and has no price,
+    but it also has no cost. It must not be able to exclude an interval it
+    contributed nothing to -- otherwise the commonest unpriced model in the
+    transcripts silently eats real samples."""
+    history = [_reading(T0, 1.0), _reading(T0 + HOUR, 2.0), _reading(T0 + 2 * HOUR, 3.0)]
+    events = [
+        _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
+        _event(_iso(T0 + 1.2 * HOUR), 2_400_000),
+        _event(_iso(T0 + 1.5 * HOUR), 0, model="<synthetic>"),
+    ]
+    result = calibration.calibrate(events, history)
+
+    assert result["samples"] == 1
+    assert result["weighted_per_point"] == 2_400_000
 
 
 def test_spend_is_attributed_by_message_timestamp_not_spread_over_a_session():

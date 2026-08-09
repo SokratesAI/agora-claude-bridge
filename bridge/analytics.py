@@ -35,9 +35,22 @@ Cost is reported in **weighted input-equivalents**, not dollars. The four
 token classes are priced differently, so raw totals are not comparable to
 each other -- a cycle that reads 10M cached tokens and one that writes 1M
 output tokens look wildly different by volume and land in the same place
-on the bill. The weights below are the published Opus price ratios
-relative to a base input token. We run on a subscription, so this is a
-comparability metric and a proxy for quota burn -- not an invoice.
+on the bill. One weighted unit is one Opus input token. We run on a
+subscription, so this is a comparability metric and a proxy for quota
+burn -- not an invoice.
+
+A token also costs a different amount depending on which *model* spent it,
+and until this was written that half was missing: everything was priced as
+Opus, so every Sonnet, Haiku and Fable token was weighed wrong. It was not
+a rounding error. Fable is twice Opus per token and Haiku is a fifth, so a
+subagent-heavy cycle was mismeasured in both directions at once, and
+`calibration.py` worked around it by discarding any quota interval that
+contained non-Opus spend -- honest, and self-defeating, because subagents
+are exactly the thing this loop is trying to spend more of. Cycle 61
+measured the damage from the outside: the three intervals containing Fable
+spend scored ~0.9M weighted per quota point against ~2.6M for the
+Opus-only ones, which was the whole of a 1.68x discrepancy that had been
+sitting in the journal for two cycles as an open question for Edvard.
 """
 import json
 import os
@@ -49,11 +62,14 @@ from bridge.config import CLAUDE_HOME
 
 PROJECTS_DIR = os.path.join(CLAUDE_HOME, ".claude", "projects")
 
-# Price ratios relative to one base input token, from the published Opus
-# rates ($5/MTok in, $25/MTok out, cache read ~0.1x, 5m write 1.25x, 1h
-# write 2x). Ratios rather than dollars on purpose: the ratios are what
-# make the four counters addable, and they have been stable across model
-# generations, whereas the per-token price has not.
+# What each token class costs relative to an input token *on the same
+# model*: output 5x, cache read 0.1x, 5m cache write 1.25x, 1h write 2x.
+# The output multiplier is exactly 5 on every published Claude model --
+# Opus $5/$25, Fable $10/$50, Sonnet $3/$15, Haiku $1/$5 per MTok -- and
+# the cache multipliers are properties of the cache, not of the model. So
+# the shape of the bill is model-independent and only its scale is not,
+# which is why this table stays flat and MODEL_PRICE_RATIOS carries the
+# rest. If a future model breaks the 5x, this splits into a real matrix.
 COST_WEIGHTS = {
     "input_tokens": 1.0,
     "output_tokens": 5.0,
@@ -63,6 +79,49 @@ COST_WEIGHTS = {
 }
 
 TOKEN_FIELDS = tuple(COST_WEIGHTS)
+
+# The scale: one input token on this model, priced in Opus input tokens.
+# From published $/MTok list prices, Opus being 1.0 by definition of the
+# unit. Substring match on the family name rather than an allowlist of ids,
+# because ids gain date suffixes (`claude-haiku-4-5-20251001`) and admitting
+# a renamed model at a known price beats silently discarding it.
+#
+# Two things this cannot see, both worth knowing before trusting a number
+# that came out of it. Opus 5 is what we actually run and its list price is
+# not published anywhere this loop can read; 1.0 is true by construction,
+# but every *other* ratio here assumes Opus 5 is priced like the Opus tier
+# has been ($5/MTok in). And Sonnet 5 carries an introductory $2/$10
+# through 2026-08-31, which would make it 0.4 rather than 0.6 -- list price
+# is used because a weight table that silently changes value on a date is
+# worse than one that is consistently wrong by a knowable amount.
+#
+# Neither is a guess that has to stay a guess. Every interval this admits
+# is now a sample, so calibration's spread across a model mix is the test:
+# if a ratio is wrong, intervals containing that model drift away from the
+# Opus-only ones instead of agreeing with them.
+MODEL_PRICE_RATIOS = {
+    "opus": 1.0,
+    "fable": 2.0,
+    "sonnet": 0.6,
+    "haiku": 0.2,
+}
+
+
+def model_price_ratio(model):
+    """Input-token price of `model` relative to Opus, or None if unknown.
+
+    None rather than a 1.0 default at this boundary on purpose: an
+    unrecognised model is a thing to report, not to quietly price as Opus.
+    `weighted_tokens` still falls back to 1.0 so a row is never dropped,
+    but `calibration.py` reads the None and excludes the interval, which is
+    the behaviour that lets a newly-released model announce itself instead
+    of skewing the constant for weeks.
+    """
+    name = (model or "").lower()
+    for family, ratio in MODEL_PRICE_RATIOS.items():
+        if family in name:
+            return ratio
+    return None
 
 # A session counts as one of our cycles if its first user message opens
 # with one of these. The first is the pre-heartbeat shape, where the whole
@@ -131,9 +190,19 @@ def _usage_totals(usage):
     }
 
 
-def weighted_tokens(totals):
-    """Weighted input-equivalents -- the single comparable cost number."""
-    return round(sum(totals.get(f, 0) * w for f, w in COST_WEIGHTS.items()), 1)
+def weighted_tokens(totals, model=None):
+    """Weighted input-equivalents -- the single comparable cost number.
+
+    `model` scales the whole row by that model's price. Omitting it, or
+    passing one no ratio is known for, prices the row as Opus: this is the
+    lenient half of the boundary described on `model_price_ratio`, so that
+    an unknown model still shows up in a cycle's cost instead of vanishing.
+    """
+    ratio = model_price_ratio(model)
+    if ratio is None:
+        ratio = 1.0
+    return round(
+        sum(totals.get(f, 0) * w for f, w in COST_WEIGHTS.items()) * ratio, 1)
 
 
 def parse_transcript(path):
@@ -143,6 +212,11 @@ def parse_transcript(path):
     report on the running cycle would make this useless exactly when it is
     most interesting."""
     totals = dict.fromkeys(TOKEN_FIELDS, 0)
+    # The same counters again, split by model. `totals` stays whole because
+    # the raw counts are model-independent and are what the ledger columns
+    # report; only the weighting needs the split, and a session routinely
+    # spans models now that subagents run on Sonnet and Haiku.
+    by_model = {}
     seen_messages = set()
     models = set()
     opening = ""
@@ -197,12 +271,15 @@ def parse_transcript(path):
                 continue
             seen_messages.add(key)
 
-            if message.get("model"):
-                models.add(message["model"])
+            model = message.get("model") or ""
+            if model:
+                models.add(model)
             if record.get("isSidechain"):
                 subagent_turns += 1
+            bucket = by_model.setdefault(model, dict.fromkeys(TOKEN_FIELDS, 0))
             for field, value in _usage_totals(usage).items():
                 totals[field] += value
+                bucket[field] += value
 
     kind, trigger = _classify(opening)
     row = {
@@ -218,7 +295,8 @@ def parse_transcript(path):
         "models": sorted(models),
     }
     row.update(totals)
-    row["weighted_tokens"] = weighted_tokens(totals)
+    row["weighted_tokens"] = round(
+        sum(weighted_tokens(t, m) for m, t in by_model.items()), 1)
     return row
 
 
@@ -298,10 +376,11 @@ def spend_events(path):
             stamp = record.get("timestamp")
             if not isinstance(stamp, str) or not stamp:
                 continue
+            model = message.get("model") or ""
             events.append({
                 "at": stamp,
-                "model": message.get("model") or "",
-                "weighted_tokens": weighted_tokens(_usage_totals(usage)),
+                "model": model,
+                "weighted_tokens": weighted_tokens(_usage_totals(usage), model),
             })
     events.sort(key=lambda e: e["at"])
     return events
