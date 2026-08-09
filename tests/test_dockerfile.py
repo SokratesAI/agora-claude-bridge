@@ -47,7 +47,7 @@ def test_claude_cli_version_arg_is_a_concrete_version():
         f"CLAUDE_CODE_VERSION should be an exact version, got {version!r} -- "
         "a range or a dist-tag reintroduces the drift this pin removes"
     )
-    assert f"@anthropic-ai/claude-code@${{CLAUDE_CODE_VERSION}}" in text, (
+    assert "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" in text, (
         "the install line should use ${CLAUDE_CODE_VERSION} rather than "
         "repeating the version, so the two cannot disagree"
     )
