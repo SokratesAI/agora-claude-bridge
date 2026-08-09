@@ -256,6 +256,72 @@ def scan(projects_dir=None):
     return rows
 
 
+def spend_events(path):
+    """One transcript -> a timestamped list of individual charges.
+
+    `parse_transcript` collapses a session into one row, which is the right
+    shape for "what did that cycle cost" and the wrong shape for "what was
+    spent between 14:03 and 14:57". Calibration needs the second: it joins
+    spend against quota readings taken at arbitrary instants, and a session
+    routinely straddles one. Spreading a session's total evenly across its
+    span would be an approximation, and the intervals where it is worst are
+    the short ones -- which are exactly the ones a percentage tick pins down
+    most precisely. So charges are kept at the granularity the API reported
+    them: one event per assistant message, at that message's timestamp.
+
+    Same dedup rule as `parse_transcript`, and for the same reason -- one
+    message written as eight content-block lines is one charge, not eight.
+    """
+    events = []
+    seen_messages = set()
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict):
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            key = message.get("id") or f"__line__{len(seen_messages)}"
+            if key in seen_messages:
+                continue
+            seen_messages.add(key)
+            stamp = record.get("timestamp")
+            if not isinstance(stamp, str) or not stamp:
+                continue
+            events.append({
+                "at": stamp,
+                "model": message.get("model") or "",
+                "weighted_tokens": weighted_tokens(_usage_totals(usage)),
+            })
+    events.sort(key=lambda e: e["at"])
+    return events
+
+
+def scan_spend_events(projects_dir=None):
+    """Every charge under the projects dir, oldest first."""
+    projects_dir = projects_dir or PROJECTS_DIR
+    events = []
+    for root, _dirs, files in os.walk(projects_dir):
+        for name in sorted(files):
+            if name.endswith(".jsonl"):
+                try:
+                    events.extend(spend_events(os.path.join(root, name)))
+                except OSError:
+                    continue
+    events.sort(key=lambda e: e["at"])
+    return events
+
+
 def summarize(rows):
     """Aggregate stats over the cycle rows only.
 
