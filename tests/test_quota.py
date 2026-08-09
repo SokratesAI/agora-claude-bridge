@@ -403,6 +403,56 @@ def test_a_boundary_row_does_not_stop_the_next_tick_being_deduped(tmp_path):
     assert quota.append_history(summary, history) is False
 
 
+def test_close_does_not_return_until_the_final_reading_is_written(tmp_path):
+    """Every other watcher test above calls `_run()` on the main thread, so
+    none of them can see anything about the thread `start()` actually makes
+    -- and the defect lived exactly there. `close()` set the stop flag and
+    returned, so the final reading ran at an unknowable time afterwards,
+    outside whatever scope the caller believed it was in.
+
+    In the suite that scope is conftest's patch of `fetch_usage`, so the
+    reading escaped the guard and went to the live endpoint on this box's
+    real credentials. Measured 2026-08-09: one `pytest tests/` run appended
+    three rows carrying the true live utilization to the production
+    quota-history.jsonl, 19ms apart, and six identical strays from the
+    previous cycle's run were already sitting in it.
+
+    The stub sleeps so this fails on purpose rather than on timing: without
+    the join, close() returns in microseconds and the row is provably not
+    there yet.
+    """
+    snapshot = str(tmp_path / "quota-snapshot.json")
+    history = str(tmp_path / "quota-history.jsonl")
+    watcher = quota.QuotaWatcher(path=snapshot)
+
+    def slow_fetch(*a, **k):
+        time.sleep(0.2)
+        return LIVE_USAGE_PAYLOAD
+
+    with patch.object(quota, "fetch_usage", slow_fetch):
+        watcher.start()
+        watcher.close()
+        # Inside the patch, deliberately: this is the assertion the live
+        # rows in production were the counter-example to.
+        assert [r.get("boundary") for r in _rows(history)][-1] == "end"
+
+
+def test_close_leaves_no_thread_still_running(tmp_path):
+    """The property conftest's session-scoped guard depends on. A watcher
+    thread that outlives close() outlives the test that made it, and then
+    reaches the network under whichever patches happen to be standing."""
+    snapshot = str(tmp_path / "quota-snapshot.json")
+    watcher = quota.QuotaWatcher(path=snapshot)
+
+    with patch.object(quota, "fetch_usage", lambda *a, **k: LIVE_USAGE_PAYLOAD):
+        watcher.start()
+        thread = watcher._thread
+        watcher.close()
+
+    assert thread is not None
+    assert not thread.is_alive()
+
+
 def test_a_failing_last_reading_does_not_escape_the_thread():
     def explode(path, boundary=None):
         raise RuntimeError("endpoint gone")

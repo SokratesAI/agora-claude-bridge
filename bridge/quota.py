@@ -96,6 +96,26 @@ POLL_BACKOFF_MAX_SECONDS = 300
 # reaches the five-minute cap, on the seventh failure.
 POLL_BACKOFF_START_SECONDS = 5
 
+# How long close() waits for the final reading, matching activity.py's
+# CLOSE_WAIT_SECONDS. Bounded rather than unbounded because the caller is
+# holding a finished reply and a hung endpoint must not delay it -- but
+# not zero, which is what this used to be. An unjoined daemon thread runs
+# its last act *after* close() returns, i.e. outside whatever scope the
+# caller thought it was in. In the test suite that scope is conftest's
+# patch of fetch_usage, so the final reading escaped the guard and hit
+# the live endpoint with this box's real credentials: measured 2026-08-09,
+# one `pytest tests/` run appended three rows carrying the real live
+# utilization to the production quota-history.jsonl, 19ms apart. The
+# conftest docstring already records that this earned a genuine 429.
+#
+# Deliberately below FETCH_TIMEOUT_SECONDS (10), so a hung endpoint does
+# outlast this join and write its row late. That is the right way round:
+# a late history row harms nothing, and Edvard is the one who would feel
+# the extra five seconds on his reply. The suite's safety does not rest on
+# this number -- conftest's guard is session-scoped precisely so that it
+# holds for the thread that wins this race rather than losing it.
+CLOSE_WAIT_SECONDS = 5
+
 
 def _read_access_token():
     """The CLI rotates this file on its own refresh schedule, so it is read
@@ -380,9 +400,12 @@ class QuotaWatcher:
             return
         self._stop.set()
         self._wake.set()
-        # Not joined: the thread is a daemon whose only remaining act is a
-        # write nobody is waiting for, and the caller is holding a finished
-        # reply. Same trade as ActivityReporter's short close wait.
+        # Joined, briefly. This comment used to claim "same trade as
+        # ActivityReporter's short close wait" while doing no waiting at
+        # all -- and the wait is the whole trade. Without it the thread's
+        # final reading lands at an unknowable time after close() returns,
+        # which makes it both untestable and, in the suite, unguarded.
+        self._thread.join(timeout=CLOSE_WAIT_SECONDS)
         self._thread = None
 
     def _run(self):
