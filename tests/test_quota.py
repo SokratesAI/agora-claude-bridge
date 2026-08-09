@@ -8,6 +8,7 @@ most are the ones about when the hook stays quiet -- a warning that fires
 on all 300 tool calls is as useless as one that never fires, just
 expensive instead of silent.
 """
+import datetime
 import io
 import json
 import time
@@ -737,3 +738,84 @@ def test_history_path_is_derived_from_the_snapshot_path(tmp_path):
 
     assert quota.history_path_for(snapshot) == str(tmp_path / "quota-history.jsonl")
     assert quota.history_path_for(None) == quota.HISTORY_FILE
+
+
+# ---------------------------------------------------------------------------
+# pace -- used share against elapsed share, so a cycle can size its own work
+# ---------------------------------------------------------------------------
+
+def _usage_at(window, used, seconds_into_window):
+    """A payload whose `window` is `seconds_into_window` old, by placing
+    `resets_at` the remaining distance in the future from *now*."""
+    length = quota.WINDOW_SECONDS[window]
+    ends = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        seconds=length - seconds_into_window)
+    return {window: {"utilization": used, "resets_at": ends.isoformat()}}
+
+
+def test_pace_is_one_when_spending_exactly_matches_elapsed_time():
+    """Half the window gone, half the quota gone -- the definition of on
+    the line, and the number a cycle compares against."""
+    summary = quota.summarize(_usage_at("seven_day", 50.0, 3.5 * 86400))
+    assert summary["windows"][0]["pace"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_pace_above_one_means_the_window_empties_early():
+    """90% spent with half the week still to run: 1.8, and the window
+    cannot survive its own remaining time at that rate."""
+    hot = quota.summarize(_usage_at("seven_day", 90.0, 3.5 * 86400))
+    assert hot["windows"][0]["pace"] == pytest.approx(1.8, abs=0.01)
+
+
+def test_pace_is_window_to_date_and_hides_an_idle_stretch():
+    """The live 2026-08-09 reading, and the reason pace alone is not the
+    whole answer: 13% used 3.97 days into the week is a pace of 0.23,
+    which reads as a very quiet week. It was not. The loop was simply
+    near-idle from 08-05 to 08-08 and then ran 14 cycles in one day at
+    14.76%/day -- above the 14.3%/day the window affords.
+
+    Pace is an average over the whole window to date, so a burst is
+    diluted by whatever came before it. It answers "will *this* window
+    hold out", which is what a cycle sizing its own work needs. It does
+    not answer "is the current cadence sustainable" -- that needs the
+    slope between two recent readings, which is why `quota-history.jsonl`
+    keeps the series and not just this number.
+    """
+    summary = quota.summarize(_usage_at("seven_day", 13.0, 3.97 * 86400))
+    assert summary["windows"][0]["pace"] == pytest.approx(0.229, abs=0.01)
+
+
+def test_pace_is_none_in_the_opening_moments_of_a_window():
+    """Elapsed share near zero makes the ratio explode; a cycle waking
+    into a fresh window must read "unknown", never "infinitely over"."""
+    summary = quota.summarize(_usage_at("five_hour", 2.0, 10))
+    assert summary["windows"][0]["pace"] is None
+
+
+def test_pace_is_none_without_a_usable_resets_at():
+    """Every degraded path here reports nothing rather than a guess."""
+    assert quota._pace("seven_day", "", 50.0) is None
+    assert quota._pace("seven_day", None, 50.0) is None
+    assert quota._pace("seven_day", "not-a-date", 50.0) is None
+    assert quota._pace("nimbus_quill", "2026-08-12T17:00:00+00:00", 50.0) is None
+
+
+def test_history_row_carries_pace_but_it_never_votes_on_dedup(tmp_path):
+    """The trap: pace moves every poll because elapsed time grows even when
+    utilization does not. If it counted as part of the reading, no two rows
+    would ever compare equal and the dedup guard would be silently off --
+    the exact failure that once put duplicates in 5 of the first 9 live
+    rows. So the row carries it and the comparison ignores it.
+    """
+    path = tmp_path / "history.jsonl"
+    usage = _usage_at("seven_day", 40.0, 3.0 * 86400)
+    assert quota.append_history(quota.summarize(usage), path=str(path)) is True
+
+    row = json.loads(path.read_text().splitlines()[0])
+    assert row["seven_day_pace"] == pytest.approx(0.933, abs=0.01)
+
+    # Same utilization, a later moment -- so pace really has moved.
+    later = quota.summarize(_usage_at("seven_day", 40.0, 3.2 * 86400))
+    assert later["windows"][0]["pace"] != row["seven_day_pace"]
+    assert quota.append_history(later, path=str(path)) is False
+    assert len(path.read_text().splitlines()) == 1
