@@ -28,6 +28,55 @@ USAGE_PAYLOAD = {
     "tangelo": None,
 }
 
+# The same endpoint's response with nothing removed, captured from the
+# live pod 2026-08-09 02:52 Oslo. Kept beside the trimmed one because the
+# trimmed one is a statement about what we think matters, and this is a
+# statement about what the server actually sends -- the difference is
+# where the last two quota defects lived. Carries no credential: the
+# whole body is percentages, reset timestamps and null feature flags.
+LIVE_USAGE_PAYLOAD = {
+    "five_hour": {"utilization": 2.0, "resets_at": "2026-08-09T05:40:00.084069+00:00",
+                  "limit_dollars": None, "used_dollars": None, "remaining_dollars": None},
+    "seven_day": {"utilization": 4.0, "resets_at": "2026-08-12T16:59:59.084090+00:00",
+                  "limit_dollars": None, "used_dollars": None, "remaining_dollars": None},
+    "seven_day_oauth_apps": None,
+    "seven_day_opus": None,
+    "seven_day_sonnet": None,
+    "seven_day_cowork": None,
+    "seven_day_omelette": None,
+    "tangelo": None,
+    "iguana_necktie": None,
+    "omelette_promotional": None,
+    "nimbus_quill": {"utilization": 0.0, "resets_at": None, "limit_dollars": None,
+                     "used_dollars": None, "remaining_dollars": None},
+    "cinder_cove": None,
+    "amber_ladder": None,
+    "extra_usage": {
+        "is_enabled": False, "monthly_limit": None, "used_credits": None,
+        "utilization": None, "currency": None, "decimal_places": None,
+        "disabled_reason": None, "user_disabled": False,
+        "spend_limit_reached": False, "credits_ever_enabled": False,
+        "daily": None, "weekly": None,
+    },
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 2, "severity": "normal",
+         "resets_at": "2026-08-09T05:40:00.084069+00:00", "scope": None, "is_active": False},
+        {"kind": "weekly_all", "group": "weekly", "percent": 4, "severity": "normal",
+         "resets_at": "2026-08-12T16:59:59.084090+00:00", "scope": None, "is_active": True},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal",
+         "resets_at": None, "scope": {"model": {"id": None, "display_name": "Fable"},
+                                      "surface": None}, "is_active": False},
+    ],
+    "spend": {
+        "used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+        "limit": None, "percent": 0, "severity": "normal", "enabled": False,
+        "disabled_reason": None, "cap": None, "balance": None, "auto_reload": None,
+        "disclaimer": "Usage credits cover you when you hit your plan limits.",
+        "can_purchase_credits": False, "can_toggle": False,
+    },
+    "member_dashboard_available": False,
+}
+
 
 # ---------------------------------------------------------------------------
 # summarize -- utilization (used) -> remaining, and which window binds
@@ -72,6 +121,23 @@ def test_summarize_clamps_overspent_window_to_zero():
     "-4% remaining" in a warning reads as a bug rather than as danger."""
     summary = quota.summarize({"five_hour": {"utilization": 104.0}})
     assert summary["tightest"]["remaining_pct"] == 0.0
+
+
+def test_summarize_handles_the_endpoint_response_verbatim():
+    """`USAGE_PAYLOAD` above is trimmed by hand, and a hand-trimmed fixture
+    is exactly how two defects reached production here: bridge#20's dedup
+    passed a mutation check against a fixture holding `resets_at` fixed,
+    which no real response does. LIVE_USAGE_PAYLOAD is the untouched body
+    of GET /api/oauth/usage, captured 2026-08-09 02:52 Oslo -- including
+    the blocks the trimmed fixture drops entirely (`limits`, `spend`,
+    `extra_usage`) and a non-null window that is not tracked
+    (`nimbus_quill`, utilization 0.0, `resets_at: null`), which would
+    otherwise summarize as the emptiest window and become "tightest"."""
+    summary = quota.summarize(LIVE_USAGE_PAYLOAD)
+
+    assert [w["window"] for w in summary["windows"]] == ["five_hour", "seven_day"]
+    assert summary["tightest"]["window"] == "seven_day"
+    assert summary["tightest"]["remaining_pct"] == 96.0
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +267,20 @@ def _drive(watcher, stop_after, refresh):
     return watcher._wake.waits
 
 
+def _drive_for_real(watcher, stop_after, usage):
+    """Same driver, but with `refresh` left alone -- only the HTTP fetch is
+    stubbed. The tests below are about what reaches the history file, and
+    patching `refresh` (which is what every test here used to do) skips
+    both the write and the dedup guard that was swallowing it."""
+    watcher._wake = _FakeWake(watcher._stop, stop_after)
+    with patch.object(quota, "fetch_usage", lambda *a, **k: usage):
+        watcher._run()
+
+
+def _rows(path):
+    return [json.loads(line) for line in open(path)]
+
+
 def test_a_failing_poll_retries_in_seconds_rather_than_backing_off_from_a_minute():
     """The failure this actually meets is the first poll of a session
     racing the CLI's OAuth refresh, which clears in about three seconds.
@@ -209,7 +289,7 @@ def test_a_failing_poll_retries_in_seconds_rather_than_backing_off_from_a_minute
     the snapshot to decide how much work to take on."""
     watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
 
-    waits = _drive(watcher, 4, lambda path: False)
+    waits = _drive(watcher, 4, lambda path, boundary=None: False)
 
     assert waits == [5, 10, 20, 40]
 
@@ -219,7 +299,7 @@ def test_a_poll_that_keeps_failing_still_backs_off_to_the_cap():
     five-second hammer for the rest of the session."""
     watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
 
-    waits = _drive(watcher, 8, lambda path: False)
+    waits = _drive(watcher, 8, lambda path, boundary=None: False)
 
     assert waits == [5, 10, 20, 40, 80, 160, 300, 300]
 
@@ -228,7 +308,7 @@ def test_a_recovered_poll_goes_back_to_the_normal_interval():
     results = [False, True, True]
     watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
 
-    waits = _drive(watcher, 3, lambda path: results.pop(0))
+    waits = _drive(watcher, 3, lambda path, boundary=None: results.pop(0))
 
     assert waits == [5, quota.POLL_SECONDS, quota.POLL_SECONDS]
 
@@ -240,7 +320,7 @@ def test_a_recovery_re_arms_the_failure_log():
     watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
 
     with patch.object(quota, "log") as logged:
-        _drive(watcher, 3, lambda path: results.pop(0))
+        _drive(watcher, 3, lambda path, boundary=None: results.pop(0))
 
     assert logged.call_count == 2
 
@@ -253,13 +333,78 @@ def test_the_last_reading_is_taken_after_the_watcher_is_told_to_stop():
     calls = []
     watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
 
-    _drive(watcher, 1, lambda path: calls.append(path) or True)
+    _drive(watcher, 1, lambda path, boundary=None: calls.append((path, boundary)) or True)
 
-    assert calls == ["/tmp/unused-snapshot.json"] * 2
+    assert calls == [("/tmp/unused-snapshot.json", "start"),
+                     ("/tmp/unused-snapshot.json", "end")]
+
+
+def test_the_last_reading_reaches_the_history_even_when_the_number_has_not_moved(tmp_path):
+    """This is the half the test above could not see, because it patches
+    out `refresh` -- and therefore the dedup guard sitting underneath it.
+    The reading was always taken; `append_history` then dropped it for
+    matching the tick before it, which is the *normal* case, since the
+    percentage only moves every one to three minutes. Live proof: Cycle
+    47's history ends at 02:00:17, exactly three poll intervals after the
+    row above it, while the cycle was still writing to the vault at 01:59.
+    """
+    snapshot = str(tmp_path / "quota-snapshot.json")
+    history = str(tmp_path / "quota-history.jsonl")
+    watcher = quota.QuotaWatcher(path=snapshot)
+
+    _drive_for_real(watcher, 3, LIVE_USAGE_PAYLOAD)
+
+    rows = _rows(history)
+    assert [r.get("boundary") for r in rows] == ["start", "end"]
+    assert rows[-1]["at"] >= rows[0]["at"]
+
+
+def test_the_first_reading_of_a_session_is_kept_even_if_it_repeats_the_last(tmp_path):
+    """The mirror image, and the one that would have re-broken what
+    bridge#20 fixed: a new cycle waking into an unchanged seven-day
+    window reads the same numbers the previous cycle ended on, so its
+    opening row would be deduped against a row written hours earlier and
+    the cycle would have no recorded start."""
+    snapshot = str(tmp_path / "quota-snapshot.json")
+    history = str(tmp_path / "quota-history.jsonl")
+    quota.append_history(quota.summarize(LIVE_USAGE_PAYLOAD), history)
+    watcher = quota.QuotaWatcher(path=snapshot)
+
+    _drive_for_real(watcher, 1, LIVE_USAGE_PAYLOAD)
+
+    assert [r.get("boundary") for r in _rows(history)] == [None, "start", "end"]
+
+
+def test_the_start_boundary_marks_the_first_poll_that_works_not_the_first_attempt(tmp_path):
+    """The first poll of a session races the CLI's own OAuth refresh and
+    loses about a third of the time. Marking the attempt rather than the
+    reading would put "start" on nothing and leave the real first reading
+    indistinguishable from a tick."""
+    snapshot = str(tmp_path / "quota-snapshot.json")
+    history = str(tmp_path / "quota-history.jsonl")
+    payloads = [None, LIVE_USAGE_PAYLOAD, LIVE_USAGE_PAYLOAD]
+    watcher = quota.QuotaWatcher(path=snapshot)
+    watcher._wake = _FakeWake(watcher._stop, 2)
+
+    with patch.object(quota, "fetch_usage", lambda *a, **k: payloads.pop(0)):
+        watcher._run()
+
+    assert [r.get("boundary") for r in _rows(history)] == ["start", "end"]
+
+
+def test_a_boundary_row_does_not_stop_the_next_tick_being_deduped(tmp_path):
+    """The exemption is for boundaries only. An ordinary tick following a
+    boundary row must still be compared on the numbers alone, or the
+    marker would quietly turn the dedup off for the row after it."""
+    history = str(tmp_path / "quota-history.jsonl")
+    summary = quota.summarize(LIVE_USAGE_PAYLOAD)
+
+    assert quota.append_history(summary, history, "start") is True
+    assert quota.append_history(summary, history) is False
 
 
 def test_a_failing_last_reading_does_not_escape_the_thread():
-    def explode(path):
+    def explode(path, boundary=None):
         raise RuntimeError("endpoint gone")
 
     watcher = quota.QuotaWatcher(path="/tmp/unused-snapshot.json")
