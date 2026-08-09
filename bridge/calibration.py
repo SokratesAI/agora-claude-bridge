@@ -124,6 +124,41 @@ def ticks(history, window="seven_day"):
     return out
 
 
+# How much of an interval's length is allowed to be boundary uncertainty
+# before it stops being a measurement. Both ends of a tick are known only to
+# within one poll gap, so the error on the length is up to two of them; at
+# 0.2 an interval must be at least ten poll gaps long.
+#
+# This is a limit with a measured danger behind it, which is the only kind
+# worth having. Live on 2026-08-09 the poller ran every 120.6s (median of
+# 175 gaps), making the floor ~20 minutes -- and the two intervals it
+# excludes are 3 and 4 minutes long, where the uncertainty is larger than
+# the interval. They scored 174k and 1.7M weighted per point against a
+# ~2.3M median, and they widened the projected cost of a week from
+# 82-1481%. The next shortest real interval is 61 minutes, so this is
+# nowhere near a knife edge.
+#
+# They only became visible when per-model pricing stopped discarding them
+# for containing Fable: the model filter had been doing this job by
+# accident, and nothing would have noticed when it stopped.
+MAX_BOUNDARY_ERROR = 0.2
+
+
+def poll_gap(history):
+    """Median seconds between quota readings, or None if under two rows.
+
+    Measured rather than assumed: the poller's cadence has changed before,
+    and a threshold derived from a stale constant would silently stop
+    matching the data it is meant to protect.
+    """
+    gaps = [
+        history[i + 1]["at"] - history[i]["at"]
+        for i in range(len(history) - 1)
+        if history[i + 1]["at"] > history[i]["at"]
+    ]
+    return statistics.median(gaps) if gaps else None
+
+
 def _epoch(stamp):
     try:
         return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
@@ -175,6 +210,8 @@ def calibrate(events, history, window="seven_day"):
         ({**e, "_at": _epoch(e.get("at"))} for e in events),
         key=lambda e: (e["_at"] is None, e["_at"] or 0),
     )
+    gap = poll_gap(history)
+    min_seconds = 2 * gap / MAX_BOUNDARY_ERROR if gap else 0
     intervals = []
     for start, end, points, is_first in ticks(history, window):
         priced, foreign, foreign_models = spend_in(events, start, end)
@@ -183,6 +220,9 @@ def calibrate(events, history, window="seven_day"):
         elif foreign > 0:
             reason = "no known price for %s, which also spent here" % (
                 ", ".join(foreign_models),)
+        elif end - start < min_seconds:
+            reason = "%.0fm interval is under %.0fm: too short to time against a %.0fs poll" % (
+                (end - start) / 60, min_seconds / 60, gap)
         elif priced <= 0:
             reason = "no transcript spend found in the interval"
         else:
