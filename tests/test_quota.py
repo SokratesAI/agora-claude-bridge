@@ -761,13 +761,28 @@ def test_pace_is_one_when_spending_exactly_matches_elapsed_time():
 
 
 def test_pace_above_one_means_the_window_empties_early():
-    """The measured 2026-08-09 case: 13% used 3.97 days into a 7-day
-    window is 1.6x the sustainable rate, which is what made the 60-minute
-    cadence worth reporting on rather than assuming."""
+    """90% spent with half the week still to run: 1.8, and the window
+    cannot survive its own remaining time at that rate."""
+    hot = quota.summarize(_usage_at("seven_day", 90.0, 3.5 * 86400))
+    assert hot["windows"][0]["pace"] == pytest.approx(1.8, abs=0.01)
+
+
+def test_pace_is_window_to_date_and_hides_an_idle_stretch():
+    """The live 2026-08-09 reading, and the reason pace alone is not the
+    whole answer: 13% used 3.97 days into the week is a pace of 0.23,
+    which reads as a very quiet week. It was not. The loop was simply
+    near-idle from 08-05 to 08-08 and then ran 14 cycles in one day at
+    14.76%/day -- above the 14.3%/day the window affords.
+
+    Pace is an average over the whole window to date, so a burst is
+    diluted by whatever came before it. It answers "will *this* window
+    hold out", which is what a cycle sizing its own work needs. It does
+    not answer "is the current cadence sustainable" -- that needs the
+    slope between two recent readings, which is why `quota-history.jsonl`
+    keeps the series and not just this number.
+    """
     summary = quota.summarize(_usage_at("seven_day", 13.0, 3.97 * 86400))
     assert summary["windows"][0]["pace"] == pytest.approx(0.229, abs=0.01)
-    hot = quota.summarize(_usage_at("seven_day", 90.0, 3.5 * 86400))
-    assert hot["windows"][0]["pace"] > 1.0
 
 
 def test_pace_is_none_in_the_opening_moments_of_a_window():

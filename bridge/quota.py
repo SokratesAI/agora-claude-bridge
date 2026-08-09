@@ -202,6 +202,14 @@ def _pace(name, resets_at, used_pct):
     because what to do about a hot week is a judgement this file cannot
     make. It reports; `prompt.md` decides.
 
+    Read it as "will *this* window hold out", not as "is the cadence
+    sustainable". It averages over the whole window to date, so a burst is
+    diluted by anything quiet before it: the live reading while this was
+    written was 0.23, which looks like a very cold week and was actually a
+    near-idle stretch 08-05 to 08-08 followed by 14 cycles in one day at
+    14.76%/day. The cadence question needs the slope between two recent
+    readings, which is what `quota-history.jsonl` is for.
+
     None when it cannot be computed honestly: an unknown window length, an
     unparseable or absent `resets_at`, or a window so freshly reset that
     the elapsed share rounds to nothing and the ratio explodes.
