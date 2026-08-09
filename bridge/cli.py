@@ -136,6 +136,44 @@ def _detect_usage_limit(text):
     return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
 
 
+def _report_subagent_event(event, subagent, reporter, tool_names, subagent_names):
+    """Narrate one event a subagent produced.
+
+    Deliberately a separate function from the main loop's own branches rather
+    than an `if` inside them: nothing here may touch `pending`, `text_parts`
+    or `thinking_parts`, and keeping it out of the scope that owns them is a
+    stronger guarantee than remembering not to.
+
+    A subagent's tool calls are reported as the tools they are -- a `Bash`
+    call is a `Bash` call whoever made it -- and only the label says who ran
+    it. Its results pair back by tool_use_id exactly like the persona's,
+    which is why they share `tool_names`: the CLI's ids are unique across the
+    whole session, so there is nothing to keep apart.
+    """
+    label = subagent_names.get(subagent, "")
+    for block in event.get("message", {}).get("content", []):
+        kind = block.get("type")
+        if kind == "text":
+            # Only on `assistant`. A child `user` event carries the brief the
+            # subagent was handed, which `task_started` has already reported.
+            if event.get("type") == "assistant":
+                reporter.report_subagent_text(label, block.get("text", ""))
+        elif kind == "tool_use":
+            name = block.get("name", "")
+            tool_use_id = str(block.get("id", ""))
+            if tool_use_id:
+                tool_names[tool_use_id] = name
+            reporter.report(name, block.get("input"), tool_use_id, subagent=label)
+        elif kind == "tool_result":
+            tool_use_id = str(block.get("tool_use_id", ""))
+            name = tool_names.pop(tool_use_id, "")
+            if name:
+                reporter.report_result(
+                    name, tool_use_id, result_text(block),
+                    is_error=bool(block.get("is_error")),
+                )
+
+
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
                   system=None):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
@@ -148,6 +186,19 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
+        # Everything a subagent does, on the parent's stream. Without this the
+        # CLI reports a Task call and then nothing until it returns, which for
+        # a delegated read is several minutes of apparent silence -- Edvard's
+        # issue #4, "it looks like it does nothing for a long time".
+        #
+        # Measured on 2.1.226 rather than read off --help, because what it
+        # actually adds is narrower than the name suggests: `system/task_*`
+        # events are on the stream with or without it, and only the child
+        # `assistant` events (a subagent's text and its own tool calls) are
+        # new. Every child event carries `parent_tool_use_id`; that field is
+        # the only thing distinguishing a subagent's work from the persona's,
+        # and the loop below depends on it.
+        "--forward-subagent-text",
     ]
     # Lets the session see its own remaining quota while it runs, so it can
     # wrap up deliberately instead of being cut off mid-sentence (quota.py).
@@ -227,6 +278,12 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # flight (normally one) rather than the whole session's history.
     tool_names = {}
 
+    # The Agent call's tool_use_id -> that subagent's description, learned
+    # from `task_started`. Child events name their parent by tool_use_id and
+    # carry nothing else identifying, so this is what turns an anonymous
+    # forwarded passage into "the opening-read subagent said this".
+    subagent_names = {}
+
     # The newest text block, held back by exactly one event.
     #
     # A passage the persona writes is narration if more work follows it and
@@ -254,9 +311,52 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 continue
 
             t = event.get("type", "")
+            # Set on every event a subagent produced, naming the Agent call it
+            # belongs to. Empty for the persona's own events.
+            #
+            # This is the single most load-bearing line in the loop, and it
+            # guards two failures that both put a subagent's words in front of
+            # Edvard as if the persona had said them:
+            #
+            #  1. The reply is `pending[-1]` -- the last passage written. A
+            #     subagent launched in the background finishes whenever it
+            #     finishes, which is routinely AFTER the persona has written
+            #     its closing passage (measured: the persona's "OK", then the
+            #     child's report, then the persona's real answer). Let child
+            #     text into `pending` and the reply posted to his phone is
+            #     whatever some subagent happened to say last.
+            #  2. `release_narrative()` empties `pending`. A background child's
+            #     tool call arriving after the persona's final passage would
+            #     release it, leaving `pending` empty -- and the reply then
+            #     falls through to the join of every passage in the session,
+            #     which is the wall-of-text regression that fallback exists to
+            #     avoid.
+            #
+            # So child events are narrated and never contribute to the reply.
+            subagent = str(event.get("parent_tool_use_id") or "")
+            if subagent and t in ("assistant", "user"):
+                _report_subagent_event(event, subagent, reporter, tool_names, subagent_names)
+                continue
+
             if t == "assistant":
                 for block in event.get("message", {}).get("content", []):
                     if block.get("type") == "thinking":
+                        # Reachable, and always empty. Measured on 2.1.226,
+                        # 2026-08-10: the block IS emitted on every turn, but
+                        # as {"thinking": "", "signature": "Ep..."} -- the
+                        # plaintext is stripped in --print mode and only the
+                        # signature survives. `system/thinking_tokens` events
+                        # on the same stream report a real, non-zero token
+                        # count, so the model is thinking and the CLI is
+                        # simply not handing the text over.
+                        #
+                        # So `thinking` returns "" for every claude-cli turn.
+                        # That is not reasoning being dropped on the floor
+                        # here -- there is none to drop. Kept rather than
+                        # deleted because it costs nothing and is the branch
+                        # that would start working if the CLI ever forwards
+                        # the text; do not re-investigate without re-probing
+                        # a real stream first.
                         thought = block.get("thinking", "").strip()
                         if thought:
                             thinking_parts.append(thought)
@@ -305,7 +405,27 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 if sid:
                     new_session_id = sid
                 subtype = event.get("subtype", "")
-                if subtype == "error_during_execution":
+                # A subagent starting and finishing. Both were already on the
+                # stream before --forward-subagent-text existed and this loop
+                # dropped them, because the only subtype it looked at was the
+                # error one -- so the "how long did that delegated read take
+                # and what did it cost" question was answerable all along.
+                if subtype == "task_started":
+                    subagent_names[str(event.get("tool_use_id", ""))] = \
+                        event.get("description", "")
+                    reporter.report_subagent_start(
+                        str(event.get("task_id", "")),
+                        event.get("subagent_type", ""),
+                        event.get("description", ""),
+                    )
+                elif subtype == "task_notification":
+                    reporter.report_subagent_finish(
+                        str(event.get("task_id", "")),
+                        event.get("status", ""),
+                        event.get("summary", ""),
+                        event.get("usage"),
+                    )
+                elif subtype == "error_during_execution":
                     errors = event.get("errors", [])
                     error_text = " ".join(str(e) for e in errors)
                     log(f"CLI error_during_execution: {error_text[:300]}")

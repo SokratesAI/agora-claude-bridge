@@ -55,6 +55,24 @@ OUTPUT_CHARS_MAX = 20_000
 # NARRATION_TEXT, which has to agree with this string.
 NARRATION_TEXT = "assistant_text"
 
+# A subagent's whole life as one chip. The Agent call that launched it is
+# already narrated like any other tool, but everything the subagent then did
+# used to be invisible: the CLI drops child events from the parent stream
+# unless --forward-subagent-text is passed (cli.py).
+#
+# Start and finish travel under the same id so Agora's client folds them into
+# a single chip, exactly as it already does for a tool call and its output.
+# That id is the CLI's `task_id`, NOT the Agent call's `tool_use_id` -- the
+# latter is already the id of the Agent chip itself, and reusing it would put
+# two different calls in the client's `callsById` map under one key.
+SUBAGENT = "subagent"
+
+# Marks a line as a subagent's work rather than the persona's own. Everything
+# a subagent does arrives on the same stream as the persona's own actions and
+# is otherwise indistinguishable from it -- so a passage a subagent wrote
+# would read, in the drawer, as if the persona had written it.
+SUBAGENT_PREFIX = "↳"
+
 # Per tool, the input fields that actually say what the call DID, in
 # preference order. A tool that isn't listed -- or a call that has none of
 # its listed fields -- falls back to a compact dump of the whole input,
@@ -186,16 +204,25 @@ class ActivityReporter:
         self._thread = threading.Thread(target=self._drain, daemon=True)
         self._thread.start()
 
-    def report(self, name, tool_input, tool_use_id=""):
+    def report(self, name, tool_input, tool_use_id="", subagent=""):
         """The call, at the moment it starts.
 
         Still posted before the tool has run, which is what makes the
         narration live -- a `pytest` that takes four minutes must show up
         when it starts, not when it finishes. `tool_use_id` is what lets
         report_result() below catch up with this chip afterwards.
+
+        `subagent`: the description of the subagent that made this call, when
+        it wasn't the persona itself. Only the label changes -- the chip is
+        still the tool's own, and its result still pairs with it by
+        tool_use_id, because a subagent's `Bash` call is a real `Bash` call.
         """
         if self.enabled and name:
-            payload = {"capability": name, "detail": summarize(name, tool_input)}
+            detail = summarize(name, tool_input)
+            if subagent:
+                detail = f"{SUBAGENT_PREFIX} {subagent} · {detail}" if detail \
+                    else f"{SUBAGENT_PREFIX} {subagent}"
+            payload = {"capability": name, "detail": detail}
             if tool_use_id:
                 payload["toolUseId"] = tool_use_id
             self._queue.put(payload)
@@ -221,6 +248,66 @@ class ActivityReporter:
         passage = (text or "").strip()
         if self.enabled and passage:
             self._queue.put({"capability": NARRATION_TEXT, "detail": passage})
+
+    def report_subagent_text(self, description, text):
+        """A passage a SUBAGENT wrote, on its way to its own answer.
+
+        Narration, never the reply -- see cli.py for why that distinction is
+        load-bearing rather than tidy. It goes down the same queue as the
+        persona's own passages and renders as prose in the same drawer, but
+        it is attributed on its first line, because Agora's client uses that
+        line as the collapsed label and an unattributed one would read as the
+        persona's own voice.
+        """
+        passage = (text or "").strip()
+        if self.enabled and passage:
+            label = description or "subagent"
+            self._queue.put({
+                "capability": NARRATION_TEXT,
+                "detail": f"{SUBAGENT_PREFIX} {label}\n\n{passage}",
+            })
+
+    def report_subagent_start(self, task_id, subagent_type, description):
+        """A subagent was launched. Posted from the CLI's `task_started`
+        event rather than from the Agent tool call, because that event is
+        what carries the subagent's type and brief."""
+        if self.enabled and task_id:
+            detail = " · ".join(p for p in (subagent_type, description) if p)
+            self._queue.put({
+                "capability": SUBAGENT,
+                "toolUseId": task_id,
+                "detail": detail or "subagent",
+            })
+
+    def report_subagent_finish(self, task_id, status, summary, usage):
+        """A subagent finished. Pairs with report_subagent_start by task_id,
+        so the client folds the two into one chip whose expanded body is what
+        the subagent actually reported back.
+
+        The cost line is here because it is the one number that is otherwise
+        unknowable from outside: a delegated read is charged to the cycle's
+        own quota, and until now nothing said how much.
+        """
+        if not (self.enabled and task_id):
+            return
+        counts = usage if isinstance(usage, dict) else {}
+        parts = [status or "finished"]
+        tokens = counts.get("total_tokens")
+        if isinstance(tokens, int):
+            parts.append(f"{tokens:,} tokens")
+        calls = counts.get("tool_uses")
+        if isinstance(calls, int):
+            parts.append(f"{calls} tool call{'' if calls == 1 else 's'}")
+        duration = counts.get("duration_ms")
+        if isinstance(duration, (int, float)):
+            parts.append(f"{duration / 1000:.1f}s")
+        body = (summary or "").strip()
+        self._queue.put({
+            "capability": SUBAGENT,
+            "toolUseId": task_id,
+            "output": f"{' · '.join(parts)}\n\n{body}" if body else " · ".join(parts),
+            "isError": status not in ("", "completed", None),
+        })
 
     def report_result(self, name, tool_use_id, output, is_error=False):
         """What the call returned, once it has.

@@ -1549,3 +1549,179 @@ def test_write_mcp_config_is_not_world_readable(tmp_path):
     path = str(tmp_path / "mcp.json")
     cli.write_mcp_config(MCP_BLOCK, path=path)
     assert stat_module.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# cli.py -- subagent forwarding (--forward-subagent-text)
+#
+# Every event shape below was captured from a real CLI 2.1.226 run on
+# 2026-08-10, not invented: the ordering in the reply-protection tests is the
+# ordering a background subagent actually produced.
+# ---------------------------------------------------------------------------
+
+ACTIVITY_BLOCK = {"url": "http://runner/tool-activity", "token": "tok"}
+
+
+def _run_with_reporter(tmp_path, lines):
+    """Run a stream and return (text, posted payloads)."""
+    posted = []
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, thinking, _ = cli.run_turn("hello", activity=ACTIVITY_BLOCK)
+    return text, thinking, posted
+
+
+def test_run_turn_asks_the_cli_to_forward_subagent_events(tmp_path):
+    captured = _cli_run_capturing_cmd(tmp_path)
+    assert "--forward-subagent-text" in captured["cmd"]
+
+
+def test_a_subagent_finishing_last_does_not_become_the_reply(tmp_path):
+    """The failure this whole change is built around.
+
+    A backgrounded subagent finishes whenever it finishes -- routinely after
+    the persona has written its closing passage. If its text reached
+    `pending`, the reply posted to Edvard's phone would be the subagent's
+    words instead of the persona's. This ordering is copied from a real run.
+    """
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Agent", "id": "toolu_agent",
+             "input": {"description": "Gather state"}},
+        ]}},
+        {"type": "system", "subtype": "task_started", "task_id": "task_1",
+         "tool_use_id": "toolu_agent", "description": "Gather state",
+         "subagent_type": "Explore"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "the persona's real answer"},
+        ]}},
+        {"type": "assistant", "parent_tool_use_id": "toolu_agent",
+         "message": {"content": [{"type": "text", "text": "the subagent's report"}]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    text, _, posted = _run_with_reporter(tmp_path, lines)
+
+    assert text == "the persona's real answer"
+    assert "subagent" not in text
+    # ...and it is not silently dropped either -- it is narrated, attributed.
+    narrated = [p["detail"] for p in posted if p["capability"] == activity.NARRATION_TEXT]
+    assert any("the subagent's report" in d and "Gather state" in d for d in narrated)
+
+
+def test_a_subagent_tool_call_does_not_flush_the_pending_reply(tmp_path):
+    """The second, subtler half. `release_narrative()` empties `pending`; if a
+    background child's tool call could trigger it after the persona's final
+    passage, `pending` would be empty at the end and the reply would fall
+    through to the join of EVERY passage -- the wall of text that fallback
+    exists to prevent."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "first passage"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "final answer"}]}},
+        {"type": "assistant", "parent_tool_use_id": "toolu_agent", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "id": "toolu_child", "input": {"command": "ls"}},
+        ]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    text, _, _ = _run_with_reporter(tmp_path, lines)
+    assert text == "final answer"
+    assert "first passage" not in text
+
+
+def test_subagent_tool_calls_are_reported_and_attributed(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "system", "subtype": "task_started", "task_id": "task_1",
+         "tool_use_id": "toolu_agent", "description": "Gather state",
+         "subagent_type": "Explore"},
+        {"type": "assistant", "parent_tool_use_id": "toolu_agent", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "id": "toolu_child",
+             "input": {"command": "echo hi"}},
+        ]}},
+        {"type": "user", "parent_tool_use_id": "toolu_agent", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_child", "content": "hi"},
+        ]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    text, _, posted = _run_with_reporter(tmp_path, lines)
+
+    assert text == "done"
+    call = [p for p in posted if p["capability"] == "Bash" and "detail" in p]
+    result = [p for p in posted if p["capability"] == "Bash" and "output" in p]
+    # The tool keeps its own name -- a subagent's Bash call is a Bash call --
+    # and only the label says who ran it.
+    assert call[0]["detail"] == "↳ Gather state · echo hi"
+    # The result still pairs back by tool_use_id, across the parent/child line.
+    assert result[0]["output"] == "hi"
+    assert result[0]["toolUseId"] == "toolu_child"
+
+
+def test_subagent_start_and_finish_fold_into_one_chip(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "system", "subtype": "task_started", "task_id": "task_1",
+         "tool_use_id": "toolu_agent", "description": "Gather state",
+         "subagent_type": "Explore"},
+        {"type": "system", "subtype": "task_notification", "task_id": "task_1",
+         "status": "completed", "summary": "found three things",
+         "usage": {"total_tokens": 94183, "tool_uses": 37, "duration_ms": 215028}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    _, _, posted = _run_with_reporter(tmp_path, lines)
+
+    chips = [p for p in posted if p["capability"] == activity.SUBAGENT]
+    assert len(chips) == 2
+    start, finish = chips
+    assert start["detail"] == "Explore · Gather state"
+    # Same id on both halves is what makes Agora's client render one chip.
+    assert start["toolUseId"] == finish["toolUseId"] == "task_1"
+    assert finish["isError"] is False
+    assert "completed · 94,183 tokens · 37 tool calls · 215.0s" in finish["output"]
+    assert "found three things" in finish["output"]
+
+
+def test_a_failed_subagent_is_marked_as_an_error(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "system", "subtype": "task_notification", "task_id": "task_1",
+         "status": "failed", "summary": "it broke", "usage": {}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    _, _, posted = _run_with_reporter(tmp_path, lines)
+    finish = [p for p in posted if p["capability"] == activity.SUBAGENT][0]
+    assert finish["isError"] is True
+
+
+def test_subagent_thinking_is_never_mistaken_for_the_personas_own(tmp_path):
+    """`thinking` is returned to the runner as the persona's reasoning. A
+    subagent's must not end up in it."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "the persona's reasoning"},
+        ]}},
+        {"type": "assistant", "parent_tool_use_id": "toolu_agent", "message": {"content": [
+            {"type": "thinking", "thinking": "the subagent's reasoning"},
+            {"type": "text", "text": "child says hello"},
+        ]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    text, thinking, _ = _run_with_reporter(tmp_path, lines)
+    assert text == "done"
+    assert thinking == "the persona's reasoning"
+
+
+def test_an_unnamed_subagent_still_gets_attributed(tmp_path):
+    """A child event can arrive before its `task_started` -- or after a
+    resume, where this process never saw one. It must still be marked as a
+    subagent rather than silently reading as the persona."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "parent_tool_use_id": "toolu_unknown",
+         "message": {"content": [{"type": "text", "text": "orphan report"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "result", "session_id": "s", "subtype": "success"},
+    )
+    _, _, posted = _run_with_reporter(tmp_path, lines)
+    narrated = [p["detail"] for p in posted if p["capability"] == activity.NARRATION_TEXT]
+    assert any(d.startswith("↳ subagent") and "orphan report" in d for d in narrated)
