@@ -11,7 +11,29 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+# The `claude` CLI itself -- pinned for the same reason NODE_MAJOR and
+# KUBECTL_VERSION above are, which this line used to be the one exception to.
+#
+# Unpinned was not "tracks latest"; it was "frozen, invisibly". Nothing above
+# this line changes between builds, so Docker's layer cache never re-ran the
+# install, and the version stayed at whatever it was when the layer was first
+# built while looking like it followed the registry. Measured 2026-08-10: the
+# running pod had 2.1.197 and the registry had 2.1.226 -- 29 releases, among
+# them two long-session performance fixes, a memory-growth fix for truncated
+# MCP tool outputs, and `--forward-subagent-text`.
+#
+# Bumping this is a deliberate, revertible change, and it deserves to be: the
+# loop that maintains this repo runs *inside* this binary, so a breaking change
+# to the stream-json contract in bridge/cli.py takes out the cycle that would
+# otherwise fix it. Before bumping, re-run the check that justified this one --
+# run the same prompt through both versions with
+# `--print --output-format stream-json --verbose` and diff the sequence of
+# event `type`s and content-block `type`s. On 2.1.197 vs 2.1.226 they were
+# identical, and every field cli.py reads (`id`/`name`/`input` on tool_use,
+# `tool_use_id`/`is_error` on tool_result, `rate_limit_info`, `session_id`)
+# was present under the same name.
+ARG CLAUDE_CODE_VERSION=2.1.226
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # kubectl -- 2026-08-01 design call: this service should be as capable as
 # an interactive Claude Code session, including real cluster access via
