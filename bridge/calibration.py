@@ -16,10 +16,18 @@ whose error bars nobody could state. Two such estimates disagreed by 1.68x
 and the standing explanation was "maybe the plan was upgraded".
 
 It was not the plan. Most of the gap was Fable: three of the twelve observed
-ticks happened during a Fable experiment, and Fable is charged on different
-ratios than the Opus ones `COST_WEIGHTS` encodes, so those intervals scored
-~0.6M weighted per point against ~2.6M for the Opus-only ones. Averaging
-them together is the whole error.
+ticks happened during a Fable experiment, and everything was being priced as
+Opus, so those intervals scored ~0.9M weighted per point against ~2.6M for
+the Opus-only ones. Averaging them together is the whole error.
+
+The first fix here was to drop any interval containing non-Opus spend. That
+was right while Opus was the only model with a known price and wrong as a
+resting state, because subagents run on Sonnet and Haiku -- so routine
+subagent use would have disabled the very instrument meant to measure
+whether subagents were worth it. `analytics.py` now knows all four models'
+prices, and this module excludes only what it genuinely cannot price: a
+model it has never heard of. An interval is a sample if every charge inside
+it has a known ratio, whatever the mix.
 
 THE METHOD, and why it beats dividing totals. The usage percentage is an
 integer, so a single reading of "14%" means somewhere in 13.5-14.5 -- a 7%
@@ -45,17 +53,16 @@ import statistics
 import sys
 from datetime import datetime, timezone
 
-from bridge.analytics import COST_WEIGHTS, scan, scan_spend_events, summarize
+from bridge.analytics import (
+    COST_WEIGHTS,
+    model_price_ratio,
+    scan,
+    scan_spend_events,
+    summarize,
+)
 from bridge.config import CLAUDE_HOME
 
 HISTORY_FILE = os.path.join(CLAUDE_HOME, "quota-history.jsonl")
-
-# COST_WEIGHTS are the published Opus price ratios, so an interval is only a
-# valid calibration sample if everything charged inside it was priced that
-# way. This is a substring test against the model id rather than an allowlist
-# because model ids gain date suffixes and we would rather admit a future
-# Opus than silently discard every interval after a rename.
-WEIGHTS_PRICED_FOR = "opus"
 
 
 def read_history(path=None):
@@ -117,6 +124,41 @@ def ticks(history, window="seven_day"):
     return out
 
 
+# How much of an interval's length is allowed to be boundary uncertainty
+# before it stops being a measurement. Both ends of a tick are known only to
+# within one poll gap, so the error on the length is up to two of them; at
+# 0.2 an interval must be at least ten poll gaps long.
+#
+# This is a limit with a measured danger behind it, which is the only kind
+# worth having. Live on 2026-08-09 the poller ran every 120.6s (median of
+# 175 gaps), making the floor ~20 minutes -- and the two intervals it
+# excludes are 3 and 4 minutes long, where the uncertainty is larger than
+# the interval. They scored 174k and 1.7M weighted per point against a
+# ~2.3M median, and they widened the projected cost of a week from
+# 82-1481%. The next shortest real interval is 61 minutes, so this is
+# nowhere near a knife edge.
+#
+# They only became visible when per-model pricing stopped discarding them
+# for containing Fable: the model filter had been doing this job by
+# accident, and nothing would have noticed when it stopped.
+MAX_BOUNDARY_ERROR = 0.2
+
+
+def poll_gap(history):
+    """Median seconds between quota readings, or None if under two rows.
+
+    Measured rather than assumed: the poller's cadence has changed before,
+    and a threshold derived from a stale constant would silently stop
+    matching the data it is meant to protect.
+    """
+    gaps = [
+        history[i + 1]["at"] - history[i]["at"]
+        for i in range(len(history) - 1)
+        if history[i + 1]["at"] > history[i]["at"]
+    ]
+    return statistics.median(gaps) if gaps else None
+
+
 def _epoch(stamp):
     try:
         return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
@@ -127,18 +169,21 @@ def _epoch(stamp):
 def spend_in(events, start, end):
     """(priced, foreign, foreign_models) weighted spend charged in [start, end).
 
-    Split by model, because only the priced half is comparable to
-    COST_WEIGHTS. The foreign half is not converted -- it is reported so the
-    caller can throw the interval away, which is the only honest thing to do
-    with it.
+    Split by whether the model's price is known. `analytics.py` has already
+    scaled each event by its own model's ratio, so the priced half is
+    directly addable across a mix of Opus, Fable, Sonnet and Haiku -- that is
+    the point of per-model weights and the reason a subagent-heavy interval
+    is now a usable sample instead of a discarded one.
 
-    Foreign is more than the Fable experiment: subagents run on Sonnet and
-    Haiku, and the `<synthetic>` model the CLI stamps on locally-generated
-    turns also lands here. Synthetic turns cost zero, so they never
-    contaminate an interval, but a cycle that leans on subagents will knock
-    out its own calibration samples. That is why the models are named in the
-    return rather than reduced to a boolean -- an empty calibration should be
-    able to say what emptied it.
+    Foreign is what is left: a model with no known ratio. It is not
+    converted, because inventing a ratio is exactly the error this module
+    exists to have caught. In practice it is the `<synthetic>` model the CLI
+    stamps on locally-generated turns, which costs zero and so never
+    contaminates an interval, plus anything Anthropic releases that this
+    table has not been taught yet. The models are named in the return rather
+    than reduced to a boolean so an empty calibration can say what emptied
+    it -- which, the next time a model is renamed, is the sentence that
+    turns a mysterious constant into a one-line fix.
     """
     priced = foreign = 0.0
     foreign_models = set()
@@ -146,7 +191,7 @@ def spend_in(events, start, end):
         at = event.get("_at") if event.get("_at") is not None else _epoch(event.get("at"))
         if at is None or at < start or at >= end:
             continue
-        if WEIGHTS_PRICED_FOR in (event.get("model") or "").lower():
+        if model_price_ratio(event.get("model")) is not None:
             priced += event["weighted_tokens"]
         elif event["weighted_tokens"]:
             foreign += event["weighted_tokens"]
@@ -165,14 +210,19 @@ def calibrate(events, history, window="seven_day"):
         ({**e, "_at": _epoch(e.get("at"))} for e in events),
         key=lambda e: (e["_at"] is None, e["_at"] or 0),
     )
+    gap = poll_gap(history)
+    min_seconds = 2 * gap / MAX_BOUNDARY_ERROR if gap else 0
     intervals = []
     for start, end, points, is_first in ticks(history, window):
         priced, foreign, foreign_models = spend_in(events, start, end)
         if is_first:
             reason = "first tick in history: no known start"
         elif foreign > 0:
-            reason = "priced for %s, but %s also spent here" % (
-                WEIGHTS_PRICED_FOR, ", ".join(foreign_models))
+            reason = "no known price for %s, which also spent here" % (
+                ", ".join(foreign_models),)
+        elif end - start < min_seconds:
+            reason = "%.0fm interval is under %.0fm: too short to time against a %.0fs poll" % (
+                (end - start) / 60, min_seconds / 60, gap)
         elif priced <= 0:
             reason = "no transcript spend found in the interval"
         else:

@@ -17,6 +17,32 @@ def _reading(at, seven_day):
     return {"at": at, "seven_day": seven_day}
 
 
+# The poller's real cadence, measured at 120.6s median over 175 live gaps.
+POLL = 120.0
+
+
+def _dense(rows):
+    """The same readings, with the poller's real cadence filled in between.
+
+    Density is load-bearing, not decoration. `calibrate` rejects an interval
+    it cannot time against the poll gap, and a fixture that polls once an
+    hour describes a history no poller has ever produced -- every interval
+    in it is one poll wide, so it would exercise the rejection path by
+    accident and hide whatever the test was actually about. Filling the gaps
+    changes no tick: `ticks` anchors on the reading where a value first
+    appears, and repeating that value does not move it.
+    """
+    out = []
+    for i, row in enumerate(rows):
+        out.append(row)
+        if i + 1 < len(rows):
+            at = row["at"] + POLL
+            while at < rows[i + 1]["at"]:
+                out.append(_reading(at, row["seven_day"]))
+                at += POLL
+    return out
+
+
 def _iso(epoch):
     from datetime import datetime, timezone
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -58,52 +84,152 @@ def test_a_window_reset_breaks_the_anchor():
     assert is_first is True, "the first tick after a reset is unanchored too"
 
 
-def test_fable_intervals_are_excluded_rather_than_averaged_in():
-    """The bug this module was written for. COST_WEIGHTS are Opus price
-    ratios, so an interval whose spend came from another model is not
-    comparable -- measured live, Fable ticks scored ~0.9M weighted per point
-    against ~2.6M for Opus. Averaging the two produced the 1.68x
-    disagreement that stood as an open question for two cycles."""
-    history = [
+def test_a_fable_interval_is_a_sample_now_that_fable_has_a_price():
+    """The inversion of the rule this module shipped with. Fable ticks used
+    to be discarded because everything was priced as Opus and they scored
+    ~0.9M weighted per point against ~2.6M. `analytics.py` now scales each
+    event by its own model's ratio before it ever reaches here, so a Fable
+    interval agrees with the Opus ones instead of reading 3x cheap -- and a
+    sample that agrees is a sample worth keeping. Half the tokens at twice
+    the price is the same quota point, which is the whole claim."""
+    history = _dense([
         _reading(T0, 1.0),
         _reading(T0 + HOUR, 2.0),
         _reading(T0 + 2 * HOUR, 3.0),
         _reading(T0 + 3 * HOUR, 4.0),
-    ]
+    ])
     events = [
         _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
         _event(_iso(T0 + 1.5 * HOUR), 2_400_000),
-        _event(_iso(T0 + 2.5 * HOUR), 900_000, model="claude-fable-5"),
+        # 1.2M Fable tokens, already scaled by 2.0 upstream.
+        _event(_iso(T0 + 2.5 * HOUR), 2_400_000, model="claude-fable-5"),
     ]
     result = calibration.calibrate(events, history)
 
-    assert result["samples"] == 1, "first tick unanchored, third tick is Fable"
-    assert result["weighted_per_point"] == 2_400_000
+    assert result["samples"] == 2, "only the unanchored first tick is dropped"
     fable_interval = result["intervals"][-1]
-    assert fable_interval["used"] is False
-    assert fable_interval["foreign_weighted"] == 900_000
-    assert fable_interval["foreign_models"] == ["claude-fable-5"]
-    assert "claude-fable-5" in fable_interval["excluded_because"], \
-        "an empty calibration must be able to say what emptied it"
+    assert fable_interval["used"] is True
+    assert fable_interval["foreign_weighted"] == 0
+    assert fable_interval["weighted_per_point"] == 2_400_000
+    assert result["weighted_per_point"] == 2_400_000
 
 
-def test_a_mixed_interval_is_dropped_even_though_it_has_priced_spend():
-    """A Fable call landing in the middle of an otherwise-Opus interval
-    contaminates the whole interval: the point was paid for partly at
-    prices these weights do not describe. Keeping the Opus half would
-    understate the constant, which reads as 'cycles are cheaper than they
-    are' -- the dangerous direction for a budget."""
-    history = [_reading(T0, 1.0), _reading(T0 + HOUR, 2.0), _reading(T0 + 2 * HOUR, 3.0)]
+def test_a_mixed_model_interval_is_kept_and_summed():
+    """Subagents run on Sonnet and Haiku, so an interval containing more
+    than one model is the normal case, not the contaminated one. Dropping
+    these would mean routine subagent use disabling the instrument meant to
+    measure whether subagents were worth it."""
+    history = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0),
+                      _reading(T0 + 2 * HOUR, 3.0)])
     events = [
         _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
         _event(_iso(T0 + 1.2 * HOUR), 2_000_000),
-        _event(_iso(T0 + 1.5 * HOUR), 50_000, model="claude-fable-5"),
+        _event(_iso(T0 + 1.4 * HOUR), 300_000, model="claude-sonnet-5"),
+        _event(_iso(T0 + 1.5 * HOUR), 100_000, model="claude-haiku-4-5-20251001"),
     ]
     result = calibration.calibrate(events, history)
+
+    assert result["samples"] == 1
+    assert result["intervals"][-1]["used"] is True
+    assert result["intervals"][-1]["priced_weighted"] == 2_400_000
+    assert result["intervals"][-1]["foreign_weighted"] == 0
+    assert result["weighted_per_point"] == 2_400_000
+
+
+def test_an_interval_shorter_than_the_poll_can_time_is_dropped():
+    """Both ends of a tick are known only to within one poll gap, so a
+    3-minute interval measured by a 2-minute poller has more uncertainty
+    than length. Live, two such intervals scored 174k and 1.7M weighted per
+    point against a ~2.3M median and stretched the projected cost of a week
+    to 82-1481%.
+
+    They had been excluded all along for containing Fable, which meant the
+    model filter was doing this job by accident -- so pricing Fable properly
+    is what exposed them. A filter nothing tests is a filter that stops
+    working silently."""
+    history = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0)])
+    # A third point ticks 3 minutes after the second, far inside the floor.
+    history.append(_reading(T0 + HOUR + 180, 3.0))
+    events = [
+        _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
+        _event(_iso(T0 + HOUR + 60), 90_000),
+    ]
+    result = calibration.calibrate(events, history)
+
+    short = result["intervals"][-1]
+    assert short["gap_seconds"] == 180.0
+    assert short["used"] is False
+    assert short["priced_weighted"] == 90_000, "the spend is real, the timing is not"
+    assert "too short" in short["excluded_because"]
+    assert result["samples"] == 0, "the only other tick is the unanchored first"
+
+
+def test_the_short_interval_floor_follows_the_measured_poll_cadence():
+    """The floor is derived, not hardcoded. The poller's cadence has changed
+    before, and a constant tuned to one cadence would silently stop matching
+    the data it exists to protect -- so a slower poller must widen the floor
+    rather than keep admitting intervals it can no longer time."""
+    fast = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0)])
+    assert calibration.poll_gap(fast) == 120.0
+
+    slow = [_reading(T0 + i * 600, 1.0) for i in range(6)]
+    assert calibration.poll_gap(slow) == 600.0
+
+    # 2 * gap / 0.2 == ten poll gaps, whatever the poller is doing.
+    assert calibration.MAX_BOUNDARY_ERROR == 0.2
+    assert 2 * 120.0 / calibration.MAX_BOUNDARY_ERROR == 1200.0
+    assert 2 * 600.0 / calibration.MAX_BOUNDARY_ERROR == 6000.0
+
+
+def test_poll_gap_needs_two_readings_and_does_not_divide_by_zero():
+    """An empty or single-row history must not take the floor to infinity
+    (excluding everything) or crash. It disables the check instead."""
+    assert calibration.poll_gap([]) is None
+    assert calibration.poll_gap([_reading(T0, 1.0)]) is None
+    # Identical timestamps are not a gap.
+    assert calibration.poll_gap([_reading(T0, 1.0), _reading(T0, 2.0)]) is None
+
+
+def test_an_unpriced_model_still_drops_the_interval():
+    """The half of the old rule that must survive. A model with no known
+    ratio cannot be converted, and pricing it as Opus by default is exactly
+    the error that produced the 1.68x disagreement. So a model this table
+    has not been taught yet excludes its interval and says its own name --
+    the next release should announce itself, not skew the constant."""
+    history = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0),
+                      _reading(T0 + 2 * HOUR, 3.0)])
+    events = [
+        _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
+        _event(_iso(T0 + 1.2 * HOUR), 2_000_000),
+        _event(_iso(T0 + 1.5 * HOUR), 50_000, model="claude-something-6"),
+    ]
+    result = calibration.calibrate(events, history)
+
     assert result["samples"] == 0
     assert result["weighted_per_point"] is None
-    assert result["intervals"][-1]["priced_weighted"] == 2_000_000
     assert result["intervals"][-1]["used"] is False
+    assert result["intervals"][-1]["priced_weighted"] == 2_000_000
+    assert result["intervals"][-1]["foreign_models"] == ["claude-something-6"]
+    assert "claude-something-6" in result["intervals"][-1]["excluded_because"], \
+        "an empty calibration must be able to say what emptied it"
+
+
+def test_a_zero_cost_synthetic_turn_does_not_drop_the_interval():
+    """`<synthetic>` is stamped on locally-generated turns and has no price,
+    but it also has no cost. It must not be able to exclude an interval it
+    contributed nothing to -- otherwise the commonest unpriced model in the
+    transcripts silently eats real samples."""
+    history = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0),
+                      _reading(T0 + 2 * HOUR, 3.0)])
+    events = [
+        _event(_iso(T0 + 0.5 * HOUR), 2_600_000),
+        _event(_iso(T0 + 1.2 * HOUR), 2_400_000),
+        _event(_iso(T0 + 1.5 * HOUR), 0, model="<synthetic>"),
+    ]
+    result = calibration.calibrate(events, history)
+
+    assert result["samples"] == 1
+    assert result["weighted_per_point"] == 2_400_000
 
 
 def test_spend_is_attributed_by_message_timestamp_not_spread_over_a_session():
@@ -111,7 +237,8 @@ def test_spend_is_attributed_by_message_timestamp_not_spread_over_a_session():
     session straddling a tick contributes only the messages on each side --
     spreading its total evenly would smear cost across a boundary and is
     worst on short intervals, which are the sharpest samples."""
-    history = [_reading(T0, 1.0), _reading(T0 + HOUR, 2.0), _reading(T0 + 2 * HOUR, 3.0)]
+    history = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0),
+                      _reading(T0 + 2 * HOUR, 3.0)])
     events = [
         _event(_iso(T0 + 0.1 * HOUR), 1_000_000),
         _event(_iso(T0 + 0.9 * HOUR), 1_000_000),
@@ -147,7 +274,8 @@ def test_an_interval_with_no_transcript_spend_is_reported_not_counted():
     """Quota moving with nothing on the PVC to explain it means spend from
     somewhere this loop cannot see. Dividing by it would produce a
     conversion factor of zero and poison the median."""
-    history = [_reading(T0, 1.0), _reading(T0 + HOUR, 2.0), _reading(T0 + 2 * HOUR, 3.0)]
+    history = _dense([_reading(T0, 1.0), _reading(T0 + HOUR, 2.0),
+                      _reading(T0 + 2 * HOUR, 3.0)])
     events = [_event(_iso(T0 + 0.5 * HOUR), 2_600_000)]
     result = calibration.calibrate(events, history)
     assert result["samples"] == 0

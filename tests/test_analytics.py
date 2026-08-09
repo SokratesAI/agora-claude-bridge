@@ -9,11 +9,12 @@ def _write(tmp_path, name, records):
     return str(path)
 
 
-def _assistant(msg_id, usage, blocks=None, ts="2026-08-08T10:00:00.000Z", **extra):
+def _assistant(msg_id, usage, blocks=None, ts="2026-08-08T10:00:00.000Z",
+               model="claude-opus-5", **extra):
     record = {
         "type": "assistant",
         "timestamp": ts,
-        "message": {"id": msg_id, "model": "claude-opus-5", "usage": usage,
+        "message": {"id": msg_id, "model": model, "usage": usage,
                     "content": blocks if blocks is not None else [{"type": "text", "text": "hi"}]},
     }
     record.update(extra)
@@ -93,6 +94,75 @@ def test_weighted_tokens_applies_the_price_ratios():
     assert analytics.weighted_tokens(totals) == 935.0
 
 
+def test_weighted_tokens_scales_by_which_model_spent_them():
+    """A token is not one price. Fable is twice Opus and Haiku a fifth, so
+    pricing every model as Opus mismeasured a subagent-heavy cycle in both
+    directions at once."""
+    totals = {"input_tokens": 100, "output_tokens": 100, "cache_read_tokens": 100,
+              "cache_write_5m_tokens": 100, "cache_write_1h_tokens": 100}
+
+    assert analytics.weighted_tokens(totals, "claude-opus-5") == 935.0
+    assert analytics.weighted_tokens(totals, "claude-fable-5") == 1870.0
+    assert analytics.weighted_tokens(totals, "claude-sonnet-5") == 561.0
+    assert analytics.weighted_tokens(totals, "claude-haiku-4-5-20251001") == 187.0
+
+
+def test_an_unknown_model_is_priced_as_opus_rather_than_dropped():
+    """The lenient half of the boundary. `model_price_ratio` reports None so
+    calibration can exclude the interval, but a cycle's own cost must still
+    include the spend -- silently reporting a row as free is worse than
+    reporting it at an approximate price."""
+    totals = {"input_tokens": 100, "output_tokens": 100, "cache_read_tokens": 100,
+              "cache_write_5m_tokens": 100, "cache_write_1h_tokens": 100}
+
+    assert analytics.model_price_ratio("claude-something-6") is None
+    assert analytics.weighted_tokens(totals, "claude-something-6") == 935.0
+    assert analytics.weighted_tokens(totals, None) == 935.0
+
+
+def test_price_ratio_matches_a_family_through_a_date_suffix():
+    """Ids gain date suffixes. Matching the family rather than the exact id
+    is what stops a rename from quietly turning a priced model unpriced."""
+    assert analytics.model_price_ratio("claude-haiku-4-5-20251001") == 0.2
+    assert analytics.model_price_ratio("claude-opus-5") == 1.0
+    assert analytics.model_price_ratio("<synthetic>") is None
+
+
+def test_a_mixed_model_session_prices_each_model_separately(tmp_path):
+    """A cycle that delegates is one row spanning several models. Weighting
+    the session total at a single rate is wrong however that rate is picked;
+    the split has to happen before the multiply."""
+    path = _write(tmp_path, "s.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE),
+        _assistant("msg_b", USAGE, model="claude-haiku-4-5-20251001"),
+    ])
+
+    row = analytics.parse_transcript(path)
+
+    one = analytics.weighted_tokens(analytics._usage_totals(USAGE))
+    # Raw counters stay whole; only the weighting is split.
+    assert row["input_tokens"] == 200
+    assert row["weighted_tokens"] == one + one * 0.2
+    assert row["weighted_tokens"] != one * 2, "must not price the Haiku half as Opus"
+
+
+def test_spend_events_carry_the_model_scaled_weight(tmp_path):
+    """Calibration adds these up directly, so the scaling has to be baked in
+    here -- it has no other chance to apply it."""
+    path = _write(tmp_path, "s.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE, ts="2026-08-08T10:00:00.000Z"),
+        _assistant("msg_b", USAGE, ts="2026-08-08T10:01:00.000Z",
+                   model="claude-fable-5"),
+    ])
+
+    events = analytics.spend_events(path)
+
+    one = analytics.weighted_tokens(analytics._usage_totals(USAGE))
+    assert [e["weighted_tokens"] for e in events] == [one, one * 2]
+
+
 def test_tool_calls_are_counted_per_block_not_per_message(tmp_path):
     """Unlike usage, each tool_use block is a real distinct call."""
     blocks = [{"type": "text", "text": "x"},
@@ -140,6 +210,43 @@ def test_cost_share_sums_to_100(tmp_path):
     share = analytics.summarize(analytics.scan(str(tmp_path)))["cost_share"]
 
     assert abs(sum(share.values()) - 100.0) < 0.5
+
+
+def test_cost_share_still_sums_to_100_across_models(tmp_path):
+    """The single-model version of this test above cannot fail, because one
+    model means one scale factor that cancels in the ratio. Every cycle so
+    far has been pure Opus, so a breakdown computed at flat weights against
+    a per-model-scaled total would have looked correct right up until the
+    first cycle that used a subagent."""
+    _write(tmp_path, "a.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("m1", USAGE),
+        _assistant("m2", USAGE, model="claude-haiku-4-5-20251001"),
+        _assistant("m3", USAGE, model="claude-fable-5"),
+    ])
+
+    summary = analytics.summarize(analytics.scan(str(tmp_path)))
+
+    assert abs(sum(summary["cost_share"].values()) - 100.0) < 0.5
+    # And the breakdown must add up to the headline number, not merely to
+    # 100% of some other quantity.
+    assert abs(sum(summary["totals_weighted"].values())
+               - summary["total_weighted"]) < 0.5
+
+
+def test_the_weighted_breakdown_adds_up_to_the_session_total(tmp_path):
+    """One source of truth for the two multiplications: if these can drift,
+    the per-class breakdown is describing a cycle that did not happen."""
+    path = _write(tmp_path, "s.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("m1", USAGE),
+        _assistant("m2", USAGE, model="claude-sonnet-5"),
+    ])
+
+    row = analytics.parse_transcript(path)
+
+    assert abs(sum(row["weighted_by_field"].values())
+               - row["weighted_tokens"]) < 0.5
 
 
 def test_a_half_written_final_line_does_not_lose_the_session(tmp_path):
