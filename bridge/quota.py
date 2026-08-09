@@ -35,6 +35,7 @@ script running in a separate process (see hooks/quota_notice.py). The
 watcher writes a snapshot; the hook reads it after each tool call and
 tells the session when it is time to wrap up.
 """
+import datetime
 import json
 import os
 import sys
@@ -166,6 +167,63 @@ def fetch_usage(token=None):
         return None
 
 
+# How long each tracked window is, so "how far through it are we" can be
+# computed from `resets_at` alone. The endpoint reports when a window ends
+# and never when it began.
+WINDOW_SECONDS = {
+    "five_hour": 5 * 3600,
+    "seven_day": 7 * 86400,
+}
+
+
+def _pace(name, resets_at, used_pct):
+    """Used share divided by elapsed share -- 1.0 is exactly on the line.
+
+    Edvard, 2026-08-09, cutting the heartbeat from 72 to 60 minutes: "i
+    think an aggressive approach is better to start with". That is the
+    right instinct and it needs an instrument, because the cadence change
+    moves this loop across the line rather than towards it. Measured the
+    same evening: `seven_day` went 2% -> 13% in 17.88 hours at the old
+    cadence -- 14.76%/day against a window that only affords 14.3%/day, so
+    24 cycles a day is roughly 118-124% of a week's quota and the window
+    empties about a day early.
+
+    The number a cycle actually needs is not "how much is left" but "is
+    what is left ahead of or behind schedule", and every cycle so far has
+    re-derived that by hand from `remaining_pct / days_left`. That formula
+    was written when the heartbeat was 6-hourly and each cycle had a
+    five-hour window to itself; five cycles now share one. Computing it
+    here means every cycle reads the same number the same way, and it
+    lands in `quota-history.jsonl` for free, which is the trial-and-error
+    record he asked for.
+
+    Deliberately a measurement and not a threshold. Nothing in this module
+    acts on it -- no warning fires off pace, no cycle is told to stop --
+    because what to do about a hot week is a judgement this file cannot
+    make. It reports; `prompt.md` decides.
+
+    None when it cannot be computed honestly: an unknown window length, an
+    unparseable or absent `resets_at`, or a window so freshly reset that
+    the elapsed share rounds to nothing and the ratio explodes.
+    """
+    length = WINDOW_SECONDS.get(name)
+    if not length or not resets_at:
+        return None
+    try:
+        ends = datetime.datetime.fromisoformat(str(resets_at))
+    except ValueError:
+        return None
+    if ends.tzinfo is None:
+        ends = ends.replace(tzinfo=datetime.timezone.utc)
+    elapsed = length - (ends.timestamp() - time.time())
+    # Guard both ends: a clock skew that puts `resets_at` further out than
+    # the window is long gives a negative elapsed, and the first seconds of
+    # a window give a near-zero denominator.
+    if elapsed < length * 0.01:
+        return None
+    return round(float(used_pct) / (elapsed / length * 100.0), 3)
+
+
 def summarize(usage):
     """{"windows": [...], "tightest": {...}} -- or None if nothing usable.
 
@@ -196,6 +254,7 @@ def summarize(usage):
             # sees it in a warning.
             "remaining_pct": max(0.0, min(100.0, 100.0 - float(used))),
             "resets_at": block.get("resets_at") or "",
+            "pace": _pace(name, block.get("resets_at"), used),
         })
     if not windows:
         return None
@@ -289,15 +348,27 @@ def _history_row(summary, boundary=None):
         if name:
             row[name] = window.get("used_pct")
             row[f"{name}_resets_at"] = window.get("resets_at") or ""
+            if window.get("pace") is not None:
+                row[f"{name}_pace"] = window["pace"]
     return row
 
 
 def _reading_only(row):
     """The part of a history row that is a measurement: the utilizations,
-    without the timestamp, the boundary marker, or the server's
-    per-request `resets_at`."""
+    without the timestamp, the boundary marker, the server's per-request
+    `resets_at`, or the derived `_pace`.
+
+    `_pace` has to be stripped for the same reason `resets_at` does, and it
+    would break this guard harder. Pace divides used share by *elapsed*
+    share, so it moves on every single poll even when utilization has not
+    budged -- including it would make no two rows ever compare equal and
+    turn the dedup off entirely, which is the exact failure this function
+    was written to fix. Nothing is lost: the row still carries pace, it
+    just does not get a vote on whether the row is new.
+    """
     return {k: v for k, v in (row or {}).items()
-            if k not in ("at", "boundary") and not k.endswith("_resets_at")}
+            if k not in ("at", "boundary")
+            and not k.endswith("_resets_at") and not k.endswith("_pace")}
 
 
 def append_history(summary, path=None, boundary=None):
