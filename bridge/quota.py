@@ -68,6 +68,16 @@ HISTORY_FILE = os.path.join(CLAUDE_HOME, "quota-history.jsonl")
 # read as "0% used, plenty left".
 TRACKED_WINDOWS = ("five_hour", "seven_day")
 
+# The same response also carries per-model caps, in a `limits[]` array this
+# module never opened: a weekly window scoped to one model, enforced ON TOP
+# of the shared weekly one rather than instead of it. Measured live
+# 2026-08-09 by running four Claude Fable 5 calls and reading the endpoint
+# either side -- `weekly_all` moved 11 -> 13 and the Fable-scoped window
+# moved 0 -> 5, so the scoped cap fills ~2.7x faster than the shared one
+# and is the one that would stop that model first. Every snapshot, warning
+# and history row ever written here has been blind to it.
+SCOPED_LIMIT_KIND = "weekly_scoped"
+
 # Once a minute while a turn is running. A cycle runs up to 45 minutes
 # (CLI_TIMEOUT_SECONDS), so this is ~45 requests per cycle against an
 # endpoint whose response is a few hundred bytes -- far below anything
@@ -163,6 +173,10 @@ def summarize(usage):
     is the one that will actually stop the session. Both are kept because
     the two fail in different ways and reading only one is misleading: a
     fresh five-hour window says nothing about a seven-day window at 95%.
+
+    `windows` also carries the per-model caps from `limits[]` (see
+    `_scoped_windows`), which are reported but never eligible to be
+    "tightest".
     """
     if not isinstance(usage, dict):
         return None
@@ -185,7 +199,39 @@ def summarize(usage):
         })
     if not windows:
         return None
-    return {"windows": windows, "tightest": min(windows, key=lambda w: w["remaining_pct"])}
+    return {
+        "windows": windows + _scoped_windows(usage),
+        "tightest": min(windows, key=lambda w: w["remaining_pct"]),
+    }
+
+
+def _scoped_windows(usage):
+    """Per-model weekly caps from `limits[]`, named `weekly_scoped:<model>`.
+
+    Recorded like any other window -- so the snapshot, the history file and
+    anything charting them get it for free -- but deliberately NOT eligible
+    to be "tightest". A scoped cap only stops the model it names, and this
+    module has no idea which model the session it is watching runs on.
+    Letting a spent Fable window become "tightest" would tell an Opus cycle
+    to wrap up while nothing was actually blocking it, and a warning that
+    cries wolf is worse than no warning at all.
+    """
+    windows = []
+    for limit in usage.get("limits") or []:
+        if not isinstance(limit, dict) or limit.get("kind") != SCOPED_LIMIT_KIND:
+            continue
+        model = ((limit.get("scope") or {}).get("model") or {}).get("display_name")
+        used = limit.get("percent")
+        if not model or not isinstance(used, (int, float)):
+            continue
+        windows.append({
+            "window": f"{SCOPED_LIMIT_KIND}:{model}",
+            "used_pct": float(used),
+            "remaining_pct": max(0.0, min(100.0, 100.0 - float(used))),
+            "resets_at": limit.get("resets_at") or "",
+            "scoped_to": model,
+        })
+    return windows
 
 
 def write_snapshot(summary, path=None):

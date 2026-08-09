@@ -135,9 +135,81 @@ def test_summarize_handles_the_endpoint_response_verbatim():
     otherwise summarize as the emptiest window and become "tightest"."""
     summary = quota.summarize(LIVE_USAGE_PAYLOAD)
 
-    assert [w["window"] for w in summary["windows"]] == ["five_hour", "seven_day"]
+    assert [w["window"] for w in summary["windows"]] == [
+        "five_hour", "seven_day", "weekly_scoped:Fable"]
     assert summary["tightest"]["window"] == "seven_day"
     assert summary["tightest"]["remaining_pct"] == 96.0
+
+
+def test_summarize_records_the_per_model_scoped_cap():
+    """The `limits[]` array carries a weekly window scoped to one model,
+    enforced on top of the shared weekly one. Measured live 2026-08-09:
+    four Fable 5 calls moved `weekly_all` 11 -> 13 and this window 0 -> 5,
+    so it is the cap that stops that model first -- and nothing recorded
+    it, because summarize only ever read the two top-level windows."""
+    scoped = [w for w in quota.summarize(LIVE_USAGE_PAYLOAD)["windows"]
+              if w["window"] == "weekly_scoped:Fable"]
+
+    assert len(scoped) == 1
+    assert scoped[0]["scoped_to"] == "Fable"
+    assert scoped[0]["used_pct"] == 0.0
+    assert scoped[0]["remaining_pct"] == 100.0
+
+
+def test_summarize_never_lets_a_scoped_cap_become_tightest():
+    """A scoped cap only stops the model it names. This module cannot know
+    which model the session it watches is running, so a spent Fable window
+    must not make an Opus cycle wrap up with 90% of its own quota left."""
+    payload = {
+        "five_hour": {"utilization": 10.0},
+        "seven_day": {"utilization": 20.0},
+        "limits": [{"kind": "weekly_scoped", "percent": 99, "resets_at": "z",
+                    "scope": {"model": {"id": None, "display_name": "Fable"}}}],
+    }
+    summary = quota.summarize(payload)
+
+    assert summary["tightest"]["window"] == "seven_day"
+    assert summary["tightest"]["remaining_pct"] == 80.0
+    # ...and it is still reported, rather than dropped to keep it out.
+    assert any(w["window"] == "weekly_scoped:Fable" and w["remaining_pct"] == 1.0
+               for w in summary["windows"])
+
+
+def test_summarize_skips_scoped_limits_it_cannot_name_or_read():
+    """An unnamed model or a null percent must not summarize as a window
+    at 0% used -- the same "plenty left" misreading TRACKED_WINDOWS avoids
+    for the null experiment keys."""
+    payload = {
+        "five_hour": {"utilization": 10.0},
+        "limits": [
+            {"kind": "weekly_scoped", "percent": None,
+             "scope": {"model": {"display_name": "Fable"}}},
+            {"kind": "weekly_scoped", "percent": 5, "scope": None},
+            {"kind": "weekly_all", "percent": 4, "scope": None},
+            {"kind": "session", "percent": 2, "scope": None},
+        ],
+    }
+    assert [w["window"] for w in quota.summarize(payload)["windows"]] == ["five_hour"]
+
+
+def test_history_row_carries_a_scoped_cap_as_its_own_column():
+    """The point of recording it is the series, not the snapshot -- the
+    Fable window moving 2.7x faster than the shared one is only visible
+    across readings."""
+    summary = {"windows": [
+        {"window": "seven_day", "used_pct": 13.0, "resets_at": "a"},
+        {"window": "weekly_scoped:Fable", "used_pct": 5.0, "resets_at": "b",
+         "scoped_to": "Fable"},
+    ]}
+    row = quota._history_row(summary)
+
+    assert row["seven_day"] == 13.0
+    assert row["weekly_scoped:Fable"] == 5.0
+    assert row["weekly_scoped:Fable_resets_at"] == "b"
+    # The dedup guard strips reset timestamps, and must strip this one too
+    # or every reading looks changed and the history fills with duplicates.
+    assert "weekly_scoped:Fable_resets_at" not in quota._reading_only(row)
+    assert quota._reading_only(row)["weekly_scoped:Fable"] == 5.0
 
 
 # ---------------------------------------------------------------------------
