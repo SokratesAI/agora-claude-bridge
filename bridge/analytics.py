@@ -123,6 +123,7 @@ def model_price_ratio(model):
             return ratio
     return None
 
+
 # A session counts as one of our cycles if its first user message opens
 # with one of these. The first is the pre-heartbeat shape, where the whole
 # constitution arrived as the user turn; the other two are what the runner
@@ -198,11 +199,27 @@ def weighted_tokens(totals, model=None):
     lenient half of the boundary described on `model_price_ratio`, so that
     an unknown model still shows up in a cycle's cost instead of vanishing.
     """
-    ratio = model_price_ratio(model)
-    if ratio is None:
-        ratio = 1.0
-    return round(
-        sum(totals.get(f, 0) * w for f, w in COST_WEIGHTS.items()) * ratio, 1)
+    return round(sum(weighted_by_field({model: totals}).values()), 1)
+
+
+def weighted_by_field(by_model):
+    """{token class: weighted cost} across a {model: totals} mapping.
+
+    The one place the two multiplications happen, so a per-class breakdown
+    and a session total can never disagree about what a token cost. They did
+    briefly: the total was scaled per model while `cost_share` still used the
+    flat weights, which summed to 100% only because every cycle so far has
+    been pure Opus. The first cycle to use a subagent would have quietly
+    broken it -- and subagents are the next thing this loop plans to do.
+    """
+    out = dict.fromkeys(TOKEN_FIELDS, 0.0)
+    for model, totals in by_model.items():
+        ratio = model_price_ratio(model)
+        if ratio is None:
+            ratio = 1.0
+        for field in TOKEN_FIELDS:
+            out[field] += totals.get(field, 0) * COST_WEIGHTS[field] * ratio
+    return out
 
 
 def parse_transcript(path):
@@ -295,8 +312,11 @@ def parse_transcript(path):
         "models": sorted(models),
     }
     row.update(totals)
-    row["weighted_tokens"] = round(
-        sum(weighted_tokens(t, m) for m, t in by_model.items()), 1)
+    # Kept on the row because `summarize` cannot re-derive it: the ledger
+    # columns are raw counts and the model split is gone by then.
+    row["weighted_by_field"] = {
+        f: round(v, 1) for f, v in weighted_by_field(by_model).items()}
+    row["weighted_tokens"] = round(sum(row["weighted_by_field"].values()), 1)
     return row
 
 
@@ -413,6 +433,10 @@ def summarize(rows):
         return {"cycles": 0, "other_sessions": len(rows)}
     weighted = [r["weighted_tokens"] for r in cycles]
     totals = {f: sum(r[f] for r in cycles) for f in TOKEN_FIELDS}
+    weighted_totals = {
+        f: sum(r.get("weighted_by_field", {}).get(f, 0) for r in cycles)
+        for f in TOKEN_FIELDS
+    }
     durations = [r["duration_seconds"] for r in cycles if r["duration_seconds"]]
     grand = sum(weighted)
     return {
@@ -421,6 +445,10 @@ def summarize(rows):
         "first_cycle": cycles[0]["started_at"],
         "last_cycle": cycles[-1]["started_at"],
         "totals": totals,
+        # The same five counters after weighting -- raw counts are not
+        # comparable to each other, so this is the one that answers "where
+        # does the money go" rather than "how many tokens moved".
+        "totals_weighted": {f: round(v, 1) for f, v in weighted_totals.items()},
         "total_weighted": round(grand, 1),
         "mean_weighted": round(statistics.mean(weighted), 1),
         "median_weighted": round(statistics.median(weighted), 1),
@@ -432,7 +460,7 @@ def summarize(rows):
         # tells you which lever is worth pulling; the raw token counts do
         # not, because they are not on the same scale.
         "cost_share": {
-            field: round(totals[field] * COST_WEIGHTS[field] / grand * 100, 1) if grand else 0.0
+            field: round(weighted_totals[field] / grand * 100, 1) if grand else 0.0
             for field in TOKEN_FIELDS
         },
         "models": sorted(Counter(m for r in cycles for m in r["models"])),

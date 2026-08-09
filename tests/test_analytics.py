@@ -212,6 +212,43 @@ def test_cost_share_sums_to_100(tmp_path):
     assert abs(sum(share.values()) - 100.0) < 0.5
 
 
+def test_cost_share_still_sums_to_100_across_models(tmp_path):
+    """The single-model version of this test above cannot fail, because one
+    model means one scale factor that cancels in the ratio. Every cycle so
+    far has been pure Opus, so a breakdown computed at flat weights against
+    a per-model-scaled total would have looked correct right up until the
+    first cycle that used a subagent."""
+    _write(tmp_path, "a.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("m1", USAGE),
+        _assistant("m2", USAGE, model="claude-haiku-4-5-20251001"),
+        _assistant("m3", USAGE, model="claude-fable-5"),
+    ])
+
+    summary = analytics.summarize(analytics.scan(str(tmp_path)))
+
+    assert abs(sum(summary["cost_share"].values()) - 100.0) < 0.5
+    # And the breakdown must add up to the headline number, not merely to
+    # 100% of some other quantity.
+    assert abs(sum(summary["totals_weighted"].values())
+               - summary["total_weighted"]) < 0.5
+
+
+def test_the_weighted_breakdown_adds_up_to_the_session_total(tmp_path):
+    """One source of truth for the two multiplications: if these can drift,
+    the per-class breakdown is describing a cycle that did not happen."""
+    path = _write(tmp_path, "s.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("m1", USAGE),
+        _assistant("m2", USAGE, model="claude-sonnet-5"),
+    ])
+
+    row = analytics.parse_transcript(path)
+
+    assert abs(sum(row["weighted_by_field"].values())
+               - row["weighted_tokens"]) < 0.5
+
+
 def test_a_half_written_final_line_does_not_lose_the_session(tmp_path):
     """Transcripts are appended to by a live process, so the running
     cycle's last line is routinely truncated."""
