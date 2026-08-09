@@ -206,11 +206,18 @@ def history_path_for(snapshot_path=None):
     return os.path.join(os.path.dirname(snapshot_path), "quota-history.jsonl")
 
 
-def _history_row(summary):
+def _history_row(summary, boundary=None):
     """One flat row: {"at": epoch, "five_hour": pct_used, ...}. Flat rather
     than the nested snapshot shape because the consumer is a chart, and a
-    row per reading with a column per window is what plots."""
+    row per reading with a column per window is what plots.
+
+    A boundary row also carries `"boundary": "start"|"end"`, so a chart can
+    tell where a cycle began and ended from the file alone rather than
+    inferring it from the size of the gap between rows.
+    """
     row = {"at": round(time.time(), 3)}
+    if boundary:
+        row["boundary"] = boundary
     for window in (summary or {}).get("windows", []):
         name = window.get("window")
         if name:
@@ -221,12 +228,13 @@ def _history_row(summary):
 
 def _reading_only(row):
     """The part of a history row that is a measurement: the utilizations,
-    without the timestamp or the server's per-request `resets_at`."""
+    without the timestamp, the boundary marker, or the server's
+    per-request `resets_at`."""
     return {k: v for k, v in (row or {}).items()
-            if k != "at" and not k.endswith("_resets_at")}
+            if k not in ("at", "boundary") and not k.endswith("_resets_at")}
 
 
-def append_history(summary, path=None):
+def append_history(summary, path=None, boundary=None):
     """Append a reading, unless it is identical to the previous one.
 
     Skipping unchanged readings is not a cap on the data -- an unchanged
@@ -244,12 +252,21 @@ def append_history(summary, path=None):
     because its fixture held `resets_at` fixed, which real responses
     never do. A window actually rolling over still writes a row, because
     utilization drops when it does.
+
+    A `boundary` reading is exempt, and has to be: the information in a
+    cycle's first and last row is the *timestamp*, which is precisely
+    what the comparison strips. The percentage moves about once every one
+    to three minutes, so an end reading taken seconds after the last tick
+    usually matches it and was being dropped -- Cycle 47's history ends at
+    02:00:17, exactly three poll intervals after the row above it, while
+    the cycle was still writing to the vault at 01:59. The final reading
+    Cycle 46 added ran every time and landed nowhere.
     """
     path = path or HISTORY_FILE
-    row = _history_row(summary)
+    row = _history_row(summary, boundary)
     comparable = _reading_only(row)
     try:
-        if comparable == _last_history_reading(path):
+        if not boundary and comparable == _last_history_reading(path):
             return False
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a") as handle:
@@ -275,16 +292,17 @@ def _last_history_reading(path):
         return None
 
 
-def refresh(path=None):
-    """One fetch -> one snapshot (+ a history row if the reading moved).
-    True if a usable snapshot was written."""
+def refresh(path=None, boundary=None):
+    """One fetch -> one snapshot (+ a history row if the reading moved, or
+    always if this is a `boundary` reading). True if a usable snapshot was
+    written."""
     summary = summarize(fetch_usage())
     if summary is None:
         return False
     written = write_snapshot(summary, path)
     # After the snapshot, and never gating on it: the history is the
     # nice-to-have and the snapshot is what the low-quota warning reads.
-    append_history(summary, history_path_for(path))
+    append_history(summary, history_path_for(path), boundary)
     return written
 
 
@@ -370,12 +388,14 @@ class QuotaWatcher:
     def _run(self):
         failures = 0
         wait = self._poll_seconds
+        opened = False
         while not self._stop.is_set():
             try:
-                ok = refresh(self._path)
+                ok = refresh(self._path, None if opened else "start")
             except Exception:
                 ok = False
             if ok:
+                opened = True
                 wait = self._poll_seconds
                 failures = 0
             else:
@@ -402,7 +422,10 @@ class QuotaWatcher:
         # the answer by up to a minute of the most expensive part of a run.
         # Best-effort like everything else here: this is a daemon thread
         # and nobody is waiting on it, so a slow endpoint delays no reply.
+        # Marked as a boundary, because taking the reading was never the
+        # hard part -- it ran, and then the dedup dropped it for matching
+        # the tick before it, which is the normal case.
         try:
-            refresh(self._path)
+            refresh(self._path, "end")
         except Exception:
             pass
