@@ -451,14 +451,20 @@ def refresh(path=None, boundary=None):
     return written
 
 
-HOOK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "quota_notice.py")
+HOOKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
+HOOK_SCRIPT = os.path.join(HOOKS_DIR, "quota_notice.py")
+# The bridge's other in-flight notice: how much wall-clock is left before
+# the turn is killed (deadline.py). It rides the same settings file and
+# the same two events because it solves the same problem on a different
+# axis -- a cycle could see its quota but not its clock.
+DEADLINE_HOOK_SCRIPT = os.path.join(HOOKS_DIR, "deadline_notice.py")
 HOOK_SETTINGS_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-hooks.settings.json")
 
 
 def write_hook_settings(path=None):
-    """Generate the --settings file that attaches the quota hook, and
+    """Generate the --settings file that attaches the bridge's hooks, and
     return its path (or "" if it could not be written, which the caller
-    treats as "run without the hook").
+    treats as "run without the hooks").
 
     Passed per invocation with --settings rather than merged into
     ~/.claude/settings.json on purpose: that file is persistent user
@@ -467,11 +473,12 @@ def write_hook_settings(path=None):
     and disappears when this code does.
     """
     path = path or HOOK_SETTINGS_FILE
-    # sys.executable, not "python3": the hook imports bridge.quota, so it
-    # has to run under the same interpreter this service is running under,
+    # sys.executable, not "python3": the hooks import from bridge, so they
+    # have to run under the same interpreter this service is running under,
     # not whatever "python3" happens to resolve to in the CLI's env.
     entry = [{"matcher": "*", "hooks": [
-        {"type": "command", "command": f"{sys.executable} {HOOK_SCRIPT}", "timeout": 10},
+        {"type": "command", "command": f"{sys.executable} {script}", "timeout": 10}
+        for script in (HOOK_SCRIPT, DEADLINE_HOOK_SCRIPT)
     ]}]
     settings = {"hooks": {"UserPromptSubmit": entry, "PostToolUse": entry}}
     try:
