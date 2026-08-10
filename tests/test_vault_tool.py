@@ -374,3 +374,74 @@ def test_main_recent_marks_a_deleted_file_in_its_output(env, capsys):
     out = capsys.readouterr().out
     assert "projects/kanban.md  [DELETED]" in out
     assert "projects/a.md" in out and "projects/a.md  [DELETED]" not in out
+
+
+# ---------------------------------------------------------------------------
+# Missing content chunks (2026-08-10). LiveSync stores a note as an ordered
+# list of chunk documents. `assemble` substituted "" for any chunk CouchDB
+# did not return, so a note with a hole came back as its surviving pieces
+# concatenated -- mid-word, no marker at the seam, parses fine.
+#
+# It happened to Edvard's `ideas.md`: a LiveSync client re-chunked it from 1
+# chunk into 184 and 6 never reached the database. `get` printed the other
+# 178. 1238 characters were gone -- the `## Board` heading, its table header,
+# rows #57 to #50, and the tail of the capture sentence he had typed 83
+# seconds earlier -- and a cycle read the result and believed it.
+#
+# Silence is what makes this unsurvivable rather than merely annoying:
+# `append` reads before it writes, so a truncated read written back makes
+# the truncation permanent, with no record the file was ever bigger.
+# ---------------------------------------------------------------------------
+
+
+def test_read_raises_when_a_content_chunk_is_missing(env):
+    client, _ = _client_with_fake_req({
+        ("GET", "note.md"): (200, {"children": ["h:1", "h:gone", "h:2"]}),
+        ("GET", "h:1"): (200, {"data": "one two "}),
+        ("GET", "h:2"): (200, {"data": "|five six"}),
+    })
+    with pytest.raises(vault_tool.VaultIncompleteDocument) as excinfo:
+        client.read("note.md")
+    message = str(excinfo.value)
+    assert "note.md" in message
+    assert "h:gone" in message
+    assert "1 of 3" in message
+
+
+def test_the_spliced_text_never_escapes_as_a_value(env):
+    """`"one two |five six"` is the danger stated as itself: plausible text
+    that a caller would go on to edit and write back."""
+    client, _ = _client_with_fake_req({
+        ("GET", "note.md"): (200, {"children": ["h:1", "h:gone", "h:2"]}),
+        ("GET", "h:1"): (200, {"data": "one two "}),
+        ("GET", "h:2"): (200, {"data": "|five six"}),
+    })
+    with pytest.raises(vault_tool.VaultIncompleteDocument):
+        client.read("note.md")
+
+
+def test_assemble_fetches_each_chunk_once(env):
+    """It used to call get_doc twice per chunk -- once for the status, once
+    for the data -- so the real 184-chunk file cost 368 round trips."""
+    client, calls = _client_with_fake_req({
+        ("GET", "note.md"): (200, {"children": ["h:1", "h:2"]}),
+        ("GET", "h:1"): (200, {"data": "a"}),
+        ("GET", "h:2"): (200, {"data": "b"}),
+    })
+    assert client.read("note.md") == "ab"
+    assert [c[1] for c in calls] == ["note.md", "h:1", "h:2"]
+
+
+def test_main_get_reports_an_incomplete_document_on_stderr_and_exits_nonzero(env, capsys):
+    """Exit code and stream both matter: `get x.md > file.md` must leave an
+    empty file and a visible error, never a confident partial one."""
+    with patch.object(vault_tool, "VaultClient") as MockClient:
+        MockClient.return_value.read.side_effect = vault_tool.VaultIncompleteDocument(
+            "ideas.md: 6 of 184 content chunks missing from the vault (h:vucrv1sugciv)"
+        )
+        code = vault_tool.main(["get", "ideas.md"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert "INCOMPLETE DOCUMENT" in captured.err
+    assert "6 of 184" in captured.err

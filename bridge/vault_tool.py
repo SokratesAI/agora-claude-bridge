@@ -89,6 +89,29 @@ def _req(method, base, db, auth, path, body=None):
         return e.code, json.loads(e.read().decode() or "{}")
 
 
+class VaultIncompleteDocument(RuntimeError):
+    """A file doc references content chunks that are not in the database.
+
+    Raised rather than returned because the text this would otherwise
+    produce is *plausible*: LiveSync stores a note as an ordered list of
+    content chunks, so a missing one drops a span out of the middle and
+    splices the surviving neighbours together mid-word. There is no
+    marker at the seam and the result parses fine.
+
+    Measured, 2026-08-10: `projects/sokrates/projects/agora/ideas.md` was
+    re-chunked by a LiveSync client into 184 chunks, 6 of which never
+    reached CouchDB. `get` printed the other 178 as if nothing were
+    wrong -- 1238 characters gone, including Edvard's `## Board` heading,
+    its table header, rows #57 to #50, and the tail of the capture
+    sentence he had just typed. A cycle read that, believed it, and had
+    to reconstruct the file from an older revision. A scan of all 686
+    file docs found exactly one damaged, so this is rare; it is also
+    unsurvivable when it happens, because `append` and `put` callers
+    read first, and writing back a silently truncated read makes the
+    truncation permanent.
+    """
+
+
 class VaultClient:
     def __init__(self):
         self.base = _env("CDB_BASE").rstrip("/")
@@ -103,14 +126,29 @@ class VaultClient:
     def get_doc(self, doc_id):
         return self._doc("GET", doc_id)
 
-    def assemble(self, doc):
+    def assemble(self, doc, path=None):
         kids = doc.get("children") or []
-        if kids:
-            return "".join(
-                (self.get_doc(c)[1].get("data", "") if self.get_doc(c)[0] == 200 else "")
-                for c in kids
+        if not kids:
+            return doc.get("data", "")
+        parts = []
+        missing = []
+        for chunk_id in kids:
+            # One GET per chunk. This used to call get_doc twice for every
+            # chunk -- once for the status, once for the data -- so a 184
+            # chunk file cost 368 round trips.
+            status, chunk = self.get_doc(chunk_id)
+            if status != 200:
+                missing.append(chunk_id)
+            parts.append(chunk.get("data", "") if status == 200 else "")
+        if missing:
+            raise VaultIncompleteDocument(
+                f"{path or doc.get('path') or doc.get('_id')}: {len(missing)} of "
+                f"{len(kids)} content chunks missing from the vault "
+                f"({', '.join(missing[:5])}"
+                f"{', …' if len(missing) > 5 else ''}) -- refusing to serve a "
+                f"partial document; recover with vault_git_revision_history"
             )
-        return doc.get("data", "")
+        return "".join(parts)
 
     def read(self, path):
         status, doc = self.get_doc(path.lower())
@@ -122,7 +160,7 @@ class VaultClient:
         # GitHub snapshot, not from here.
         if doc.get("deleted"):
             return None
-        return self.assemble(doc)
+        return self.assemble(doc, path.lower())
 
     def file_docs(self, prefix=""):
         """{doc_id: doc} for every file under `prefix` that still exists.
@@ -310,6 +348,18 @@ class VaultClient:
 
 
 def main(argv=None):
+    # An incomplete document is a read failure, not a result. It exits
+    # non-zero and prints to stderr so a caller that pipes `get` into a
+    # file gets an empty file and a visible error, rather than a
+    # confident-looking partial one it will go on to edit and write back.
+    try:
+        return _dispatch(argv)
+    except VaultIncompleteDocument as e:
+        print(f"[INCOMPLETE DOCUMENT] {e}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         print(__doc__)
