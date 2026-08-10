@@ -201,11 +201,68 @@ class TimingOutProc(FakeProc):
         self._killed = True
 
 
-def run_until_timeout(tmp_path, lines):
+def run_until_timeout(tmp_path, lines, activity=None):
     with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(cli.subprocess, "Popen", return_value=TimingOutProc(lines)):
-        return cli.run_turn("hello")
+        return cli.run_turn("hello", activity=activity)
+
+
+def run_narrated_until_timeout(tmp_path, lines):
+    """A killed turn in its real production shape.
+
+    Every real call carries an activity block -- the runner's claude_cli
+    provider sets one unconditionally -- so `reporter.enabled` is True on
+    every actual cycle and False in every test that forgets it. Returns
+    (reply, passages already narrated to Agora).
+    """
+    narrated = []
+    with patch.object(cli.ActivityReporter, "report_text",
+                      side_effect=lambda text: narrated.append(text), autospec=False), \
+         patch.object(cli.ActivityReporter, "start", autospec=False), \
+         patch.object(cli.ActivityReporter, "close", autospec=False), \
+         patch.object(cli.ActivityReporter, "report", autospec=False), \
+         patch.object(cli.ActivityReporter, "report_result", autospec=False):
+        text, _, _ = run_until_timeout(
+            tmp_path, lines, activity={"url": "http://agora.invalid", "token": "t"})
+    return text, narrated
+
+
+def test_salvage_does_not_repeat_what_was_already_narrated(tmp_path):
+    """The reviewer's finding, and the one that would have reached his phone.
+
+    `pending` is emptied by release_narrative() on every tool_use, so a
+    turn killed mid-tool-call -- the normal shape of this failure -- left
+    the reply falling through to "join every passage", duplicating the
+    whole run underneath the narration he had already watched.
+    """
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "reading the vault"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "merged the PR"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t2", "name": "Bash", "input": {}}]}},
+    )
+    text, narrated = run_narrated_until_timeout(tmp_path, lines)
+    assert narrated == ["reading the vault", "merged the PR"]
+    # The last passage, once -- not the transcript a second time.
+    assert "merged the PR" in text
+    assert "reading the vault" not in text
+    assert text.count("merged the PR") == 1
+
+
+def test_salvage_keeps_everything_when_nothing_was_narrated(tmp_path):
+    """The /invoke path has no reporter, so nothing reached the caller
+    live and the join is the only record there is."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "first"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "second"}]}},
+    )
+    text, _, _ = run_until_timeout(tmp_path, lines)
+    assert "first" in text and "second" in text
 
 
 def test_timeout_returns_what_the_session_managed_to_say(tmp_path):

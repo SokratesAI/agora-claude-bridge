@@ -592,10 +592,23 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         text = "\n".join(text_parts).strip()
     thinking = "\n\n".join(thinking_parts).strip()
     if timed_out:
-        # A killed turn never reached its closing passage, so `text` here is
+        # A killed turn never reached its closing passage, so the salvage is
         # mid-run narration -- "now the digest, re-fetching first" was
         # Cycle 81's. That is worth sending and worth labelling: unlabelled
         # it would arrive looking like a considered reply that simply stops.
+        #
+        # It has to be picked here rather than reusing the selection above,
+        # and the reviewer caught this: `pending` is emptied by
+        # release_narrative() on every tool_use, and a turn killed mid-tool-
+        # call is the normal shape of this failure -- Cycle 81 died three
+        # tool calls into rewriting the digest. So `pending` is empty
+        # exactly when this path runs, the selection above falls through to
+        # joining every passage, and Edvard's phone gets the entire
+        # transcript a second time on top of the narration he already
+        # watched. That is the wall-of-text regression the comment above
+        # exists to prevent, arriving through a different door. The last
+        # passage is what the label promises and all it should send.
+        text = text_parts[-1].strip() if (reporter.enabled and text_parts) else text
         if not text:
             raise ClaudeCliError(f"CLI timed out after {CLI_TIMEOUT_SECONDS}s")
         return (
