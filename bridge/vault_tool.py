@@ -217,6 +217,15 @@ class VaultClient:
         })
         status, data = _req("GET", self.base, self.db, self.auth, f"_all_docs?{query}")
         if status != 200:
+            # An empty folder and a failed sweep used to look identical from
+            # here -- `ls` printed nothing either way, and "that folder is
+            # empty" is a thing a cycle writes down as fact. The batch
+            # failure below has said so since 2026-08-07; this path never
+            # did, and the range gives CouchDB a new way to say no (a
+            # malformed startkey is a 400, where an unrestricted sweep had
+            # nothing to reject).
+            print(f"vault_tool: WARNING listing failed ({status}) for "
+                  f"{prefix!r}; this is not an empty folder", file=sys.stderr)
             return {}
         prefix = prefix.lower()
         keys = [

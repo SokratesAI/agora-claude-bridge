@@ -352,6 +352,21 @@ def test_a_mixed_case_prefix_still_finds_the_folder(env):
         ]
 
 
+def test_the_endkey_sentinel_is_above_every_code_point_not_just_most(env):
+    """`"\\uffff"` is the idiom people reach for and it is wrong: it is the
+    top of the BMP, not the top of Unicode, so any filename containing an
+    emoji or any other astral character sorts *above* it and drops out of
+    its own folder. The vault has no such filename today, which is exactly
+    why this needs a test rather than a measurement -- the failure arrives
+    the day Edvard names a note with an emoji, silently, as a folder that
+    is missing one file."""
+    astral = "notes/\U0001F600 idea.md"
+    docs = [{"_id": "notes/plain.md"}, {"_id": astral}]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_all_docs(docs)):
+        assert client.list("notes/") == sorted(["notes/plain.md", astral])
+
+
 def test_an_empty_prefix_still_sweeps_the_whole_vault(env):
     """`recent()` asks for everything, and a range that excluded anything
     would silently shrink what a cycle sees changed since it last ran."""
