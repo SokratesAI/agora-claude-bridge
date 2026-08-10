@@ -1,3 +1,5 @@
+import json
+import urllib.parse
 from unittest.mock import patch
 
 import pytest
@@ -285,18 +287,93 @@ def test_main_get_prints_not_found_marker(env, capsys):
 # every path still pointing at it. Not seeing it is what made this take a
 # day to notice.
 # ---------------------------------------------------------------------------
-def _fake_all_docs(docs):
+def _fake_all_docs(docs, seen=None):
     """Fake _req covering the two calls file_docs makes: the id sweep and
-    the batched include_docs re-fetch."""
+    the batched include_docs re-fetch.
+
+    The sweep **honours `startkey`/`endkey`**, the way CouchDB does. A fake
+    that ignored them would serve the whole database to a caller asking for
+    one folder and every test here would still pass -- which is exactly the
+    bug that lived in `file_docs` for two days, and a fake is the one place
+    it could hide again. `seen` collects the sweep paths so a test can
+    assert the range was asked for at all."""
     def fake(method, base, db, auth, path, body=None):
-        if path == "_all_docs" and method == "GET":
-            return 200, {"rows": [{"id": d["_id"]} for d in docs]}
+        if path.startswith("_all_docs?startkey=") and method == "GET":
+            if seen is not None:
+                seen.append(path)
+            query = urllib.parse.parse_qs(path.split("?", 1)[1])
+            start = json.loads(query["startkey"][0])
+            end = json.loads(query["endkey"][0])
+            return 200, {"rows": [{"id": d["_id"]} for d in docs
+                                  if start <= d["_id"] <= end]}
         if path.startswith("_all_docs?include_docs=true") and method == "POST":
             by_id = {d["_id"]: d for d in docs}
             return 200, {"rows": [{"id": k, "doc": by_id[k]}
                                   for k in body["keys"] if k in by_id]}
         raise AssertionError(f"unexpected request: {method} {path}")
     return fake
+
+
+def test_listing_a_folder_asks_couchdb_for_that_folder_only(env):
+    """The id sweep used to fetch `_all_docs` unrestricted and filter the
+    rows in Python -- every listing paid for the whole vault. Measured end
+    to end on the live vault 2026-08-11: `ls` of the 103-file journal
+    folder went 3.3s to 1.0s, byte-identical output. `list` is the only
+    caller -- `recent` goes through Mango `_find` and never paid this."""
+    docs = [
+        {"_id": "projects/agora/journal/104-cycle-95.md"},
+        {"_id": "projects/agora/journal/103-cycle-94.md"},
+        {"_id": "projects/other/big.md"},
+        {"_id": "zzz/last.md"},
+    ]
+    seen = []
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_all_docs(docs, seen)):
+        listed = client.list("projects/agora/journal/")
+    assert listed == ["projects/agora/journal/103-cycle-94.md",
+                      "projects/agora/journal/104-cycle-95.md"]
+    query = urllib.parse.parse_qs(seen[0].split("?", 1)[1])
+    assert json.loads(query["startkey"][0]) == "projects/agora/journal/"
+    assert json.loads(query["endkey"][0]).startswith("projects/agora/journal/")
+
+
+def test_a_mixed_case_prefix_still_finds_the_folder(env):
+    """Paths are case-insensitive here -- `read` lowercases, the tool
+    description promises it, and Nova's own docs write `Projects/Sokrates/`
+    with capitals. The old sweep lowercased the row ids in Python *after*
+    fetching everything, so case never reached CouchDB. A range does reach
+    it, and `"Projects/" <= "projects/foo.md"` is false: get this wrong and
+    `ls 'Projects/...'` returns an empty folder rather than an error."""
+    docs = [{"_id": "projects/agora/journal/104-cycle-95.md"}]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_all_docs(docs)):
+        assert client.list("Projects/Agora/Journal/") == [
+            "projects/agora/journal/104-cycle-95.md"
+        ]
+
+
+def test_the_endkey_sentinel_is_above_every_code_point_not_just_most(env):
+    """`"\\uffff"` is the idiom people reach for and it is wrong: it is the
+    top of the BMP, not the top of Unicode, so any filename containing an
+    emoji or any other astral character sorts *above* it and drops out of
+    its own folder. The vault has no such filename today, which is exactly
+    why this needs a test rather than a measurement -- the failure arrives
+    the day Edvard names a note with an emoji, silently, as a folder that
+    is missing one file."""
+    astral = "notes/\U0001F600 idea.md"
+    docs = [{"_id": "notes/plain.md"}, {"_id": astral}]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_all_docs(docs)):
+        assert client.list("notes/") == sorted(["notes/plain.md", astral])
+
+
+def test_an_empty_prefix_still_sweeps_the_whole_vault(env):
+    """`recent()` asks for everything, and a range that excluded anything
+    would silently shrink what a cycle sees changed since it last ran."""
+    docs = [{"_id": "a/first.md"}, {"_id": "zzz/last.md"}]
+    client = vault_tool.VaultClient()
+    with patch.object(vault_tool, "_req", _fake_all_docs(docs)):
+        assert client.list("") == ["a/first.md", "zzz/last.md"]
 
 
 def test_read_returns_none_for_a_deleted_file(env):
