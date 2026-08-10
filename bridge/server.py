@@ -109,7 +109,7 @@ def _await_drain():
 
 
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
-             activity=None, mcp=None, attachments=None):
+             activity=None, mcp=None, attachments=None, allow_concurrent=False):
     """One turn for one conversation. The system/persona prompt goes to the
     CLI as --append-system-prompt on every turn, resumed or not (see
     cli.run_turn) -- it reaches the model as an operator instruction rather
@@ -153,12 +153,23 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     existed a claude-cli persona was the only one of the three providers
     that dropped them silently, which started mattering the moment Cycle
     78 moved six of Edvard's personas onto this provider to stop them
-    billing the metered API. See cli.write_stream_json_input."""
+    billing the metered API. See cli.write_stream_json_input.
+
+    allow_concurrent (2026-08-10, off by default): let this turn run
+    alongside one already in flight instead of queueing behind the
+    process-wide invocation lock. For short turns a caller would rather
+    drop than have wait out a 45-minute Nova cycle -- the journal-card
+    reply is the one that asked for it, because a reply that arrives
+    forty minutes later is not a conversation. It is a request, not a
+    guarantee: cli.run_turn opens the lane only while the OAuth token is
+    clear of its refresh window and falls back to the lock otherwise, so
+    no caller has to reason about the credential itself."""
     if stateless:
         text, thinking, _ = run_turn(
             prompt, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
+            allow_concurrent=allow_concurrent,
         )
         return text, thinking
 
@@ -169,6 +180,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
         text, thinking, new_session_id = run_turn(
             prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
+            allow_concurrent=allow_concurrent,
         )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
@@ -177,6 +189,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             text, thinking, new_session_id = run_turn(
                 prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
                 activity=activity, mcp=mcp, system=system, attachments=attachments,
+                allow_concurrent=allow_concurrent,
             )
         else:
             raise
@@ -241,6 +254,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             stateless = bool(payload.get("stateless", False))
             activity = payload.get("activity")
             mcp = payload.get("mcp")
+            # Opt-in per request, and False for every caller that does not
+            # know the flag exists -- the lock stays the default for the
+            # long turns, which is where the refresh race would matter.
+            allow_concurrent = bool(payload.get("allow_concurrent", False))
 
             if not _enter_turn():
                 # Starting a 45-minute turn on a pod that is already
@@ -252,7 +269,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 text, thinking = generate(
                     conversation_id, system, prompt, model=model, restricted=restricted,
                     stateless=stateless, activity=activity, mcp=mcp,
-                    attachments=attachments,
+                    attachments=attachments, allow_concurrent=allow_concurrent,
                 )
             finally:
                 _leave_turn()
