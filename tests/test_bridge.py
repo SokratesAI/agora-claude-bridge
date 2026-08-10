@@ -1947,3 +1947,101 @@ def test_an_unnamed_subagent_still_gets_attributed(tmp_path):
     _, _, posted = _run_with_reporter(tmp_path, lines)
     narrated = [p["detail"] for p in posted if p["capability"] == activity.NARRATION_TEXT]
     assert any(d.startswith("↳ subagent") and "orphan report" in d for d in narrated)
+
+
+# ---------------------------------------------------------------------------
+# cli.py -- the opt-in concurrent lane past _invocation_lock
+# ---------------------------------------------------------------------------
+
+
+def _clear_creds(tmp_path, seconds_out):
+    path = tmp_path / ".credentials.json"
+    path.write_text(json.dumps(
+        {"claudeAiOauth": {"expiresAt": (time.time() + seconds_out) * 1000}}))
+    return str(path)
+
+
+def test_refresh_window_clear_only_when_token_is_far_from_expiry(tmp_path):
+    assert cli.refresh_window_clear(path=_clear_creds(tmp_path, 8 * 3600)) is True
+    # Inside the margin the refresh the module docstring worries about could
+    # fire, so the lane has to shut.
+    assert cli.refresh_window_clear(path=_clear_creds(tmp_path, 60)) is False
+
+
+@pytest.mark.parametrize("body", ["not json at all", "{}", '{"claudeAiOauth": {}}'])
+def test_refresh_window_clear_is_false_on_anything_unreadable(tmp_path, body):
+    """An unreadable credential is not evidence that concurrency is safe."""
+    path = tmp_path / ".credentials.json"
+    path.write_text(body)
+    assert cli.refresh_window_clear(path=str(path)) is False
+    assert cli.refresh_window_clear(path=str(tmp_path / "does-not-exist.json")) is False
+
+
+def _lock_probe(tmp_path, **run_turn_kwargs):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["held"] = cli._invocation_lock.locked()
+        seen["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", **run_turn_kwargs)
+    return seen
+
+
+def test_allow_concurrent_runs_outside_the_lock_when_the_window_is_clear(tmp_path):
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        assert _lock_probe(tmp_path, allow_concurrent=True)["held"] is False
+
+
+def test_allow_concurrent_falls_back_to_the_lock_inside_the_refresh_window(tmp_path):
+    """A caller asks for the lane; the token decides whether it opens."""
+    with patch.object(cli, "refresh_window_clear", return_value=False):
+        assert _lock_probe(tmp_path, allow_concurrent=True)["held"] is True
+
+
+def test_default_callers_never_reach_the_concurrent_lane(tmp_path):
+    """Not opting in must not even consult the credential file."""
+    with patch.object(cli, "refresh_window_clear", side_effect=AssertionError("consulted")):
+        assert _lock_probe(tmp_path)["held"] is True
+
+
+def test_slotted_isolates_the_per_turn_files_only_for_a_concurrent_turn():
+    """The mcp config carries this turn's bearer token and is deleted in the
+    finally, so two overlapping turns sharing that one path can hand a turn
+    the other's token. A serialized turn keeps its historical filename."""
+    assert cli._slotted("/x/.claude/bridge-mcp.config.json", "") == \
+        "/x/.claude/bridge-mcp.config.json"
+    assert cli._slotted("/x/.claude/bridge-mcp.config.json", "7-9") == \
+        "/x/.claude/bridge-mcp.config.7-9.json"
+    assert cli._slotted("/x/.claude/bridge-input.jsonl", "7-9") == \
+        "/x/.claude/bridge-input.7-9.jsonl"
+
+
+def test_concurrent_turns_do_not_share_their_mcp_config_path(tmp_path):
+    """Two concurrent turns must not write the same file -- the regression
+    this whole change would otherwise introduce."""
+    paths = []
+    real_write = cli.write_mcp_config
+
+    def spy(mcp, path=None):
+        paths.append(path)
+        return real_write(mcp, path)
+
+    shared = str(tmp_path / "bridge-mcp.config.json")
+    with patch.object(cli, "refresh_window_clear", return_value=True), \
+         patch.object(cli, "MCP_CONFIG_FILE", shared), \
+         patch.object(cli, "write_mcp_config", side_effect=spy):
+        mcp = {"url": "http://runner/mcp", "token": "t"}
+        _lock_probe(tmp_path, allow_concurrent=True, mcp=mcp)
+        _lock_probe(tmp_path, allow_concurrent=True, mcp=mcp)
+        _lock_probe(tmp_path, mcp=mcp)
+    assert paths[0] != paths[2], "concurrent turn reused the shared path"
+    assert paths[2] == shared, "serialized turn changed path"
