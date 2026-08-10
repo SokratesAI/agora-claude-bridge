@@ -65,6 +65,56 @@ MCP_CONFIG_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-mcp.config.json")
 # the model as mcp__agora__<tool_name>.
 MCP_SERVER_NAME = "agora"
 
+# Where a turn carrying attachments writes its stream-json user message.
+# Same directory and same lifecycle as MCP_CONFIG_FILE above, deleted in
+# _run_cli_once's finally. A fixed path is safe because _invocation_lock
+# serializes every real invocation in this process (see run_turn).
+CLI_INPUT_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-input.jsonl")
+
+
+def write_stream_json_input(message, attachments, path=None):
+    """Render one turn as a stream-json `user` event and return its path.
+
+    `claude -p <text>` can only carry text, which is why a claude-cli
+    persona silently lost every image sent to it while the other two
+    providers built real image blocks (agora-persona-runner's
+    _anthropic_content / _gemini_parts). `--input-format stream-json`
+    reads the same content-block shape those two send to their APIs, so
+    the fix is a different way of handing over the same message rather
+    than a new capability.
+
+    Measured against CLI 2.1.226 in this pod, 2026-08-10, because the
+    combination is what matters and not the flag alone: a resumed session
+    (`--resume`) reading an image block off stdin still answered from the
+    image AND still had its `--append-system-prompt` codeword. That is
+    exactly the bridge's production path, so all three work together.
+
+    `attachments` entries are {filename, mimeType, data} with `data`
+    base64. An entry with no `data` becomes the same "[attached file:
+    ...]" text the other two providers emit for a non-image or a fetch
+    that failed -- the caller decides what is renderable, and this stays
+    a transport."""
+    blocks = []
+    if message:
+        blocks.append({"type": "text", "text": message})
+    for att in attachments:
+        mime = att.get("mimeType", "")
+        data = att.get("data")
+        if data:
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": data},
+            })
+        else:
+            blocks.append({"type": "text", "text": (
+                f"[attached file: {att.get('filename', '?')} "
+                f"({mime or 'unknown type'}) -- not loaded]")})
+    event = {"type": "user", "message": {"role": "user", "content": blocks}}
+    path = path or CLI_INPUT_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(json.dumps(event) + "\n")
+    return path
 
 def write_mcp_config(mcp, path=None):
     """Render the caller's {"url", "token"} into a --mcp-config file and
@@ -175,14 +225,24 @@ def _report_subagent_event(event, subagent, reporter, tool_names, subagent_names
 
 
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
-                  system=None):
+                  system=None, attachments=None):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
     env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir}
 
-    cmd = [
-        "claude", "-p", message,
+    # Only a turn that actually carries attachments switches to stdin. The
+    # text path is what every Nova cycle and every ordinary chat turn runs,
+    # and moving all of them onto a second mechanism to avoid having two
+    # would put the whole service behind a change nothing was asking for.
+    input_file = write_stream_json_input(message, attachments) if attachments else ""
+
+    cmd = ["claude", "-p"]
+    if input_file:
+        cmd.extend(["--input-format", "stream-json"])
+    else:
+        cmd.append(message)
+    cmd.extend([
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
@@ -199,7 +259,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         # the only thing distinguishing a subagent's work from the persona's,
         # and the loop below depends on it.
         "--forward-subagent-text",
-    ]
+    ])
     # Lets the session see its own remaining quota while it runs, so it can
     # wrap up deliberately instead of being cut off mid-sentence (quota.py).
     hook_settings = write_hook_settings()
@@ -247,16 +307,28 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     if model:
         cmd.extend(["--model", model])
 
-    log(f"CLI start: session={session_id} model={model} msg={message[:120]!r}")
+    log(f"CLI start: session={session_id} model={model} msg={message[:120]!r} "
+        f"attachments={len(attachments or [])}")
     t0 = time.monotonic()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=CLAUDE_WORKSPACE,
-        env=env,
-        text=True,
-    )
+    # Handed over as a file rather than written to a pipe: an image is far
+    # larger than a pipe buffer, and writing it to stdin while the child is
+    # already writing to the stdout we have not started reading yet is the
+    # classic way to deadlock two processes. The child gets its own fd, so
+    # this copy closes immediately.
+    stdin_handle = open(input_file) if input_file else None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=stdin_handle,
+            cwd=CLAUDE_WORKSPACE,
+            env=env,
+            text=True,
+        )
+    finally:
+        if stdin_handle:
+            stdin_handle.close()
 
     text_parts = []
     thinking_parts = []
@@ -457,6 +529,13 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 os.remove(mcp_config)
             except OSError as exc:
                 log(f"mcp config cleanup failed: {type(exc).__name__}: {exc}")
+        # Same reasoning one step further: this one holds whatever Edvard
+        # photographed, and the CLI read it before the first event arrived.
+        if input_file:
+            try:
+                os.remove(input_file)
+            except OSError as exc:
+                log(f"cli input cleanup failed: {type(exc).__name__}: {exc}")
 
     elapsed = time.monotonic() - t0
     log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "
@@ -502,8 +581,12 @@ _invocation_lock = threading.Lock()
 
 
 def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-             mcp=None, system=None):
+             mcp=None, system=None, attachments=None):
     """One turn. Returns (text, thinking, new_session_id).
+
+    attachments: optional [{filename, mimeType, data}] with `data` base64,
+    sent as real content blocks alongside the text (write_stream_json_input).
+    Omit it and the CLI is invoked exactly as it was before this existed.
 
     system: optional persona/system prompt, passed to the CLI as
     --append-system-prompt so it reaches the model as an operator
@@ -530,4 +613,4 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
     """
     with _invocation_lock:
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
-                             system)
+                             system, attachments)

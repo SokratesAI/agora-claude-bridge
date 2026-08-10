@@ -233,6 +233,133 @@ def test_run_turn_omits_the_flag_entirely_when_no_system_given(tmp_path):
     assert "--append-system-prompt" not in captured["cmd"]
 
 
+# ---------------------------------------------------------------------------
+# Attachments -- 2026-08-10. `claude -p <text>` can only carry text, so a
+# claude-cli persona silently dropped every image while the runner's other
+# two providers built real image blocks. --input-format stream-json reads
+# the same content-block shape off stdin. Verified live against CLI 2.1.226
+# in this pod on the full production path (resume + --append-system-prompt +
+# an image block): the model answered from the image and still knew its
+# system-prompt codeword.
+# ---------------------------------------------------------------------------
+
+_PNG_B64 = "iVBORw0KGgo="
+
+
+def test_write_stream_json_input_builds_text_then_image_blocks(tmp_path):
+    path = cli.write_stream_json_input(
+        "what is this?",
+        [{"filename": "photo.png", "mimeType": "image/png", "data": _PNG_B64}],
+        path=str(tmp_path / "in.jsonl"),
+    )
+    event = json.loads(open(path).read())
+    assert event["type"] == "user"
+    assert event["message"]["role"] == "user"
+    assert event["message"]["content"] == [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image",
+         "source": {"type": "base64", "media_type": "image/png", "data": _PNG_B64}},
+    ]
+
+
+def test_write_stream_json_input_omits_the_text_block_for_an_uncaptioned_image(tmp_path):
+    path = cli.write_stream_json_input(
+        "", [{"filename": "photo.png", "mimeType": "image/png", "data": _PNG_B64}],
+        path=str(tmp_path / "in.jsonl"),
+    )
+    blocks = json.loads(open(path).read())["message"]["content"]
+    assert [b["type"] for b in blocks] == ["image"]
+
+
+def test_write_stream_json_input_notes_an_attachment_that_has_no_data(tmp_path):
+    """A non-image, or an image whose fetch failed -- the caller decides
+    which, and this renders the same note the other two providers emit."""
+    path = cli.write_stream_json_input(
+        "read this", [{"filename": "notes.pdf", "mimeType": "application/pdf"}],
+        path=str(tmp_path / "in.jsonl"),
+    )
+    blocks = json.loads(open(path).read())["message"]["content"]
+    assert blocks[1] == {
+        "type": "text",
+        "text": "[attached file: notes.pdf (application/pdf) -- not loaded]",
+    }
+
+
+def test_run_turn_with_attachments_switches_to_stream_json_input(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["stdin"] = kwargs.get("stdin")
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "CLI_INPUT_FILE", str(tmp_path / "home" / "in.jsonl")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("what is this?", attachments=[
+            {"filename": "photo.png", "mimeType": "image/png", "data": _PNG_B64}])
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--input-format") + 1] == "stream-json"
+    # The message moved to stdin, so it must NOT also be an argv prompt --
+    # sending it both ways would deliver the user's text twice.
+    assert cmd[cmd.index("-p") + 1] == "--input-format"
+    assert "what is this?" not in cmd
+    assert captured["stdin"] is not None
+
+
+def test_run_turn_without_attachments_still_passes_the_prompt_as_argv(tmp_path):
+    """Every ordinary chat turn and every Nova cycle runs this path. It has
+    to stay byte-identical to what it was before attachments existed."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["stdin"] = kwargs.get("stdin")
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello")
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-p") + 1] == "hello"
+    assert "--input-format" not in cmd
+    assert captured["stdin"] is None
+
+
+def test_run_turn_deletes_the_input_file_after_the_turn(tmp_path):
+    """It holds whatever Edvard photographed, on a persistent volume, and
+    the CLI has read it before the first event arrives."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    input_file = tmp_path / "home" / "in.jsonl"
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["existed_during_turn"] = input_file.exists()
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "CLI_INPUT_FILE", str(input_file)), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hi", attachments=[
+            {"filename": "photo.png", "mimeType": "image/png", "data": _PNG_B64}])
+    assert seen["existed_during_turn"] is True
+    assert not input_file.exists()
+
+
 def test_run_turn_is_unrestricted_by_default(tmp_path):
     """2026-08-01 design reversal: no --disallowedTools flag at all unless
     a caller explicitly asks for restriction -- the old always-on denylist
@@ -370,7 +497,7 @@ def test_generate_sends_system_prompt_out_of_band_not_in_the_message():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -396,7 +523,7 @@ def test_generate_resends_the_system_prompt_on_a_resumed_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -416,7 +543,7 @@ def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         calls.append((message, session_id, system))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -438,7 +565,7 @@ def test_generate_retries_fresh_on_session_not_found():
 
 def test_generate_propagates_other_cli_errors_without_retry():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -451,7 +578,7 @@ def test_generate_is_unrestricted_by_default():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -467,7 +594,7 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -483,7 +610,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -504,7 +631,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -520,7 +647,7 @@ def test_generate_stateless_can_combine_with_restricted():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None):
+                      mcp=None, system=None, attachments=None):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -585,7 +712,7 @@ def test_do_post_passes_restricted_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None):
+                      activity=None, attachments=None):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -601,7 +728,7 @@ def test_do_post_restricted_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None):
+                      activity=None, attachments=None):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -619,7 +746,7 @@ def test_do_post_passes_stateless_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None):
+                      activity=None, attachments=None):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -635,7 +762,7 @@ def test_do_post_stateless_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None):
+                      activity=None, attachments=None):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -974,7 +1101,7 @@ def test_do_post_passes_activity_through_to_generate():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None):
+                      stateless=False, activity=None, attachments=None):
         captured["activity"] = activity
         return "answer", ""
 
@@ -991,7 +1118,7 @@ def test_do_post_activity_defaults_to_none_when_omitted():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None):
+                      stateless=False, activity=None, attachments=None):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1000,6 +1127,101 @@ def test_do_post_activity_defaults_to_none_when_omitted():
         handler.do_POST()
     assert sent["status"] == 200
     assert captured["activity"] is None
+
+
+def _capture_generate_attachments(payload):
+    handler, sent = _make_handler(payload)
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
+                      stateless=False, activity=None, attachments=None):
+        captured["attachments"] = attachments
+        captured["prompt"] = prompt
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    return sent, captured
+
+
+def test_do_post_passes_attachments_through_to_generate():
+    att = [{"filename": "photo.png", "mimeType": "image/png", "data": "iVBORw0KGgo="}]
+    sent, captured = _capture_generate_attachments(
+        {"conversation_id": "c1", "prompt": "what is this?", "attachments": att})
+    assert sent["status"] == 200
+    assert captured["attachments"] == att
+
+
+def test_do_post_attachments_default_to_empty_when_omitted():
+    sent, captured = _capture_generate_attachments({"conversation_id": "c1", "prompt": "hi"})
+    assert sent["status"] == 200
+    assert captured["attachments"] == []
+
+
+def test_do_post_accepts_an_image_with_no_caption():
+    """An uncaptioned image is a real message. This used to 400 as an empty
+    prompt, which is the empty-turn crash the runner's _gemini_parts
+    documents on the other side."""
+    sent, captured = _capture_generate_attachments({
+        "conversation_id": "c1",
+        "prompt": "",
+        "attachments": [{"filename": "photo.png", "mimeType": "image/png", "data": "x"}],
+    })
+    assert sent["status"] == 200
+    assert captured["prompt"] == ""
+
+
+def test_do_post_normalises_a_null_prompt_to_empty_string():
+    """A caller sending "prompt": null alongside an attachment gets past
+    the emptiness check, and None then reaches cli.py's `message[:120]`
+    as a TypeError -- a 500 for what is a perfectly valid message."""
+    sent, captured = _capture_generate_attachments({
+        "conversation_id": "c1",
+        "prompt": None,
+        "attachments": [{"filename": "photo.png", "mimeType": "image/png", "data": "x"}],
+    })
+    assert sent["status"] == 200
+    assert captured["prompt"] == ""
+
+
+def test_do_post_still_rejects_a_turn_carrying_neither_prompt_nor_attachments():
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": ""})
+    with patch.object(server, "BRIDGE_TOKEN", ""):
+        handler.do_POST()
+    assert sent["status"] == 400
+
+
+def test_generate_passes_attachments_to_run_turn():
+    att = [{"filename": "photo.png", "mimeType": "image/png", "data": "x"}]
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None, system=None, attachments=None):
+        captured["attachments"] = attachments
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "get_session_id", return_value=None), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", attachments=att)
+    assert captured["attachments"] == att
+
+
+def test_generate_stateless_also_passes_attachments_to_run_turn():
+    """The stateless branch is a separate call site and has been forgotten
+    by a previous pass-through before (it is how the Nova workflow runs)."""
+    att = [{"filename": "photo.png", "mimeType": "image/png", "data": "x"}]
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None, system=None, attachments=None):
+        captured["attachments"] = attachments
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", stateless=True, attachments=att)
+    assert captured["attachments"] == att
 
 
 # ---------------------------------------------------------------------------
