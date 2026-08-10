@@ -45,6 +45,9 @@ from pathlib import Path
 # Obsidian LiveSync's own bookkeeping docs -- chunks, file/index/version
 # entries. Never files a human wrote.
 INTERNAL_PREFIXES = ("_", "h:", "f:", "i:", "v:")
+# The largest code point there is, so `prefix + _ID_MAX` sorts above every
+# id that starts with `prefix` and below the next one that does not.
+_ID_MAX = "\U0010FFFF"
 # Historical: this tool used to write one of these per overwrite, and the
 # whole `agora/` folder was deleted on 2026-08-06 once it stopped. The
 # filter stays because deleting a folder from CouchDB does not stop an
@@ -180,12 +183,39 @@ class VaultClient:
         to read it as the backlog.
 
         `_all_docs` returns ids and revs but not fields, so the ids get
-        re-fetched with `include_docs=true` in batches. Cost scales with
-        the prefix asked for: 0.46s for a project folder, 5.0s for the
-        whole vault. A Mango `_find` on the flag is worse -- unindexed, it
-        scans all 10939 docs in 8.5s whatever the prefix.
+        re-fetched with `include_docs=true` in batches. A Mango `_find` on
+        the flag is worse -- unindexed, it scans all 10939 docs in 8.5s
+        whatever the prefix.
+
+        **Both phases are restricted to the prefix, and until 2026-08-11
+        only the second one was.** Doc ids in a LiveSync vault are the
+        lowercased file paths, so a folder is a contiguous key range and
+        CouchDB can seek straight to it; this asked for the whole database
+        and filtered the rows in Python. The docstring claimed the cost
+        scaled with the prefix, which was true of the batches below and
+        false of the scan above -- listing one folder or listing the vault
+        paid the same 12k rows either way.
+
+        Measured end to end on the live vault 2026-08-11, `ls` of the
+        103-file journal folder: **3.3s before, 1.0s after**, byte
+        identical output. The sweep itself is the part that went from
+        ~2.3s to ~0.05s; the second below still re-fetches those 103
+        documents to read their `deleted` flags, and that is the floor
+        this cannot go under without giving up the tombstone check. `list`
+        is the only caller -- `recent` goes through Mango `_find` and
+        never paid this -- so the win is on `ls`, which every cycle runs
+        to find the number of its own last journal entry before it can
+        write one. The runner's copy of this client has had the range
+        since 2026-08-09; this is that drift, in the half nobody checks.
+
+        An empty prefix keeps the old behaviour: `""` to U+10FFFF is every
+        document there is, which is what `recent()` asks for.
         """
-        status, data = _req("GET", self.base, self.db, self.auth, "_all_docs")
+        query = urllib.parse.urlencode({
+            "startkey": json.dumps(prefix.lower()),
+            "endkey": json.dumps(prefix.lower() + _ID_MAX),
+        })
+        status, data = _req("GET", self.base, self.db, self.auth, f"_all_docs?{query}")
         if status != 200:
             return {}
         prefix = prefix.lower()
