@@ -109,7 +109,7 @@ def _await_drain():
 
 
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
-             activity=None, mcp=None):
+             activity=None, mcp=None, attachments=None):
     """One turn for one conversation. The system/persona prompt goes to the
     CLI as --append-system-prompt on every turn, resumed or not (see
     cli.run_turn) -- it reaches the model as an operator instruction rather
@@ -146,12 +146,19 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     runner hands a claude-cli persona the same capability tools every
     other provider already has (agora-persona-runner/tools_mcp.py). Absent
     means no --mcp-config flag at all, which is what every caller did
-    before this existed."""
+    before this existed.
+
+    attachments (2026-08-10, absent by default): [{filename, mimeType,
+    data}] the user sent with this message, `data` base64. Until this
+    existed a claude-cli persona was the only one of the three providers
+    that dropped them silently, which started mattering the moment Cycle
+    78 moved six of Edvard's personas onto this provider to stop them
+    billing the metered API. See cli.write_stream_json_input."""
     if stateless:
         text, thinking, _ = run_turn(
             prompt, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
-            activity=activity, mcp=mcp, system=system,
+            activity=activity, mcp=mcp, system=system, attachments=attachments,
         )
         return text, thinking
 
@@ -161,7 +168,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     try:
         text, thinking, new_session_id = run_turn(
             prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
-            activity=activity, mcp=mcp, system=system,
+            activity=activity, mcp=mcp, system=system, attachments=attachments,
         )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
@@ -169,7 +176,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             clear_session_id(conversation_id)
             text, thinking, new_session_id = run_turn(
                 prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
-                activity=activity, mcp=mcp, system=system,
+                activity=activity, mcp=mcp, system=system, attachments=attachments,
             )
         else:
             raise
@@ -212,9 +219,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             conversation_id = payload.get("conversation_id")
-            prompt = payload.get("prompt")
-            if not conversation_id or not prompt:
-                self._send(400, {"error": "conversation_id and prompt are required"})
+            # `or ""` rather than a default: a caller that sends
+            # "prompt": null used to be rejected by the emptiness check
+            # below and now gets past it whenever attachments are present,
+            # at which point None reaches cli.py's log line and 500s the
+            # turn with a TypeError. Normalising here keeps this endpoint
+            # total over its own input instead of trusting one client.
+            prompt = payload.get("prompt") or ""
+            attachments = payload.get("attachments") or []
+            # An image with no caption is a real message and used to be
+            # rejected here as an empty one -- the same empty-turn crash
+            # _gemini_parts documents on the other side. A turn still has
+            # to carry something, so it is now "prompt or attachments".
+            if not conversation_id or not (prompt or attachments):
+                self._send(400, {
+                    "error": "conversation_id and prompt (or attachments) are required"})
                 return
             system = payload.get("system", "")
             model = payload.get("model")
@@ -233,6 +252,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 text, thinking = generate(
                     conversation_id, system, prompt, model=model, restricted=restricted,
                     stateless=stateless, activity=activity, mcp=mcp,
+                    attachments=attachments,
                 )
             finally:
                 _leave_turn()
