@@ -497,7 +497,7 @@ def test_generate_sends_system_prompt_out_of_band_not_in_the_message():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -523,7 +523,7 @@ def test_generate_resends_the_system_prompt_on_a_resumed_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -543,7 +543,7 @@ def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         calls.append((message, session_id, system))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -565,7 +565,7 @@ def test_generate_retries_fresh_on_session_not_found():
 
 def test_generate_propagates_other_cli_errors_without_retry():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -578,7 +578,7 @@ def test_generate_is_unrestricted_by_default():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -594,7 +594,7 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -610,7 +610,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -631,7 +631,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -647,7 +647,7 @@ def test_generate_stateless_can_combine_with_restricted():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -712,7 +712,7 @@ def test_do_post_passes_restricted_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None):
+                      activity=None, attachments=None, allow_concurrent=False):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -728,7 +728,7 @@ def test_do_post_restricted_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None):
+                      activity=None, attachments=None, allow_concurrent=False):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -746,7 +746,7 @@ def test_do_post_passes_stateless_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None):
+                      activity=None, attachments=None, allow_concurrent=False):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -762,7 +762,7 @@ def test_do_post_stateless_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None):
+                      activity=None, attachments=None, allow_concurrent=False):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -1101,7 +1101,7 @@ def test_do_post_passes_activity_through_to_generate():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1118,7 +1118,7 @@ def test_do_post_activity_defaults_to_none_when_omitted():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1134,7 +1134,7 @@ def _capture_generate_attachments(payload):
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
         captured["attachments"] = attachments
         captured["prompt"] = prompt
         return "answer", ""
@@ -1197,7 +1197,7 @@ def test_generate_passes_attachments_to_run_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1215,13 +1215,105 @@ def test_generate_stateless_also_passes_attachments_to_run_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
     with patch.object(server, "run_turn", side_effect=fake_run_turn):
         server.generate("conv-1", "system", "hi", stateless=True, attachments=att)
     assert captured["attachments"] == att
+
+
+# ---------------------------------------------------------------------------
+# allow_concurrent, end to end through this module -- cli.run_turn's lane
+# (tested further down) was merged inert on 2026-08-10 because nothing
+# asked for it. These are the wiring that makes a journal-card reply
+# actually skip a running Nova cycle instead of queueing 45 minutes behind
+# it. Every one of them is a pass-through test, and every pass-through in
+# this file exists because one of them was once forgotten.
+# ---------------------------------------------------------------------------
+
+
+def _capture_generate_allow_concurrent(payload):
+    handler, sent = _make_handler(payload)
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
+        captured["allow_concurrent"] = allow_concurrent
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    return sent, captured
+
+
+def test_do_post_passes_allow_concurrent_through_to_generate():
+    sent, captured = _capture_generate_allow_concurrent(
+        {"conversation_id": "c1", "prompt": "hi", "allow_concurrent": True})
+    assert sent["status"] == 200
+    assert captured["allow_concurrent"] is True
+
+
+def test_do_post_allow_concurrent_defaults_to_false_when_omitted():
+    """Every existing caller sends a long turn and must keep the lock."""
+    sent, captured = _capture_generate_allow_concurrent(
+        {"conversation_id": "c1", "prompt": "hi"})
+    assert sent["status"] == 200
+    assert captured["allow_concurrent"] is False
+
+
+def test_generate_passes_allow_concurrent_to_run_turn():
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+        captured["allow_concurrent"] = allow_concurrent
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "get_session_id", return_value=None), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", allow_concurrent=True)
+    assert captured["allow_concurrent"] is True
+
+
+def test_generate_stateless_also_passes_allow_concurrent_to_run_turn():
+    """The stateless branch is the one that matters here: the journal-card
+    reply is stateless, so a pass-through that only covered the resumed
+    branch would leave the whole feature inert with green tests."""
+    captured = {}
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+        captured["allow_concurrent"] = allow_concurrent
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", stateless=True, allow_concurrent=True)
+    assert captured["allow_concurrent"] is True
+
+
+def test_generate_keeps_allow_concurrent_on_the_session_not_found_retry():
+    """Third call site. A retry that silently dropped the flag would take
+    the lock and hang for the length of a cycle -- the exact wait this is
+    meant to remove, on the one path a caller cannot predict."""
+    seen = []
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+        seen.append(allow_concurrent)
+        if session_id is not None:
+            raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
+        return "reply", "", "sess-2"
+
+    with patch.object(server, "get_session_id", return_value="sess-old"), \
+         patch.object(server, "clear_session_id"), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", allow_concurrent=True)
+    assert seen == [True, True]
 
 
 # ---------------------------------------------------------------------------
