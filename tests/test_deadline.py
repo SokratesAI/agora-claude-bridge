@@ -170,6 +170,17 @@ def test_hook_is_silent_when_no_turn_is_running(tmp_path):
     assert printed == []
 
 
+def test_no_hook_tells_a_cycle_to_write_to_the_frozen_archive():
+    """journal.md has been the frozen pre-2026-08-09 archive since the
+    journal became one document per entry, and an entry appended there is
+    invisible to the site and to every later cycle. Both hooks fire when a
+    cycle is under pressure and least likely to check."""
+    from bridge.hooks import quota_notice
+    for module in (quota_notice, deadline_notice):
+        assert "journal.md" not in module.WRAP_UP
+        assert "nova/journal/" in module.WRAP_UP
+
+
 def test_hook_settings_attach_both_bridge_hooks(tmp_path):
     """The deadline hook is useless if it is never registered -- the quota
     hook shipped correct and unattached once already."""
