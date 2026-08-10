@@ -22,10 +22,26 @@ from unittest.mock import patch
 
 import pytest
 
-from bridge import quota
+from bridge import deadline, quota
 
 
 @pytest.fixture(autouse=True, scope="session")
 def no_live_quota_fetches():
     with patch.object(quota, "fetch_usage", return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True, scope="session")
+def isolated_turn_deadline(tmp_path_factory):
+    """Keeps the cli tests off the real turn clock.
+
+    Same class of problem as the quota fixture above: cli.py writes a
+    deadline record for every invocation and clears it in its finally, so
+    a suite run on the bridge pod itself would delete the live clock of
+    whatever cycle is running -- and the deadline hook would then go quiet
+    for the rest of that cycle. Tests that care about the file's contents
+    patch DEADLINE_FILE themselves and nest inside this one.
+    """
+    path = str(tmp_path_factory.mktemp("deadline") / "turn-deadline.json")
+    with patch.object(deadline, "DEADLINE_FILE", path):
         yield

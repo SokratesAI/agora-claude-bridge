@@ -24,6 +24,7 @@ import threading
 import time
 
 from bridge.activity import ActivityReporter, result_text
+from bridge import deadline
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
 from bridge.quota import QuotaWatcher, write_hook_settings
@@ -260,8 +261,9 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         # and the loop below depends on it.
         "--forward-subagent-text",
     ])
-    # Lets the session see its own remaining quota while it runs, so it can
-    # wrap up deliberately instead of being cut off mid-sentence (quota.py).
+    # Lets the session see its own remaining quota and its own remaining
+    # wall-clock while it runs, so it can wrap up deliberately instead of
+    # being cut off mid-sentence (quota.py, deadline.py).
     hook_settings = write_hook_settings()
     if hook_settings:
         cmd.extend(["--settings", hook_settings])
@@ -310,12 +312,18 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     log(f"CLI start: session={session_id} model={model} msg={message[:120]!r} "
         f"attachments={len(attachments or [])}")
     t0 = time.monotonic()
+    # Starts the clock the deadline hook reports off. Written here rather
+    # than at the top of the function so it measures the same span
+    # proc.wait() enforces, and cleared in the finally below so a finished
+    # turn never leaves an expired clock for the next one to read.
+    deadline.write(CLI_TIMEOUT_SECONDS)
     # Handed over as a file rather than written to a pipe: an image is far
     # larger than a pipe buffer, and writing it to stdin while the child is
     # already writing to the stdout we have not started reading yet is the
     # classic way to deadlock two processes. The child gets its own fd, so
     # this copy closes immediately.
     stdin_handle = open(input_file) if input_file else None
+    timed_out = False
     try:
         proc = subprocess.Popen(
             cmd,
@@ -513,12 +521,25 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            raise ClaudeCliError(f"CLI timed out after {CLI_TIMEOUT_SECONDS}s")
+            # Falling through rather than raising, because this process is
+            # holding every word the session wrote and used to throw all of
+            # it away. Cycle 81 was killed here having already merged its
+            # PR and written its journal entry, and the only thing Edvard
+            # was told is "failed: timed out" -- which reads as "the cycle
+            # achieved nothing", the opposite of what happened. The reply
+            # built below is now the last thing the session managed to say,
+            # labelled as truncated so it cannot be mistaken for a finished
+            # one. If it wrote nothing at all there is genuinely nothing to
+            # salvage, and the raise below still fires.
+            timed_out = True
+            log(f"CLI timed out after {CLI_TIMEOUT_SECONDS}s; "
+                f"salvaging {len(''.join(text_parts))} chars of text")
     finally:
         if proc.stdout:
             proc.stdout.close()
         reporter.close()
         watcher.close()
+        deadline.clear()
         # The config file holds this turn's bearer token, and the turn is
         # over -- the caller revokes the grant as its own call returns, so
         # what is left on the PVC is inert, but there is no reason to leave
@@ -570,6 +591,32 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     else:
         text = "\n".join(text_parts).strip()
     thinking = "\n\n".join(thinking_parts).strip()
+    if timed_out:
+        # A killed turn never reached its closing passage, so the salvage is
+        # mid-run narration -- "now the digest, re-fetching first" was
+        # Cycle 81's. That is worth sending and worth labelling: unlabelled
+        # it would arrive looking like a considered reply that simply stops.
+        #
+        # It has to be picked here rather than reusing the selection above,
+        # and the reviewer caught this: `pending` is emptied by
+        # release_narrative() on every tool_use, and a turn killed mid-tool-
+        # call is the normal shape of this failure -- Cycle 81 died three
+        # tool calls into rewriting the digest. So `pending` is empty
+        # exactly when this path runs, the selection above falls through to
+        # joining every passage, and Edvard's phone gets the entire
+        # transcript a second time on top of the narration he already
+        # watched. That is the wall-of-text regression the comment above
+        # exists to prevent, arriving through a different door. The last
+        # passage is what the label promises and all it should send.
+        text = text_parts[-1].strip() if (reporter.enabled and text_parts) else text
+        if not text:
+            raise ClaudeCliError(f"CLI timed out after {CLI_TIMEOUT_SECONDS}s")
+        return (
+            f"_Cut off at this turn's {CLI_TIMEOUT_SECONDS // 60}-minute limit "
+            "before I could write a proper reply. Anything I wrote to the vault "
+            "survived; anything else did not. The last thing I was doing:_\n\n"
+            f"{text}"
+        ), thinking, new_session_id
     if not text:
         raise ClaudeCliError("CLI produced no text output")
     return text, thinking, new_session_id

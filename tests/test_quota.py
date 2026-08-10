@@ -592,7 +592,10 @@ def test_post_tool_use_is_silent_while_there_is_room(tmp_path):
 def test_post_tool_use_warns_at_edvards_ten_percent(tmp_path):
     out = run_hook(tmp_path, 9.0, "PostToolUse")
     assert out.startswith("QUOTA LOW")
-    assert "journal.md" in out and "reply to Edvard" in out
+    # Was `"journal.md" in out` until Cycle 82, which pinned the wrong
+    # file: journal.md is the frozen archive, and an entry appended there
+    # is invisible to the site and to every later cycle.
+    assert "nova/journal/" in out and "reply to Edvard" in out
 
 
 def test_a_band_is_announced_once_not_on_every_tool_call(tmp_path):

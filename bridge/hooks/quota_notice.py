@@ -122,10 +122,17 @@ def describe(snapshot):
     return report + "."
 
 
+# journal.md was frozen on 2026-08-09 when the journal became one document
+# per entry, and an entry appended to it is invisible to the site and to
+# every cycle after -- so this line was telling a cycle to destroy its own
+# handoff, at exactly the moment it was least likely to double-check.
+# Found by the reviewer on Cycle 82 while checking the wording of the new
+# deadline hook against this one.
 WRAP_UP = (
     " Wrap up now rather than starting anything new: finish the step you are on, then "
-    "write journal.md, rewrite journal-digest.md (put where to resume under **Next cycle**), "
-    "and post your reply to Edvard. Those three are what survive; work in progress is not."
+    "write your journal entry to nova/journal/, rewrite journal-digest.md (put where to "
+    "resume under **Next cycle**), and post your reply to Edvard. Those three are what "
+    "survive; work in progress is not."
 )
 
 
