@@ -8,9 +8,15 @@ service avoids that by being the only process anywhere that holds the
 credential, but a second risk remains even within one pod: the CLI's own
 token refresh is a side effect of *any* invocation, so two concurrent
 invocations (different conversations, same pod) could still race each
-other on the same underlying refresh. Unverified until live-tested against
-the real subscription -- the lock is the deliberately conservative default
-until that's confirmed safe to relax. Synchronous/blocking throughout,
+other on the same underlying refresh. Half of that is now measured
+(2026-08-10, this pod, against the real subscription): two invocations
+started simultaneously on one credential, while a third was mid-turn,
+all returned cleanly and left `.credentials.json` byte-identical. So
+concurrency itself is fine; what stays unverified is the narrow window
+where a refresh is actually due, and run_turn's allow_concurrent lane is
+gated on staying out of it rather than on the whole lock. The lock
+remains the default for every caller that does not opt in.
+Synchronous/blocking throughout,
 matching agora-persona-runner's own style (no asyncio anywhere in that
 codebase) -- serializing on a plain threading.Lock is simpler than
 asyncio.Lock across ThreadingHTTPServer's per-request threads, and there's
@@ -27,6 +33,7 @@ from bridge.activity import ActivityReporter, result_text
 from bridge import deadline
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
+from bridge import quota
 from bridge.quota import QuotaWatcher, write_hook_settings
 
 SESSION_NOT_FOUND = "\x00SESSION_NOT_FOUND"
@@ -225,8 +232,21 @@ def _report_subagent_event(event, subagent, reporter, tool_names, subagent_names
                 )
 
 
+def _slotted(path, slot):
+    """`/x/.claude/bridge-mcp.config.json` -> `...config.<slot>.json`.
+
+    Only a turn running outside _invocation_lock passes a slot; everything
+    else keeps the exact filenames it has always used, so the serialized
+    path is byte-for-byte unchanged.
+    """
+    if not slot:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}.{slot}{ext}"
+
+
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
-                  system=None, attachments=None):
+                  system=None, attachments=None, slot=""):
     os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
@@ -236,7 +256,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # text path is what every Nova cycle and every ordinary chat turn runs,
     # and moving all of them onto a second mechanism to avoid having two
     # would put the whole service behind a change nothing was asking for.
-    input_file = write_stream_json_input(message, attachments) if attachments else ""
+    input_file = (write_stream_json_input(message, attachments, _slotted(CLI_INPUT_FILE, slot))
+                  if attachments else "")
 
     cmd = ["claude", "-p"]
     if input_file:
@@ -264,7 +285,14 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # Lets the session see its own remaining quota and its own remaining
     # wall-clock while it runs, so it can wrap up deliberately instead of
     # being cut off mid-sentence (quota.py, deadline.py).
-    hook_settings = write_hook_settings()
+    # Slotted for the same reason as the two above, with a different
+    # failure: this file is never deleted and every turn writes identical
+    # content, so sharing it looks harmless -- but `open(path, "w")`
+    # truncates, and a concurrent turn's CLI can read the empty window
+    # between that truncate and the json.dump. Losing the quota and
+    # deadline hooks is silent; the turn just stops being able to see its
+    # own budget.
+    hook_settings = write_hook_settings(_slotted(quota.HOOK_SETTINGS_FILE, slot))
     if hook_settings:
         cmd.extend(["--settings", hook_settings])
     # Agora's own capability tools (vault_read, kubectl_read, create_pr,
@@ -283,7 +311,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # roughly 1.5s in. The only turn that can miss them is one whose first
     # and last action both happen inside that window; a persona cycle runs
     # for tens of minutes and cannot.
-    mcp_config = write_mcp_config(mcp)
+    mcp_config = write_mcp_config(mcp, _slotted(MCP_CONFIG_FILE, slot))
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
     if disallowed_tools:
@@ -626,9 +654,42 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
 # see this module's own docstring for why.
 _invocation_lock = threading.Lock()
 
+# How far from expiry the OAuth access token has to be before a caller is
+# allowed past the lock (see run_turn's allow_concurrent).
+#
+# Measured in this pod on 2026-08-10, because the design this implements
+# was written against a wrong number: `.credentials.json` carried an
+# `expiresAt` **eight hours** out, not the ~60 minutes an earlier reading
+# recorded, and the file's mtime matched the start of that 8-hour span.
+# The CLI's own refresh is therefore a roughly-8-hourly event, not an
+# hourly one, so a 15-minute margin leaves this lane open ~97% of the
+# time and shut exactly across the window where the refresh race the
+# module docstring describes could actually happen.
+CONCURRENT_REFRESH_MARGIN_SECONDS = 900
+
+CREDENTIALS_FILE = os.path.join(CLAUDE_HOME, ".claude", ".credentials.json")
+
+
+def refresh_window_clear(margin=CONCURRENT_REFRESH_MARGIN_SECONDS, path=None, now=None):
+    """True when the OAuth token is far enough from expiry that no
+    invocation started right now should trigger a refresh.
+
+    Every failure answers False. An unreadable, malformed or
+    `expiresAt`-less credential file is not evidence that concurrency is
+    safe -- it is the absence of evidence, and the lock is the thing that
+    is correct in the absence of evidence.
+    """
+    try:
+        with open(path or CREDENTIALS_FILE) as handle:
+            expires_at = json.load(handle)["claudeAiOauth"]["expiresAt"]
+        return (float(expires_at) / 1000.0) - (now or time.time()) > margin
+    except Exception as exc:
+        log(f"refresh window check failed, staying serialized: {type(exc).__name__}: {exc}")
+        return False
+
 
 def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-             mcp=None, system=None, attachments=None):
+             mcp=None, system=None, attachments=None, allow_concurrent=False):
     """One turn. Returns (text, thinking, new_session_id).
 
     attachments: optional [{filename, mimeType, data}] with `data` base64,
@@ -653,11 +714,41 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
     this turn's model to have (see write_mcp_config). Omit it and the CLI
     is invoked with no MCP configuration at all, exactly as before.
 
+    allow_concurrent: let this turn run alongside one already in flight
+    instead of queueing behind the process-wide lock. Opt-in per call, for
+    short turns that a caller would rather drop than have wait out a
+    45-minute Nova cycle -- a journal-card reply is the case it was built
+    for. It is a request, not a guarantee: the lane opens only while
+    refresh_window_clear() holds, and falls back to the lock otherwise, so
+    a caller never has to reason about the token itself.
+
     Raises UsageLimitError on a real subscription cap, ClaudeCliError on
     anything else that prevented a usable reply (including the
     SESSION_NOT_FOUND sentinel message -- callers should clear their stored
     session_id and retry once with session_id=None on that specific case).
     """
+    # Measured live in the bridge pod, 2026-08-10 (Cycle 84): two `claude
+    # -p` invocations started simultaneously, on one credential, while a
+    # third -- the Nova cycle running this very test -- was mid-turn. All
+    # three returned is_error:false with distinct session ids and
+    # `.credentials.json` was byte-identical afterwards. That retires the
+    # "unverified" in this module's docstring for the no-refresh-due case,
+    # and only for that case: the token was 8 hours from expiry, so
+    # nothing in that test refreshed anything. The refresh race is still
+    # unmeasured, which is exactly what the gate below exists to avoid.
+    if allow_concurrent and refresh_window_clear():
+        # The three files a turn writes into ~/.claude are on fixed paths
+        # (MCP_CONFIG_FILE, CLI_INPUT_FILE), and the comments there say
+        # plainly that this is safe *because* the lock serializes
+        # invocations. Take the lock away and it stops being true: the mcp
+        # config holds this turn's bearer token for the runner's tool
+        # endpoint and is deleted in _run_cli_once's finally, so two
+        # overlapping turns can hand one turn the other's token, or delete
+        # a file the other's subprocess has not read yet. A concurrent turn
+        # therefore gets its own paths rather than sharing.
+        slot = f"{os.getpid()}-{threading.get_ident()}"
+        return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
+                             system, attachments, slot=slot)
     with _invocation_lock:
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
                              system, attachments)
