@@ -699,3 +699,18 @@ def test_a_chunk_write_conflict_is_success_not_failure(env):
     client._doc = conflicting
     assert client.write("notes/thing.md", _realistic_capture_file()) == "written"
     assert [c for c in calls if c[1] == "notes/thing.md"], "file doc never written"
+
+
+def test_split_chunks_caps_a_chunk_that_mixes_ordinary_lines_and_a_long_one(env):
+    """My own fix for the byte-cap finding was incomplete and this fixture
+    is why. Pure emoji on one line splits into units that each already
+    exceed the cap, so every unit flushes on its own and nothing
+    accumulates. Real content is ordinary lines followed by a long one:
+    the accumulator was near the cap and then took a whole 16KB unit on
+    top. Measured live against the vault at 20,692 bytes."""
+    content = ("".join("- %d: ordinary line of prose, nothing special.\n" % i
+                       for i in range(200))
+               + "\U0001F600" * 20000 + "\n")
+    chunks = vault_tool._split_chunks(content)
+    assert "".join(chunks) == content
+    assert max(len(c.encode("utf-8")) for c in chunks) <= vault_tool.CHUNK_MAX_BYTES

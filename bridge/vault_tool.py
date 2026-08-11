@@ -157,11 +157,19 @@ def _split_chunks(content):
 
     chunks, current, size = [], [], 0
     for unit in units:
+        unit_bytes = len(unit.encode("utf-8"))
+        # Close the chunk BEFORE the unit that would overflow it, not
+        # after. Closing after lets a chunk reach almost CHUNK_MAX_BYTES
+        # and then take one more whole unit -- measured live on mixed
+        # text plus one long emoji line, 20,692 bytes against a 16,384
+        # cap. Every unit is itself capped by the loop above, so this
+        # makes the invariant hold rather than nearly hold.
+        if current and size + unit_bytes > CHUNK_MAX_BYTES:
+            chunks.append("".join(current))
+            current, size = [], 0
         current.append(unit)
-        size += len(unit.encode("utf-8"))
-        if size >= CHUNK_MAX_BYTES or (
-            size >= CHUNK_MIN_BYTES and _is_chunk_boundary(unit)
-        ):
+        size += unit_bytes
+        if size >= CHUNK_MIN_BYTES and _is_chunk_boundary(unit):
             chunks.append("".join(current))
             current, size = [], 0
     if current:
