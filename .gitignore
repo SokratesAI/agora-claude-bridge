@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .env
 *.log
+
+# Reviewer subagents run in their own git worktree (review-rubric.md), and it
+# lands here inside the repo. Untracked it is one `git add -A` away from being
+# committed whole, by a loop that does exactly that on every cycle.
+.claude/
