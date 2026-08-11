@@ -522,3 +522,122 @@ def test_main_get_reports_an_incomplete_document_on_stderr_and_exits_nonzero(env
     assert captured.out == ""
     assert "INCOMPLETE DOCUMENT" in captured.err
     assert "6 of 184" in captured.err
+
+
+# --- content-defined chunking (Cycle 117) ----------------------------------
+#
+# Before this, _put_raw stored the whole file as one content-hashed blob and
+# deleted nothing, so every append left a complete dead copy behind. Measured
+# on the live vault 2026-08-11: 38.8MB of dead chunks against 1.4MB of live
+# Nova content, 27.6x. These tests pin the two properties that fix costs.
+
+def _realistic_capture_file(entries=400):
+    """Shaped like nova/resources/issues.md: a heading, then bullets, newest
+    inserted directly under the heading."""
+    body = "".join(
+        f"- 2026-08-{(i % 28) + 1:02d} (Cycle {i}) - capture number {i}, "
+        f"long enough to look like the real thing rather than a token.\n"
+        for i in range(entries)
+    )
+    return "# Issues\n\n## Entries\n\n" + body
+
+
+def test_split_chunks_concatenates_back_to_the_original():
+    """The whole contract: assemble() joins children with no separator."""
+    for content in ("", "short\n", _realistic_capture_file(),
+                    "no trailing newline", "unicode: åæø \U0001f600\n" * 500):
+        assert "".join(vault_tool._split_chunks(content)) == content
+
+
+def test_split_chunks_produces_many_chunks_in_the_livesync_size_band():
+    content = _realistic_capture_file()
+    chunks = vault_tool._split_chunks(content)
+    assert len(chunks) > 5, "a 40KB file stored as one blob is the bug"
+    sizes = [len(c.encode("utf-8")) for c in chunks]
+    # Only the final chunk may fall under the minimum -- it is whatever is
+    # left over.
+    assert all(s >= vault_tool.CHUNK_MIN_BYTES for s in sizes[:-1])
+    assert all(s <= vault_tool.CHUNK_MAX_BYTES for s in sizes)
+
+
+def test_split_chunks_is_stable_across_processes():
+    """A per-process salt (builtin hash()) would re-chunk every file on
+    every run and reuse nothing, which looks exactly like working."""
+    import subprocess, sys, textwrap
+    script = textwrap.dedent("""
+        import sys; sys.path.insert(0, %r)
+        from bridge import vault_tool
+        print(len(vault_tool._split_chunks("line %%d of a file\\n" %% 0 + "".join(
+            "line %%d of a file that needs to be long enough to matter\\n" %% i
+            for i in range(2000)))))
+    """) % "/data/workspace/agora-claude-bridge"
+    runs = {subprocess.run([sys.executable, "-c", script], capture_output=True,
+                           text=True).stdout.strip() for _ in range(3)}
+    assert len(runs) == 1 and runs != {""}, runs
+
+
+def test_split_chunks_breaks_up_a_single_oversized_line():
+    """cost-ledger.json is one JSON line republished whole every cycle."""
+    content = '{"a": "' + ("x" * 100_000) + '"}'
+    chunks = vault_tool._split_chunks(content)
+    assert "".join(chunks) == content
+    assert len(chunks) > 5
+    assert all(len(c.encode("utf-8")) <= vault_tool.CHUNK_MAX_BYTES for c in chunks)
+
+
+def test_append_rewrites_only_the_changed_chunks(env):
+    """The measurement that made this cycle: an append must not rewrite the
+    part of the file that did not change."""
+    original = _realistic_capture_file()
+    ider = vault_tool.VaultClient()
+    chunk_ids = [ider._chunk_id_for(c.encode("utf-8"))
+                 for c in vault_tool._split_chunks(original)]
+
+    responses = {("GET", "notes/issues.md"): (200, {
+        "children": list(chunk_ids), "_rev": "1-abc", "ctime": 1,
+    })}
+    for cid, text in zip(chunk_ids, vault_tool._split_chunks(original)):
+        responses[("GET", cid)] = (200, {"data": text})
+    # Every existing chunk is already in the database.
+    responses[("POST", "_all_docs")] = (200, {
+        "rows": [{"key": cid, "id": cid, "value": {"rev": "1-x"}}
+                 for cid in sorted(set(chunk_ids))]
+    })
+    client = vault_tool.VaultClient()
+    calls = []
+
+    def fake_doc(method, doc_id, body=None):
+        calls.append((method, doc_id, body))
+        if (method, doc_id) in responses:
+            return responses[(method, doc_id)]
+        # A chunk this file has never held before, or the file doc itself.
+        return (201, {"ok": True}) if method == "PUT" else (404, {"error": "not_found"})
+
+    client._doc = fake_doc
+
+    client.append("notes/issues.md", "- 2026-08-11 (Cycle 117) - a new capture.",
+                  "## Entries")
+
+    chunk_puts = [c for c in calls if c[0] == "PUT" and c[1].startswith("h:")]
+    assert len(chunk_ids) > 5
+    # The insert lands under a heading at the very top, so the boundary
+    # shifts for a chunk or two and then re-syncs. Anything close to the
+    # full file means the chunker is not content-defined.
+    assert len(chunk_puts) <= 3, (
+        f"{len(chunk_puts)} of {len(chunk_ids)} chunks rewritten for a "
+        "one-line append")
+    file_puts = [c for c in calls if c[0] == "PUT" and c[1] == "notes/issues.md"]
+    assert len(file_puts) == 1
+    assert len(file_puts[0][2]["children"]) > 5
+
+
+def test_put_raw_refuses_to_write_a_file_doc_when_a_chunk_fails(env):
+    """A file doc pointing at a missing chunk is VaultIncompleteDocument --
+    silent on read, and it splices surviving neighbours together mid-word."""
+    client, calls = _client_with_fake_req({
+        ("POST", "_all_docs"): (200, {"rows": []}),
+        # every chunk PUT falls through to the 404 default
+    })
+    result = client.write("notes/thing.md", _realistic_capture_file())
+    assert result.startswith("FAILED(chunk ")
+    assert [c for c in calls if c[0] == "PUT" and c[1] == "notes/thing.md"] == []

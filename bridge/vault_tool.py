@@ -92,6 +92,64 @@ def _req(method, base, db, auth, path, body=None):
         return e.code, json.loads(e.read().decode() or "{}")
 
 
+# Content-defined chunking, in bytes. LiveSync -- the client that wrote
+# every file in this vault Nova didn't -- averages ~4KB a chunk, and
+# these are picked to land there.
+#
+# Why content-defined and not a fixed stride: `append` inserts under a
+# heading near the TOP of the file, so a fixed stride would shift every
+# boundary after the insertion and rewrite the whole file anyway. A
+# boundary chosen by the content of the line it follows re-syncs within
+# a chunk or two of the edit, so an append rewrites the tail and nothing
+# else. Measured 2026-08-11 (Cycle 116, research/vault-storage-format.md):
+# one-blob writes left 38.8MB of dead copies in Edvard's database against
+# 1.4MB of live content -- 27.6x -- because every write stored the whole
+# file again under a new content hash and deleted nothing.
+CHUNK_MIN_BYTES = 2048
+CHUNK_MAX_BYTES = 16384
+# 1 line in 32 is a boundary candidate once past CHUNK_MIN_BYTES.
+CHUNK_BOUNDARY_MASK = 0x1F
+
+
+def _is_chunk_boundary(line):
+    # zlib.crc32, not the builtin hash(): str hashing is salted per
+    # process, so the same file would chunk differently on every run and
+    # reuse nothing.
+    import zlib
+    return (zlib.crc32(line.encode("utf-8")) & CHUNK_BOUNDARY_MASK) == 0
+
+
+def _split_chunks(content):
+    """Split `content` into content-defined pieces.
+
+    Concatenating the result reproduces `content` byte for byte --
+    `assemble()` does exactly that, so this is the whole contract."""
+    if not content:
+        return [""]
+    units = []
+    for line in content.splitlines(keepends=True):
+        # A single line can be longer than a chunk (a one-line JSON
+        # ledger is the real case). Slice it on character boundaries --
+        # never on bytes, which would cut a UTF-8 sequence in half.
+        while len(line) > CHUNK_MAX_BYTES:
+            units.append(line[:CHUNK_MAX_BYTES])
+            line = line[CHUNK_MAX_BYTES:]
+        units.append(line)
+
+    chunks, current, size = [], [], 0
+    for unit in units:
+        current.append(unit)
+        size += len(unit.encode("utf-8"))
+        if size >= CHUNK_MAX_BYTES or (
+            size >= CHUNK_MIN_BYTES and _is_chunk_boundary(unit)
+        ):
+            chunks.append("".join(current))
+            current, size = [], 0
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 class VaultIncompleteDocument(RuntimeError):
     """A file doc references content chunks that are not in the database.
 
@@ -315,24 +373,60 @@ class VaultClient:
             import hashlib
             return f"h:{hashlib.sha256(content_bytes).hexdigest()[:16]}"
 
+    def _existing_chunk_ids(self, chunk_ids):
+        """Which of `chunk_ids` are already in the database.
+
+        One `_all_docs` POST instead of a GET per chunk. A row for a
+        missing id carries `error`; a row for a deleted one carries
+        `value.deleted`, and both have to be rewritten."""
+        keys = sorted(set(chunk_ids))
+        if not keys:
+            return set()
+        # `_all_docs` is not a doc id, but it needs no escaping and going
+        # through _doc keeps every CouchDB call in this class on one seam
+        # the tests can fake -- the module-level _req is guarded against
+        # in tests precisely because the bridge pod resolves the real
+        # vault.
+        status, body = self._doc("POST", "_all_docs", {"keys": keys})
+        if status != 200:
+            return set()
+        return {
+            row["key"] for row in body.get("rows", [])
+            if "error" not in row and not (row.get("value") or {}).get("deleted")
+        }
+
     def _put_raw(self, path, content, existing=None):
         path = path.lower()
         now_ms = int(time.time() * 1000)
         content_bytes = content.encode("utf-8")
-        chunk_id = self._chunk_id_for(content_bytes)
+        chunk_texts = _split_chunks(content)
+        chunk_ids = [self._chunk_id_for(t.encode("utf-8")) for t in chunk_texts]
 
         if existing is None:
             status, found = self.get_doc(path)
             existing = found if status == 200 else None
 
-        chunk_status, existing_chunk = self.get_doc(chunk_id)
-        chunk = {"_id": chunk_id, "data": content, "type": "leaf", "children": []}
-        if chunk_status == 200:
-            chunk["_rev"] = existing_chunk["_rev"]
-        self._doc("PUT", chunk_id, chunk)
+        # Chunks are content-addressed, so one that already exists holds
+        # exactly this text and does not need rewriting -- that reuse is
+        # the entire point of chunking, and it is what stops an append
+        # from leaving a whole extra copy of the file behind.
+        already = self._existing_chunk_ids(chunk_ids)
+        written = set()
+        for chunk_id, text in zip(chunk_ids, chunk_texts):
+            if chunk_id in already or chunk_id in written:
+                continue
+            chunk = {"_id": chunk_id, "data": text, "type": "leaf", "children": []}
+            chunk_status, _ = self._doc("PUT", chunk_id, chunk)
+            if chunk_status not in (200, 201):
+                # Never point a file doc at a chunk that isn't there --
+                # that is the VaultIncompleteDocument failure, and it is
+                # silent on read. Leaving the old revision intact is the
+                # safe outcome.
+                return f"FAILED(chunk {chunk_id}: {chunk_status})"
+            written.add(chunk_id)
 
         doc = {
-            "_id": path, "path": path, "data": "", "children": [chunk_id],
+            "_id": path, "path": path, "data": "", "children": chunk_ids,
             "size": len(content_bytes), "ctime": now_ms, "mtime": now_ms,
             "type": "plain", "eden": {},
         }
