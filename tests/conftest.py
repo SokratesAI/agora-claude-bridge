@@ -29,10 +29,14 @@ from bridge import deadline, quota
 LEAKED_MESSAGE = (
     "this test left {count} background thread(s) still running: {names}. A "
     "thread that outlives the test has also outlived the test's patches, so "
-    "whatever it does next it does against the real usage endpoint, the real "
-    "deadline file and the real clock -- and it does it while some later "
-    "test is running, which is where the blame lands. Either do not start "
-    "the thread (patch whatever starts it) or join it before the test ends."
+    "whatever it does next it does against the references the patches were "
+    "hiding -- the real usage endpoint, the real deadline file, the real "
+    "clock -- and it does it while some later test is running, which is "
+    "where the blame lands. Its exception, if it raises one, goes to "
+    "threading's default excepthook and fails nothing: the quota watcher's "
+    "stray reading did not fail anything either, it just appended to the "
+    "live history file. Either do not start the thread (patch whatever "
+    "starts it) or join it before the test ends."
 )
 
 _threads_at_setup = {}
