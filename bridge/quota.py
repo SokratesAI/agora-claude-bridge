@@ -504,9 +504,17 @@ class QuotaWatcher:
     reports anything other than "allowed" (note_rate_limit_event).
     """
 
-    def __init__(self, path=None, poll_seconds=POLL_SECONDS):
+    def __init__(self, path=None, poll_seconds=POLL_SECONDS, publish_costs=False):
         self._path = path or SNAPSHOT_FILE
         self._poll_seconds = poll_seconds
+        # Off unless the caller says this invocation is a cycle. Every CLI
+        # invocation gets a watcher -- reply turns, probes, the whole test
+        # suite -- and publishing is a full transcript scan plus a ~90KB
+        # vault write, which none of those should be doing. Defaulting it
+        # on is what broke 8 cli tests when this was first attempted: they
+        # start a real watcher against a faked subprocess, so the scan ran
+        # on the live PVC and the publish outlived the test that started it.
+        self._publish_costs = publish_costs
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -584,3 +592,31 @@ class QuotaWatcher:
             refresh(self._path, "end")
         except Exception:
             pass
+        # Then, for a cycle only, republish the cost record into the vault.
+        # After the final reading rather than before it, so the document
+        # carries the boundary row this cycle just wrote instead of missing
+        # it by one poll -- which is the same off-by-one-tick the "end"
+        # reading above exists to fix.
+        #
+        # Imported here rather than at module scope because publish_costs
+        # imports this module: at the top it is a cycle, and the module that
+        # loses the race gets a half-initialised partner. Nothing is waiting
+        # on this thread, so the import cost is paid off the reply's path.
+        #
+        # One honest property of publishing from here, and it is why this
+        # must stay a daemon thread that never raises: the scan plus the
+        # vault round-trip can outrun close()'s 5s join, so the join times
+        # out and this finishes after the turn has already returned.
+        #
+        # What it is *not*: an incomplete reading of the publishing cycle's
+        # own transcript. A reviewer checked the ordering this comment used
+        # to assume and it was wrong -- `proc.wait()` (cli.py) precedes
+        # `watcher.close()`, so the CLI has exited and its transcript is
+        # closed before the scan starts. Every row is settled, including
+        # this cycle's.
+        if self._publish_costs:
+            try:
+                from bridge import publish_costs
+                publish_costs.refresh()
+            except Exception as exc:
+                log(f"quota: cost publish failed: {type(exc).__name__}: {exc}")

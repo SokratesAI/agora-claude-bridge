@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from bridge import publish_costs
 from bridge import quota
 from bridge.hooks import quota_notice
 
@@ -822,3 +823,65 @@ def test_history_row_carries_pace_but_it_never_votes_on_dedup(tmp_path):
     assert later["windows"][0]["pace"] != row["seven_day_pace"]
     assert quota.append_history(later, path=str(path)) is False
     assert len(path.read_text().splitlines()) == 1
+
+
+# --- publishing the cost record on the way out of a cycle ------------------
+#
+# Every CLI invocation gets a watcher, and only some of them are cycles. The
+# gate is what keeps a journal-card reply -- or the test suite -- from
+# scanning every transcript on the PVC and pushing ~90KB to the vault.
+
+
+def test_a_cycle_publishes_the_cost_record_on_the_way_out(tmp_path):
+    """The whole point of arming it: the last thing a cycle does, after its
+    own closing quota reading, is republish the record the site reads. A
+    hand-refreshed snapshot is the failure this replaces -- the file it
+    supersedes sat describing 45 cycles while the loop was on its 107th."""
+    calls = []
+    watcher = quota.QuotaWatcher(path=str(tmp_path / "snap.json"), publish_costs=True)
+
+    with patch.object(publish_costs, "refresh", lambda *a, **k: calls.append(1) or True):
+        _drive_for_real(watcher, 1, LIVE_USAGE_PAYLOAD)
+
+    assert calls == [1]
+
+
+def test_an_ordinary_turn_does_not_publish_anything(tmp_path):
+    """The default, and it must stay the default. cli.py builds a watcher for
+    every invocation -- reply turns, probes, and every test in this suite that
+    exercises stream parsing -- and a scan-plus-vault-write on each of those is
+    both wrong and slow. Arming it by default is exactly what broke 8 cli tests
+    the first time this was attempted."""
+    calls = []
+    watcher = quota.QuotaWatcher(path=str(tmp_path / "snap.json"))
+
+    # Asserted on the attribute as well as the behaviour, because the
+    # behaviour alone pinned nothing: a reviewer pointed out that reverting
+    # this whole change -- no parameter, no publish call anywhere -- leaves
+    # `calls == []` true for the boring reason that nothing publishes at all.
+    # A test whose negative result was guaranteed in advance is not evidence.
+    # This line fails with AttributeError on that revert.
+    assert watcher._publish_costs is False
+
+    with patch.object(publish_costs, "refresh", lambda *a, **k: calls.append(1) or True):
+        _drive_for_real(watcher, 1, LIVE_USAGE_PAYLOAD)
+
+    assert calls == []
+
+
+def test_a_publish_that_raises_still_leaves_the_closing_reading_written(tmp_path):
+    """Best-effort, and the ordering is the reason it can be. The reading is
+    the thing the next cycle reads to size its own work; publishing is a
+    convenience for a chart. So the record goes last and its failure is a log
+    line, never a lost boundary row."""
+    snapshot = str(tmp_path / "quota-snapshot.json")
+    history = str(tmp_path / "quota-history.jsonl")
+
+    def boom(*a, **k):
+        raise RuntimeError("vault unreachable")
+
+    watcher = quota.QuotaWatcher(path=snapshot, publish_costs=True)
+    with patch.object(publish_costs, "refresh", boom):
+        _drive_for_real(watcher, 1, LIVE_USAGE_PAYLOAD)
+
+    assert [r.get("boundary") for r in _rows(history)] == ["start", "end"]

@@ -30,6 +30,7 @@ import threading
 import time
 
 from bridge.activity import ActivityReporter, result_text
+from bridge.analytics import is_cycle_opening
 from bridge import deadline
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
@@ -377,8 +378,12 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     reporter = ActivityReporter(activity)
     reporter.start()
 
-    # Polls remaining quota into a snapshot file the hook above reads.
-    watcher = QuotaWatcher()
+    # Polls remaining quota into a snapshot file the hook above reads, and --
+    # on a cycle, not on a reply turn or a probe -- republishes the cost
+    # record into the vault on the way out. `message` is this invocation's
+    # opening user turn, which is the same string analytics.py classifies a
+    # finished transcript by, so the two agree by construction.
+    watcher = QuotaWatcher(publish_costs=is_cycle_opening(message))
     watcher.start()
 
     # tool_use_id -> tool name, for the `user` branch below. Entries are

@@ -124,12 +124,22 @@ def build_payload(projects_dir=None, history_path=None):
 def publish(payload, vault_path=VAULT_PATH):
     """Write the payload to the vault. True if it landed.
 
-    Shelled out to `vault_tool` rather than imported, which is not the usual
-    preference and is the right call here: that module keeps its whole write
-    path inside `_dispatch`, so there is no `put` to import -- the only public
-    surfaces are `main()` and the command line. Reaching past that into its
-    private request helpers would couple this module to internals that exist
-    in three independently maintained copies of the client.
+    Shelled out to `vault_tool` rather than imported. The reason this
+    docstring gave until Cycle 108 was false and worth replacing rather than
+    deleting: it claimed the module "keeps its whole write path inside
+    `_dispatch`, so there is no `put` to import". There is --
+    `VaultClient.write(path, content)` is public, and a reviewer went and read
+    it. The real reasons are smaller and both survive checking:
+
+    Process isolation. This runs on the watcher's daemon thread on the way
+    out of a cycle. A subprocess cannot take that thread down with an
+    unexpected exception, an import-time failure, or a hung socket that
+    outlives the turn -- it just exits non-zero.
+
+    And importing would not buy the clean return value it looks like it
+    would: `write` returns the *string* "written" or "FAILED(<status>)", so
+    the caller is checking text either way. Given that, the process boundary
+    is free.
 
     `puts <path> -` takes the body on stdin, so the document never touches
     disk. A non-zero exit is a failure to publish, not an exception: see the

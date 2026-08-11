@@ -2137,3 +2137,73 @@ def test_concurrent_turns_do_not_share_their_mcp_config_path(tmp_path):
         _lock_probe(tmp_path, mcp=mcp)
     assert paths[0] != paths[2], "concurrent turn reused the shared path"
     assert paths[2] == shared, "serialized turn changed path"
+
+
+# --- which invocations publish the cost record ----------------------------
+
+# The real strings, copied from agora_runner/heartbeats.py:288-290, not
+# invented. Checked live 2026-08-11 against this loop's own transcript, which
+# analytics classifies `cycle manual` off exactly this text.
+_REAL_MANUAL_TRIGGER = ("[Manual heartbeat trigger — Edvard started this run himself. "
+                        "Address Edvard directly.]")
+_REAL_AUTOMATIC_TRIGGER = "[Automatic heartbeat trigger — address Edvard directly.]"
+
+
+def _watcher_armed_for(message, tmp_path, **kwargs):
+    """Run one turn and report whether its watcher was told to publish."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-new", "subtype": "success"},
+    )
+    made = MagicMock()
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "QuotaWatcher", made), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        cli.run_turn(message, **kwargs)
+    return made.call_args.kwargs["publish_costs"]
+
+
+def test_a_heartbeat_cycle_arms_the_cost_publish(tmp_path):
+    """The end of the chain: a cycle's own invocation is what republishes the
+    record the site charts. Asserted against the runner's literal trigger
+    strings rather than a stand-in, because the whole gate is one prefix match
+    against text written in another repo -- a fixture that says "a cycle" would
+    pass with the markers spelled wrong."""
+    assert _watcher_armed_for(_REAL_MANUAL_TRIGGER, tmp_path) is True
+    assert _watcher_armed_for(_REAL_AUTOMATIC_TRIGGER, tmp_path) is True
+
+
+def test_a_trigger_that_carries_a_message_from_edvard_still_arms_it(tmp_path):
+    """heartbeats.py appends his most recent message to the trigger when one
+    is pending, so the opening turn is routinely longer than the marker. An
+    equality check here would silently stop publishing on exactly the cycles
+    he had spoken to."""
+    carried = _REAL_MANUAL_TRIGGER + " Edvard's most recent message in this conversation: hi"
+    assert _watcher_armed_for(carried, tmp_path) is True
+
+
+def test_a_journal_card_reply_does_not_arm_it(tmp_path):
+    """The turn this gate exists for. A reply is a short, concurrent turn on
+    the same bridge, and publishing from it would scan every transcript on the
+    PVC and push ~90KB to the vault for a two-sentence answer.
+
+    The opening line is the real one, from `nova_replies.build_prompt` in
+    agora-persona-runner. Writing this fixture by hand is what made it fail
+    first time round: the invented version opened "You are Nova", which is a
+    legacy `CYCLE_MARKER` from the pre-heartbeat shape where the constitution
+    arrived as the user turn -- so it armed. The live reply does not, because
+    `SYSTEM` goes to --append-system-prompt and the *message* starts with the
+    entry. The marker stays as wide as it is on purpose: analytics still has
+    to classify those old transcripts, and a second, narrower tuple here is
+    the drift this shares one predicate to avoid. Over-firing costs one
+    idempotent republish; under-firing is the silent staleness being fixed.
+    """
+    reply = ("Here is the journal entry you are answering a comment on -- cycle 107, "
+             "2026-08-11 12:09.\n\n<entry>\n### Cycle 107\n...\n</entry>")
+    assert _watcher_armed_for(reply, tmp_path, allow_concurrent=True) is False
+
+
+def test_an_ordinary_turn_does_not_arm_it(tmp_path):
+    """The default every other caller gets, including this suite."""
+    assert _watcher_armed_for("hello", tmp_path) is False
