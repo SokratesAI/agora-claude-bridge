@@ -661,3 +661,41 @@ def test_put_raw_refuses_to_write_a_file_doc_when_a_chunk_fails(env):
     result = client.write("notes/thing.md", _realistic_capture_file())
     assert result.startswith("FAILED(chunk ")
     assert [c for c in calls if c[0] == "PUT" and c[1] == "notes/thing.md"] == []
+
+
+def test_split_chunks_respects_the_byte_cap_for_multi_byte_text(env):
+    """Reviewer finding, Cycle 117. The oversized-line branch sliced by
+    CHARACTER count against a BYTE budget, so 20,000 emoji on one line
+    produced a 65,536-byte chunk -- four times the cap this chunker claims
+    to enforce. The old fixture was pure ASCII, where the two counts are
+    identical, which is exactly why it stayed green."""
+    content = "\U0001F600" * 20000
+    chunks = vault_tool._split_chunks(content)
+    assert "".join(chunks) == content
+    assert max(len(c.encode("utf-8")) for c in chunks) <= vault_tool.CHUNK_MAX_BYTES
+
+
+def test_a_chunk_write_conflict_is_success_not_failure(env):
+    """Reviewer finding, Cycle 117. Chunk ids are content hashes, so a 409
+    means somebody else stored this exact text first -- the other client,
+    or a reply turn running alongside a cycle. Aborting there throws away
+    a perfectly good write, and does it most often on the common path: if
+    the existence check errors it reports 'nothing exists', every
+    unchanged chunk becomes a blind PUT, and every one of them 409s."""
+    client, calls = _client_with_fake_req({
+        ("POST", "_all_docs"): (500, {"error": "server_error"}),
+    })
+    original_doc = client._doc
+
+    def conflicting(method, doc_id, body=None):
+        if method == "PUT" and doc_id.startswith("h:"):
+            calls.append((method, doc_id, body))
+            return 409, {"error": "conflict"}
+        if method == "PUT":
+            calls.append((method, doc_id, body))
+            return 201, {"ok": True}
+        return original_doc(method, doc_id, body)
+
+    client._doc = conflicting
+    assert client.write("notes/thing.md", _realistic_capture_file()) == "written"
+    assert [c for c in calls if c[1] == "notes/thing.md"], "file doc never written"

@@ -119,6 +119,24 @@ def _is_chunk_boundary(line):
     return (zlib.crc32(line.encode("utf-8")) & CHUNK_BOUNDARY_MASK) == 0
 
 
+def _bytes_prefix(text, limit):
+    """How many characters of `text` fit in `limit` UTF-8 bytes.
+
+    Slicing a long line by character count is wrong: CHUNK_MAX_BYTES is a
+    byte budget, and 20,000 emoji measured 65,536 bytes in a single
+    "chunk" -- four times the cap the chunker claims to enforce. Cutting
+    on a code-point boundary is still required, so this finds the
+    boundary rather than assuming one character is one byte."""
+    lo, hi = 0, min(len(text), limit)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(text[:mid].encode("utf-8")) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return max(lo, 1)
+
+
 def _split_chunks(content):
     """Split `content` into content-defined pieces.
 
@@ -129,11 +147,12 @@ def _split_chunks(content):
     units = []
     for line in content.splitlines(keepends=True):
         # A single line can be longer than a chunk (a one-line JSON
-        # ledger is the real case). Slice it on character boundaries --
-        # never on bytes, which would cut a UTF-8 sequence in half.
-        while len(line) > CHUNK_MAX_BYTES:
-            units.append(line[:CHUNK_MAX_BYTES])
-            line = line[CHUNK_MAX_BYTES:]
+        # ledger is the real case). Cut on a code-point boundary, but
+        # count bytes while doing it -- see _bytes_prefix.
+        while len(line.encode("utf-8")) > CHUNK_MAX_BYTES:
+            cut = _bytes_prefix(line, CHUNK_MAX_BYTES)
+            units.append(line[:cut])
+            line = line[cut:]
         units.append(line)
 
     chunks, current, size = [], [], 0
@@ -449,6 +468,19 @@ class VaultClient:
                 continue
             chunk = {"_id": chunk_id, "data": text, "type": "leaf", "children": []}
             chunk_status, _ = self._doc("PUT", chunk_id, chunk)
+            if chunk_status == 409:
+                # Content-addressed, so a conflict means this exact chunk
+                # was created between the existence check above and this
+                # PUT -- by the other client, or by a reply turn running
+                # alongside a cycle. The id IS the hash of the content, so
+                # whoever won stored exactly this text. That is success.
+                # Treating it as failure aborts a perfectly good write,
+                # and does so most often on the common path: a non-200
+                # from the existence check reports "nothing exists", which
+                # makes every unchanged chunk a blind PUT and every one of
+                # them a 409.
+                written.add(chunk_id)
+                continue
             if chunk_status not in (200, 201):
                 # Never point a file doc at a chunk that isn't there --
                 # that is the VaultIncompleteDocument failure, and it is
