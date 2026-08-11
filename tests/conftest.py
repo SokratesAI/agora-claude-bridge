@@ -19,10 +19,73 @@ session removes the race instead of narrowing it. Tests that stub
 fetch_usage themselves nest inside this one and still win.
 """
 from unittest.mock import patch
+import threading
 
 import pytest
 
 from bridge import deadline, quota
+
+
+LEAKED_MESSAGE = (
+    "this test left {count} background thread(s) still running: {names}. A "
+    "thread that outlives the test has also outlived the test's patches, so "
+    "whatever it does next it does against the references the patches were "
+    "hiding -- the real usage endpoint, the real deadline file, the real "
+    "clock -- and it does it while some later test is running, which is "
+    "where the blame lands. Its exception, if it raises one, goes to "
+    "threading's default excepthook and fails nothing: the quota watcher's "
+    "stray reading did not fail anything either, it just appended to the "
+    "live history file. Either do not start the thread (patch whatever "
+    "starts it) or join it before the test ends."
+)
+
+_threads_at_setup = {}
+
+
+def pytest_runtest_setup(item):
+    # The Thread objects rather than their `ident`s: an ident is the OS
+    # thread id and the OS reuses those, so a leaked thread that happened
+    # to land on a dead one's id would look like it had been here all
+    # along. Holding the object costs nothing -- it does not keep the OS
+    # thread alive, and the entry is dropped again in teardown.
+    _threads_at_setup[item.nodeid] = set(threading.enumerate())
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Fail a test that leaves a thread running behind it.
+
+    This is the general form of the incident the docstring above describes,
+    and it is the check that would have caught it in the cycle that caused
+    it rather than after a live 429. The two session-scoped fixtures are a
+    fix for the two escapes we know about; this one is what notices the
+    next one, because it needs no foresight about which thread or which
+    module.
+
+    The same shape has now cost the runner twice as well -- its reply
+    worker escaped a site test in about one run in three, and its journal
+    refresh thread raced the cache reset -- so this file and
+    `agora-persona-runner/tests/conftest.py` carry the same guard on
+    purpose.
+
+    Checked after the wrapped hook, so fixture finalizers have already run
+    -- a fixture that starts a thread and joins it in teardown is doing the
+    right thing and must not be flagged for it. No grace period, because
+    the bug is the escape and not the duration: a thread still alive once
+    the test and its fixtures are done has already outlived the patches,
+    whether it finishes a millisecond later or not.
+    """
+    result = yield
+    before = _threads_at_setup.pop(item.nodeid, None)
+    if before is None:
+        return result
+    leaked = sorted(
+        t.name for t in threading.enumerate()
+        if t not in before and t.is_alive()
+    )
+    if leaked:
+        pytest.fail(LEAKED_MESSAGE.format(count=len(leaked), names=", ".join(leaked)))
+    return result
 
 
 @pytest.fixture(autouse=True, scope="session")
