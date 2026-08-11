@@ -603,14 +603,17 @@ class QuotaWatcher:
         # loses the race gets a half-initialised partner. Nothing is waiting
         # on this thread, so the import cost is paid off the reply's path.
         #
-        # Two honest properties of publishing from here, both fine and
-        # neither obvious. The scan takes longer than close()'s 5s join, so
-        # the join times out and this finishes after the turn returns --
-        # which is why it must stay a daemon thread and must never raise.
-        # And the publishing cycle's own row is read from a transcript still
-        # being written, so it under-reports its own last few turns; the
-        # next cycle's publish rewrites it complete. Every row but the last
-        # is settled, which is the shape a chart of past cycles wants.
+        # One honest property of publishing from here, and it is why this
+        # must stay a daemon thread that never raises: the scan plus the
+        # vault round-trip can outrun close()'s 5s join, so the join times
+        # out and this finishes after the turn has already returned.
+        #
+        # What it is *not*: an incomplete reading of the publishing cycle's
+        # own transcript. A reviewer checked the ordering this comment used
+        # to assume and it was wrong -- `proc.wait()` (cli.py) precedes
+        # `watcher.close()`, so the CLI has exited and its transcript is
+        # closed before the scan starts. Every row is settled, including
+        # this cycle's.
         if self._publish_costs:
             try:
                 from bridge import publish_costs

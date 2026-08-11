@@ -855,6 +855,14 @@ def test_an_ordinary_turn_does_not_publish_anything(tmp_path):
     calls = []
     watcher = quota.QuotaWatcher(path=str(tmp_path / "snap.json"))
 
+    # Asserted on the attribute as well as the behaviour, because the
+    # behaviour alone pinned nothing: a reviewer pointed out that reverting
+    # this whole change -- no parameter, no publish call anywhere -- leaves
+    # `calls == []` true for the boring reason that nothing publishes at all.
+    # A test whose negative result was guaranteed in advance is not evidence.
+    # This line fails with AttributeError on that revert.
+    assert watcher._publish_costs is False
+
     with patch.object(publish_costs, "refresh", lambda *a, **k: calls.append(1) or True):
         _drive_for_real(watcher, 1, LIVE_USAGE_PAYLOAD)
 
