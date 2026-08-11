@@ -153,15 +153,27 @@ def _first_user_text(record):
     return ""
 
 
+def is_cycle_opening(opening):
+    """True if this opening user message is one of our cycles.
+
+    Public because two callers need the same answer at two different times:
+    this module asks it of a finished transcript, and cli.py asks it of the
+    prompt it is about to send, so that only a cycle publishes its costs on
+    the way out. Two copies of `CYCLE_MARKERS` would drift the first time
+    the runner changed a trigger line, and the failure would be silent --
+    reply turns publishing, or cycles not.
+    """
+    return any((opening or "").startswith(marker) for marker in CYCLE_MARKERS)
+
+
 def _classify(opening):
     """(kind, trigger) for a session, from its first user message."""
-    for marker in CYCLE_MARKERS:
-        if opening.startswith(marker):
-            if opening.startswith("[Manual"):
-                return "cycle", "manual"
-            if opening.startswith("[Automatic"):
-                return "cycle", "automatic"
-            return "cycle", "embedded"
+    if is_cycle_opening(opening):
+        if opening.startswith("[Manual"):
+            return "cycle", "manual"
+        if opening.startswith("[Automatic"):
+            return "cycle", "automatic"
+        return "cycle", "embedded"
     return "other", "none"
 
 
