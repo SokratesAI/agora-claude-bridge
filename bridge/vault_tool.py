@@ -17,7 +17,10 @@ Usage (from Bash inside the bridge pod):
   python3 -m bridge.vault_tool ls     [prefix]
   python3 -m bridge.vault_tool recent [hours] [prefix]   # what changed lately
 
-Env: CDB_BASE, CDB_USER, CDB_PASS, CDB_DB (default "obsidian").
+Env: CDB_BASE, CDB_USER, CDB_PASS, CDB_DB (default "obsidian"),
+CDB_NOVA_DB (unset = one database, exactly as before routing existed;
+set = Nova's own files are read and written there instead -- see
+NOVA_DB_TARGETS below).
 
 All paths are lowercased before use, always (standing vault-wide
 convention -- see CLAUDE.md/memory `feedback-always-use-lowercase-vault-paths`).
@@ -59,6 +62,43 @@ DEFAULT_RECENT_LIMIT = 2000
 # Times shown to a human are Oslo time, not UTC -- Edvard lives there and
 # asked for it directly (evolve/identity.md rule 7).
 LOCAL_TZ = "Europe/Oslo"
+
+# Nova's files live in their own CouchDB database rather than in Edvard's
+# vault (his ask, 2026-08-11: "You have outgrown a poc project that is
+# allowed to use my Vault as a database. Move out and get your own space").
+# The document id in a LiveSync vault IS the lowercased file path, so which
+# database holds a document is a pure function of its path and needs no
+# lookup -- which is what makes one rule in one place possible at all.
+#
+# This is the second copy of a rule agora_runner/vault.py also holds, for
+# the same reason the whole client is duplicated (see the module docstring):
+# this image depends on neither repo. The duplication is the known cost --
+# nothing detects drift between the two, and a routing rule that disagrees
+# between the writer and the reader serves a file out of the wrong store.
+# Keep them identical, or fix them both in the same cycle.
+#
+# `issues.md` and `ideas.md` deliberately stay in `obsidian`. Edvard offered
+# them ("Take all of 'my' files aswell with you if you want"), but they are
+# the two files Obsidian LiveSync may still write, and a second writer that
+# cannot see this rule would silently re-create them in the vault Nova had
+# stopped reading.
+#
+# Folders match by prefix; single files must match EXACTLY. Testing
+# everything with startswith routed `journal-digest.md.bak` -- and any other
+# file merely *beginning* with that name -- into Nova's database, which is a
+# file Edvard owns being answered by the wrong store.
+NOVA_DB_FOLDERS = (
+    "projects/sokrates/projects/agora/nova/",
+)
+NOVA_DB_FILES = (
+    "projects/sokrates/projects/agora/journal-digest.md",
+)
+NOVA_DB_TARGETS = NOVA_DB_FOLDERS + NOVA_DB_FILES
+
+# Stamped onto a fetched doc by file_docs() so a later chunk lookup uses the
+# database the doc was really read from. Private; never written back --
+# _put_raw builds its document from scratch.
+_SRC_DB_KEY = "_nova_src_db"
 
 
 def _local_stamp(mtime_ms):
@@ -204,17 +244,63 @@ class VaultClient:
     def __init__(self):
         self.base = _env("CDB_BASE").rstrip("/")
         self.db = _env("CDB_DB", "obsidian")
+        # Unset means "one database", i.e. exactly the behaviour before
+        # routing existed. The switch is the env var, in both config repos
+        # at once -- flipping one client and not the other is the bug.
+        self.nova_db = _env("CDB_NOVA_DB", "")
         user = _env("CDB_USER")
         pw = _env("CDB_PASS")
         self.auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
 
-    def _doc(self, method, doc_id, body=None):
-        return _req(method, self.base, self.db, self.auth, urllib.parse.quote(doc_id, safe=""), body)
+    def db_for(self, path):
+        """Which database holds `path`. One rule, one place, so the answer
+        cannot drift between the call sites that need it.
 
-    def get_doc(self, doc_id):
-        return self._doc("GET", doc_id)
+        Note this takes a *path*. Chunk ids (`h:...`) are content hashes
+        with no path at all, so they can never be routed by this function
+        -- every chunk lives in the same database as the document that
+        points at it, and the chunk call sites take an explicit `db`
+        argument for exactly that reason. Routing a chunk id through here
+        would silently resolve it to `obsidian` and turn every chunked read
+        of a Nova file into a VaultIncompleteDocument.
+        """
+        if not self.nova_db:
+            return self.db
+        lowered = (path or "").lower()
+        if lowered.startswith(NOVA_DB_FOLDERS) or lowered in NOVA_DB_FILES:
+            return self.nova_db
+        return self.db
 
-    def _fetch_chunks(self, chunk_ids):
+    def dbs_for_prefix(self, prefix):
+        """Every database that could hold a document under `prefix`.
+
+        Three cases, and the middle one is the one worth naming: a prefix
+        wholly inside Nova's folder needs only Nova's database; a prefix
+        that is an *ancestor* of it (`""`, or `projects/`) straddles both
+        and has to query both or a whole-vault listing quietly loses every
+        Nova file; and anything else is Edvard's alone.
+        """
+        if not self.nova_db:
+            return [self.db]
+        lowered = (prefix or "").lower()
+        if lowered.startswith(NOVA_DB_FOLDERS):
+            return [self.nova_db]
+        # Deliberately not `lowered in NOVA_DB_FILES -> [nova]`: as a
+        # *prefix*, a single file's path also matches its own neighbours (a
+        # `.bak` beside it), and those live in Edvard's database. Querying
+        # both is the conservative answer and costs one extra request.
+        if any(t.startswith(lowered) for t in NOVA_DB_TARGETS):
+            return [self.db, self.nova_db]
+        return [self.db]
+
+    def _doc(self, method, doc_id, body=None, db=None):
+        return _req(method, self.base, db or self.db_for(doc_id), self.auth,
+                    urllib.parse.quote(doc_id, safe=""), body)
+
+    def get_doc(self, doc_id, db=None):
+        return self._doc("GET", doc_id, db=db)
+
+    def _fetch_chunks(self, chunk_ids, db):
         """`{chunk_id: data}` for every chunk that exists, in one request.
 
         An id absent from the result is genuinely missing -- that is what
@@ -226,11 +312,12 @@ class VaultClient:
         keys = sorted(set(chunk_ids))
         if not keys:
             return {}
-        status, body = self._doc("POST", "_all_docs", {"keys": keys, "include_docs": True})
+        status, body = self._doc("POST", "_all_docs",
+                                 {"keys": keys, "include_docs": True}, db=db)
         if status != 200:
             out = {}
             for chunk_id in keys:
-                chunk_status, chunk = self.get_doc(chunk_id)
+                chunk_status, chunk = self.get_doc(chunk_id, db=db)
                 if chunk_status == 200:
                     out[chunk_id] = chunk.get("data", "")
             return out
@@ -240,10 +327,18 @@ class VaultClient:
             if "error" not in row and row.get("doc")
         }
 
-    def assemble(self, doc, path=None):
+    def assemble(self, doc, path=None, db=None):
         kids = doc.get("children") or []
         if not kids:
             return doc.get("data", "")
+        # Where the doc actually came FROM, never where db_for predicts it
+        # should be. Those two agree in steady state and disagree during a
+        # migration -- which is exactly when a doc's chunks would be looked
+        # up in a database that does not hold them, and a chunk that is
+        # merely in the other database is indistinguishable from one that
+        # was never written. An intact file would report itself corrupt.
+        db = db or doc.get(_SRC_DB_KEY) or self.db_for(
+            path or doc.get("path") or doc.get("_id"))
         # One request for every chunk, not one per chunk. This reduces a
         # regression that chunked writes (Cycle 117) introduce; it does not
         # erase it, and the honest numbers belong here rather than in a
@@ -253,7 +348,7 @@ class VaultClient:
         # get slower to read -- roughly 9ms to 196ms -- and this recovers
         # about a third of that. The trade is deliberate: the write side
         # was leaving a full dead copy of the file behind on every save.
-        by_id = self._fetch_chunks(kids)
+        by_id = self._fetch_chunks(kids, db)
         parts = []
         missing = []
         for chunk_id in kids:
@@ -271,7 +366,8 @@ class VaultClient:
         return "".join(parts)
 
     def read(self, path):
-        status, doc = self.get_doc(path.lower())
+        db = self.db_for(path.lower())
+        status, doc = self.get_doc(path.lower(), db=db)
         if status != 200:
             return None
         # A LiveSync tombstone keeps its content chunks, so assemble()
@@ -280,7 +376,7 @@ class VaultClient:
         # GitHub snapshot, not from here.
         if doc.get("deleted"):
             return None
-        return self.assemble(doc, path.lower())
+        return self.assemble(doc, path.lower(), db)
 
     def file_docs(self, prefix=""):
         """{doc_id: doc} for every file under `prefix` that still exists.
@@ -332,41 +428,55 @@ class VaultClient:
             "startkey": json.dumps(prefix.lower()),
             "endkey": json.dumps(prefix.lower() + _ID_MAX),
         })
-        status, data = _req("GET", self.base, self.db, self.auth, f"_all_docs?{query}")
-        if status != 200:
-            # An empty folder and a failed sweep used to look identical from
-            # here -- `ls` printed nothing either way, and "that folder is
-            # empty" is a thing a cycle writes down as fact. The batch
-            # failure below has said so since 2026-08-07; this path never
-            # did, and the range gives CouchDB a new way to say no (a
-            # malformed startkey is a 400, where an unrestricted sweep had
-            # nothing to reject).
-            print(f"vault_tool: WARNING listing failed ({status}) for "
-                  f"{prefix!r}; this is not an empty folder", file=sys.stderr)
-            return {}
         prefix = prefix.lower()
-        keys = [
-            row["id"] for row in data.get("rows", [])
-            if not row["id"].startswith(INTERNAL_PREFIXES)
-            and row["id"].lower().startswith(prefix)
-        ]
-        out = {}
-        for i in range(0, len(keys), 500):
-            status, res = _req(
-                "POST", self.base, self.db, self.auth,
-                "_all_docs?include_docs=true", {"keys": keys[i:i + 500]},
-            )
+        # Keyed by database, never flattened: a batch is one POST to one
+        # database, so mixing ids from both into a single list of 500 would
+        # send half of them to a database that has never heard of them and
+        # drop them from the listing without a word.
+        keys_by_db = {}
+        for db in self.dbs_for_prefix(prefix):
+            status, data = _req("GET", self.base, db, self.auth, f"_all_docs?{query}")
             if status != 200:
-                # Silently dropping the batch would make live files vanish
-                # from `ls` with no signal, and "that file does not exist"
-                # is a thing a cycle writes into the journal as fact.
-                print(f"vault_tool: WARNING include_docs batch failed ({status}); "
-                      f"up to 500 file(s) omitted from this listing", file=sys.stderr)
+                # An empty folder and a failed sweep used to look identical
+                # from here -- `ls` printed nothing either way, and "that
+                # folder is empty" is a thing a cycle writes down as fact.
+                # With two databases it is worse than that: one failing
+                # leaves the other's rows in place, so the caller gets a
+                # partial listing that looks entirely healthy. Say which
+                # database, or the warning cannot be acted on.
+                print(f"vault_tool: WARNING listing failed on database {db!r} "
+                      f"({status}) for {prefix!r}; files under that prefix in "
+                      f"that database are missing from this listing -- this is "
+                      f"not an empty folder", file=sys.stderr)
                 continue
-            for row in res.get("rows", []):
-                doc = row.get("doc")
-                if doc and not doc.get("deleted"):
-                    out[row["id"]] = doc
+            keys_by_db[db] = [
+                row["id"] for row in data.get("rows", [])
+                if not row["id"].startswith(INTERNAL_PREFIXES)
+                and row["id"].lower().startswith(prefix)
+            ]
+        out = {}
+        for db, keys in keys_by_db.items():
+            for i in range(0, len(keys), 500):
+                status, res = _req(
+                    "POST", self.base, db, self.auth,
+                    "_all_docs?include_docs=true", {"keys": keys[i:i + 500]},
+                )
+                if status != 200:
+                    # Silently dropping the batch would make live files
+                    # vanish from `ls` with no signal, and "that file does
+                    # not exist" is a thing a cycle writes into the journal
+                    # as fact.
+                    print(f"vault_tool: WARNING include_docs batch failed on "
+                          f"database {db!r} ({status}); up to 500 file(s) "
+                          f"omitted from this listing", file=sys.stderr)
+                    continue
+                for row in res.get("rows", []):
+                    doc = row.get("doc")
+                    if doc and not doc.get("deleted"):
+                        # Which database it really came from, for the chunk
+                        # lookup that follows. See assemble().
+                        doc[_SRC_DB_KEY] = db
+                        out[row["id"]] = doc
         return out
 
     def list(self, prefix=""):
@@ -403,26 +513,39 @@ class VaultClient:
         read it. Rows come back as `(mtime_ms, path, deleted)`.
         """
         since_ms = int((time.time() - hours * 3600) * 1000)
-        status, data = _req(
-            "POST", self.base, self.db, self.auth, "_find",
-            {"selector": {"mtime": {"$gt": since_ms}},
-             "fields": ["_id", "mtime", "deleted"], "limit": limit},
-        )
-        if status != 200:
-            raise SystemExit(f"vault_tool: _find failed ({status}): {data}")
-        docs = data.get("docs", [])
         prefix = prefix.lower()
         out = []
-        for doc in docs:
-            path = doc["_id"]
-            if path.startswith(INTERNAL_PREFIXES):
-                continue
-            if not path.lower().startswith(prefix):
-                continue
-            if path.lower().startswith(BACKUP_PREFIX) and not prefix.startswith(BACKUP_PREFIX):
-                continue
-            out.append((doc.get("mtime", 0), path, bool(doc.get("deleted"))))
-        return sorted(out, reverse=True), len(docs) >= limit
+        truncated = False
+        # Once Nova's files live in their own database, "what changed
+        # lately" that only asks Edvard's database answers with his edits
+        # and none of Nova's -- and this is the command every cycle opens
+        # with, precisely to notice what it does not already know about. A
+        # failure is raised rather than warned: a silently short answer
+        # here is read as "nothing changed", which is a conclusion, not a
+        # gap.
+        for db in self.dbs_for_prefix(prefix):
+            status, data = _req(
+                "POST", self.base, db, self.auth, "_find",
+                {"selector": {"mtime": {"$gt": since_ms}},
+                 "fields": ["_id", "mtime", "deleted"], "limit": limit},
+            )
+            if status != 200:
+                raise SystemExit(
+                    f"vault_tool: _find failed on database {db!r} ({status}): {data}")
+            docs = data.get("docs", [])
+            # `limit` is applied by CouchDB per query, so each database can
+            # truncate independently and either one poisons the whole list.
+            truncated = truncated or len(docs) >= limit
+            for doc in docs:
+                path = doc["_id"]
+                if path.startswith(INTERNAL_PREFIXES):
+                    continue
+                if not path.lower().startswith(prefix):
+                    continue
+                if path.lower().startswith(BACKUP_PREFIX) and not prefix.startswith(BACKUP_PREFIX):
+                    continue
+                out.append((doc.get("mtime", 0), path, bool(doc.get("deleted"))))
+        return sorted(out, reverse=True), truncated
 
     def _chunk_id_for(self, content_bytes):
         try:
@@ -432,8 +555,15 @@ class VaultClient:
             import hashlib
             return f"h:{hashlib.sha256(content_bytes).hexdigest()[:16]}"
 
-    def _existing_chunk_ids(self, chunk_ids):
-        """Which of `chunk_ids` are already in the database.
+    def _existing_chunk_ids(self, chunk_ids, db):
+        """Which of `chunk_ids` are already in database `db`.
+
+        `db` is required rather than derived: a chunk id is a content hash
+        with no path, so there is nothing to derive it from, and defaulting
+        would silently ask Edvard's database whether Nova's chunks exist.
+        The answer would be "no" for every one of them, which is merely
+        wasteful on write -- but the same mistake on read is a file that
+        comes back empty.
 
         One `_all_docs` POST instead of a GET per chunk. A row for a
         missing id carries `error`; a row for a deleted one carries
@@ -446,7 +576,7 @@ class VaultClient:
         # the tests can fake -- the module-level _req is guarded against
         # in tests precisely because the bridge pod resolves the real
         # vault.
-        status, body = self._doc("POST", "_all_docs", {"keys": keys})
+        status, body = self._doc("POST", "_all_docs", {"keys": keys}, db=db)
         if status != 200:
             return set()
         return {
@@ -456,26 +586,30 @@ class VaultClient:
 
     def _put_raw(self, path, content, existing=None):
         path = path.lower()
+        # One lookup, reused for the chunks and the file doc, so a chunk
+        # can never be written to a different database than the doc that
+        # will point at it.
+        db = self.db_for(path)
         now_ms = int(time.time() * 1000)
         content_bytes = content.encode("utf-8")
         chunk_texts = _split_chunks(content)
         chunk_ids = [self._chunk_id_for(t.encode("utf-8")) for t in chunk_texts]
 
         if existing is None:
-            status, found = self.get_doc(path)
+            status, found = self.get_doc(path, db=db)
             existing = found if status == 200 else None
 
         # Chunks are content-addressed, so one that already exists holds
         # exactly this text and does not need rewriting -- that reuse is
         # the entire point of chunking, and it is what stops an append
         # from leaving a whole extra copy of the file behind.
-        already = self._existing_chunk_ids(chunk_ids)
+        already = self._existing_chunk_ids(chunk_ids, db)
         written = set()
         for chunk_id, text in zip(chunk_ids, chunk_texts):
             if chunk_id in already or chunk_id in written:
                 continue
             chunk = {"_id": chunk_id, "data": text, "type": "leaf", "children": []}
-            chunk_status, _ = self._doc("PUT", chunk_id, chunk)
+            chunk_status, _ = self._doc("PUT", chunk_id, chunk, db=db)
             if chunk_status == 409:
                 # Content-addressed, so a conflict means this exact chunk
                 # was created between the existence check above and this
@@ -505,14 +639,14 @@ class VaultClient:
         if existing is not None:
             doc["_rev"] = existing["_rev"]
             doc["ctime"] = existing.get("ctime", now_ms)
-        status, _ = self._doc("PUT", path, doc)
+        status, _ = self._doc("PUT", path, doc, db=db)
         return "written" if status in (200, 201) else f"FAILED({status})"
 
     def write(self, path, content):
         """Overwrite (or create) a file. Previous content is not copied
         anywhere first -- the daily GitHub snapshot is the recovery
         path (see module docstring)."""
-        status, existing = self.get_doc(path.lower())
+        status, existing = self.get_doc(path.lower(), db=self.db_for(path.lower()))
         return self._put_raw(path, content, existing if status == 200 else None)
 
     def append(self, path, content, after_marker=""):
@@ -540,13 +674,14 @@ class VaultClient:
 
     def delete(self, path):
         path = path.lower()
-        status, existing = self.get_doc(path)
+        db = self.db_for(path)
+        status, existing = self.get_doc(path, db=db)
         if status == 404:
             return "absent"
         if status != 200:
             return f"FAILED_GET({status})"
         status, _ = _req(
-            "DELETE", self.base, self.db, self.auth,
+            "DELETE", self.base, db, self.auth,
             f"{urllib.parse.quote(path, safe='')}?rev={existing['_rev']}",
         )
         return "deleted" if status in (200, 202) else f"FAILED({status})"

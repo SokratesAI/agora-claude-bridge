@@ -34,7 +34,7 @@ def _client_with_fake_req(responses):
     client = vault_tool.VaultClient()
     calls = []
 
-    def fake_doc(method, doc_id, body=None):
+    def fake_doc(method, doc_id, body=None, db=None):
         calls.append((method, doc_id, body))
         return responses.get((method, doc_id), (404, {"error": "not_found"}))
 
@@ -626,7 +626,7 @@ def test_append_rewrites_only_the_changed_chunks(env):
     client = vault_tool.VaultClient()
     calls = []
 
-    def fake_doc(method, doc_id, body=None):
+    def fake_doc(method, doc_id, body=None, db=None):
         calls.append((method, doc_id, body))
         if (method, doc_id) in responses:
             return responses[(method, doc_id)]
@@ -687,7 +687,7 @@ def test_a_chunk_write_conflict_is_success_not_failure(env):
     })
     original_doc = client._doc
 
-    def conflicting(method, doc_id, body=None):
+    def conflicting(method, doc_id, body=None, db=None):
         if method == "PUT" and doc_id.startswith("h:"):
             calls.append((method, doc_id, body))
             return 409, {"error": "conflict"}
