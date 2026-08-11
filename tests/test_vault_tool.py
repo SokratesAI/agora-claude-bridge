@@ -497,16 +497,34 @@ def test_the_spliced_text_never_escapes_as_a_value(env):
         client.read("note.md")
 
 
-def test_assemble_fetches_each_chunk_once(env):
-    """It used to call get_doc twice per chunk -- once for the status, once
-    for the data -- so the real 184-chunk file cost 368 round trips."""
+def test_assemble_fetches_all_chunks_in_one_request(env):
+    """It used to call get_doc twice per chunk, then once per chunk. Chunked
+    writes (Cycle 117) turned a 134KB file from 1 chunk into 16, and 16
+    sequential GETs measured 343ms against 22ms on the live vault -- a cost
+    the site pays on every page load."""
+    client, calls = _client_with_fake_req({
+        ("GET", "note.md"): (200, {"children": ["h:1", "h:2"]}),
+        ("POST", "_all_docs"): (200, {"rows": [
+            {"key": "h:1", "id": "h:1", "doc": {"data": "a"}},
+            {"key": "h:2", "id": "h:2", "doc": {"data": "b"}},
+        ]}),
+    })
+    assert client.read("note.md") == "ab"
+    assert [c[1] for c in calls] == ["note.md", "_all_docs"]
+
+
+def test_assemble_falls_back_to_per_chunk_gets_when_the_bulk_read_fails(env):
+    """An empty map out of a failed bulk read would look exactly like every
+    chunk being missing, i.e. it would report every file in the vault as
+    corrupt. Absence has to mean absence."""
     client, calls = _client_with_fake_req({
         ("GET", "note.md"): (200, {"children": ["h:1", "h:2"]}),
         ("GET", "h:1"): (200, {"data": "a"}),
         ("GET", "h:2"): (200, {"data": "b"}),
+        # ("POST", "_all_docs") falls through to the 404 default
     })
     assert client.read("note.md") == "ab"
-    assert [c[1] for c in calls] == ["note.md", "h:1", "h:2"]
+    assert [c[1] for c in calls] == ["note.md", "_all_docs", "h:1", "h:2"]
 
 
 def test_main_get_reports_an_incomplete_document_on_stderr_and_exits_nonzero(env, capsys):
@@ -599,8 +617,10 @@ def test_append_rewrites_only_the_changed_chunks(env):
     for cid, text in zip(chunk_ids, vault_tool._split_chunks(original)):
         responses[("GET", cid)] = (200, {"data": text})
     # Every existing chunk is already in the database.
+    chunk_data = dict(zip(chunk_ids, vault_tool._split_chunks(original)))
     responses[("POST", "_all_docs")] = (200, {
-        "rows": [{"key": cid, "id": cid, "value": {"rev": "1-x"}}
+        "rows": [{"key": cid, "id": cid, "value": {"rev": "1-x"},
+                  "doc": {"data": chunk_data[cid]}}
                  for cid in sorted(set(chunk_ids))]
     })
     client = vault_tool.VaultClient()
