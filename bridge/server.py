@@ -239,9 +239,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             try:
                 from bridge.vault_tool import VaultClient
                 health = VaultClient().database_health()
-            except Exception as e:
+            except (Exception, SystemExit) as e:
                 # A client that cannot even be constructed (CDB_BASE unset)
                 # is a real, reportable answer, not a stack trace.
+                #
+                # `SystemExit` is named explicitly and is the whole reason
+                # this is not a plain `except Exception`: _env() raises
+                # SystemExit for a missing variable, and SystemExit derives
+                # from BaseException, so `except Exception` does not catch
+                # it. Uncaught here it unwinds the request thread without
+                # ever calling _send, and the caller gets a dropped
+                # connection with no status at all -- strictly worse than
+                # the 503 this block exists to produce, and during exactly
+                # the migration window this endpoint was built for. Still
+                # not a bare `except BaseException`: KeyboardInterrupt must
+                # keep propagating.
                 self._send(503, {"error": str(e)[:300], "ok": False})
                 return
             unreachable = [

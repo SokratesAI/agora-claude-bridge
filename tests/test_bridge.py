@@ -2268,11 +2268,24 @@ def test_health_database_is_503_when_a_database_is_unreachable():
 
 
 def test_health_database_reports_an_unconstructable_client_rather_than_raising():
+    """The real failure mode, not a stand-in for it.
+
+    This test used to inject `RuntimeError`, which `except Exception`
+    catches -- so it was green whether or not the handler dealt with what
+    `VaultClient()` actually raises. `_env()` raises **SystemExit** for a
+    missing variable, and SystemExit derives from BaseException, so the
+    original `except Exception` did not catch it: the request thread
+    unwound without calling _send and the caller got a dropped connection
+    with no status. So no fake client here -- the real one is constructed
+    with the variable genuinely absent.
+    """
+    import os
     handler, sent = _make_handler({}, path="/health/database")
-    with _patch_client(exc=RuntimeError("CDB_BASE is unset")):
+    with patch.dict(os.environ):
+        os.environ.pop("CDB_BASE", None)
         handler.do_GET()
-    assert sent["status"] == 503
-    assert "CDB_BASE is unset" in sent["payload"]["error"]
+    assert sent["status"] == 503, "a missing env var must be reported, not raised"
+    assert "CDB_BASE" in sent["payload"]["error"]
 
 
 def test_readiness_health_stays_green_when_couchdb_is_unreachable():
