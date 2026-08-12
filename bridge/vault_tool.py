@@ -759,6 +759,34 @@ class VaultClient:
         return self.write(path, existing_content + sep + content.strip("\n") + "\n")
 
     def delete(self, path):
+        """Tombstone the document the way Obsidian does, instead of
+        removing it from CouchDB.
+
+        These are two different operations and only one of them syncs.
+        A CouchDB `DELETE` throws the document away; LiveSync peers poll
+        the changes feed for *documents*, so a phone that already holds
+        the note is never told anything and keeps its local copy
+        forever. Obsidian's own delete instead keeps the document and
+        sets a `deleted` field inside it -- that edit is a new revision,
+        peers see it, and they drop their copy.
+
+        Every agent delete this platform has done used the first one.
+        Edvard reported the symptom twice (comments.md 2026-08-12: "my
+        Vault did sync multiple times and i still have the old deleted
+        files on my phone... I have had this issue before, as in an
+        agent deleted a file in couchdb but i still have it on my
+        phone"), and Cycle 129 hand-repaired the 167 paths the
+        migration had removed this way. This is that repair moved into
+        the code path, so the next delete anywhere does not reproduce
+        it.
+
+        Measured on the live `obsidian` database 2026-08-12: of 283
+        tombstones Obsidian itself wrote, 282 keep their `children` and
+        `size` intact -- the flag is the entire signal, so nothing else
+        is touched here. `mtime` is bumped because it is what decides a
+        conflict against a peer's local copy, and `read`/`file_docs`
+        already treat the flag as gone.
+        """
         path = path.lower()
         db = self.db_for(path)
         status, existing = self.get_doc(path, db=db)
@@ -766,11 +794,15 @@ class VaultClient:
             return "absent"
         if status != 200:
             return f"FAILED_GET({status})"
-        status, _ = _req(
-            "DELETE", self.base, db, self.auth,
-            f"{urllib.parse.quote(path, safe='')}?rev={existing['_rev']}",
-        )
-        return "deleted" if status in (200, 202) else f"FAILED({status})"
+        if existing.get("deleted"):
+            # Already a tombstone. Re-flagging it would burn a revision
+            # and republish a deletion peers have long since applied.
+            return "absent"
+        doc = dict(existing)
+        doc["deleted"] = True
+        doc["mtime"] = int(time.time() * 1000)
+        status, _ = self._doc("PUT", path, doc, db=db)
+        return "deleted" if status in (200, 201) else f"FAILED({status})"
 
 
 def main(argv=None):

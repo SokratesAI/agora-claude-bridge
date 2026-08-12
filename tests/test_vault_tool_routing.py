@@ -150,9 +150,8 @@ class TestChunksFollowTheirDocument:
     def test_deleting_a_nova_file_deletes_it_from_nova(self, env):
         client, calls = _recording_client({
             ("GET", "nova", NOVA_FILE): (200, {"_id": NOVA_FILE, "_rev": "1-x"}),
-            ("DELETE", "nova", f"{NOVA_FILE.replace(':', '%3A')}?rev=1-x"): (200, {}),
+            ("PUT", "nova", NOVA_FILE): (200, {}),
         })
-        # The quoted path is awkward to predict, so assert on the database.
         client.delete(NOVA_FILE)
         assert all(db == "nova" for _, db, _ in calls), calls
 
