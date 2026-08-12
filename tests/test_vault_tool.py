@@ -85,19 +85,73 @@ def test_delete_does_not_copy_content_into_the_vault(env):
     """Deleting made a backup copy too -- which meant deleting the
     backups folder itself created new backups of it."""
     client, calls = _client_with_fake_req({
-        ("GET", "doomed.md"): (200, {"data": "content", "children": [], "_rev": "1-abc"}),
+        ("GET", "doomed.md"): (200, {"_id": "doomed.md", "data": "content",
+                                     "children": [], "_rev": "1-abc"}),
+        ("PUT", "doomed.md"): (200, {"ok": True}),
     })
-    sent = []
+    assert client.delete("doomed.md") == "deleted"
 
-    def fake_req(method, base, db, auth, path, body=None):
-        sent.append((method, path))
-        return 200, {"ok": True}
+    put_calls = [c for c in calls if c[0] == "PUT"]
+    # The tombstone below is a PUT to the doc's own id; what must not
+    # happen is a second copy of the content appearing anywhere else.
+    assert [c for c in put_calls if c[1] != "doomed.md"] == []
 
-    with patch.object(vault_tool, "_req", fake_req):
-        assert client.delete("doomed.md") == "deleted"
 
+# Obsidian and CouchDB disagree about what "delete" means, and only one of
+# the two syncs. CouchDB's DELETE throws the document away; LiveSync peers
+# watch the changes feed for documents, so a phone holding the note is never
+# told and keeps its copy forever. Obsidian instead keeps the document and
+# sets a `deleted` field -- a new revision peers actually see.
+#
+# Every agent delete this platform ever did used CouchDB's. Edvard reported
+# it twice (comments.md 2026-08-12: "an agent deleted a file in couchdb but
+# i still have it on my phone"), Cycle 129 hand-repaired the 167 paths the
+# migration removed, and the code path itself stayed broken until Cycle 131.
+def test_delete_writes_a_livesync_tombstone_rather_than_removing_the_doc(env):
+    # Every field `_put_raw` actually writes, so "nothing else is
+    # rewritten" is tested against a real document rather than against a
+    # fixture that omits the fields it would have damaged.
+    client, calls = _client_with_fake_req({
+        ("GET", "doomed.md"): (200, {"_id": "doomed.md", "path": "doomed.md",
+                                     "data": "", "children": ["h:1"], "size": 9,
+                                     "ctime": 111, "mtime": 222,
+                                     "type": "plain", "eden": {}, "_rev": "1-abc"}),
+        ("PUT", "doomed.md"): (200, {"ok": True}),
+    })
+    # No _req patch: a real CouchDB DELETE goes through the module-level
+    # _req, which `env` turns into an AssertionError. If this test starts
+    # failing that way, the tombstone has regressed into a hard delete.
+    assert client.delete("doomed.md") == "deleted"
+
+    put = [c for c in calls if c[0] == "PUT"][-1][2]
+    assert put["deleted"] is True
+    assert put["_rev"] == "1-abc", "must edit the existing doc, not replace it"
+    # Measured on the live obsidian database 2026-08-12: 282 of 283
+    # tombstones Obsidian wrote itself keep children and size intact.
+    assert put["children"] == ["h:1"] and put["size"] == 9
+    assert put["ctime"] == 111
+    # A tombstone Obsidian would not recognise is one that arrives with
+    # its type or its path rewritten, so pin the untouched half too.
+    assert put["type"] == "plain" and put["eden"] == {}
+    assert put["path"] == "doomed.md" and put["data"] == ""
+    # Obsidian's own deletions bump mtime; that much is measured. That it
+    # is specifically what settles a conflict against a peer's stale copy
+    # is inference, so this pins the behaviour and not the explanation.
+    assert put["mtime"] > 222
+
+
+def test_delete_of_an_already_tombstoned_file_is_a_no_op(env):
+    """Re-flagging burns a revision and republishes a deletion every peer
+    applied long ago. `read` already reports these as gone, so `delete`
+    agreeing with it is what keeps the two consistent. The answer is
+    deliberately not "absent" -- "nothing was ever here" and "this was
+    already correctly deleted" are different answers, and the return
+    string is all the caller gets."""
+    client, calls = _client_with_fake_req({
+        ("GET", "gone.md"): (200, {"_id": "gone.md", "deleted": True, "_rev": "2-x"}),
+    })
+    assert client.delete("gone.md") == "already deleted"
     assert [c for c in calls if c[0] == "PUT"] == []
-    assert [m for m, _ in sent] == ["DELETE"]
 
 
 def test_append_fails_when_file_does_not_exist(env):

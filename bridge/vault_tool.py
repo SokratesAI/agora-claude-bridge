@@ -759,6 +759,47 @@ class VaultClient:
         return self.write(path, existing_content + sep + content.strip("\n") + "\n")
 
     def delete(self, path):
+        """Tombstone the document the way Obsidian does, instead of
+        removing it from CouchDB.
+
+        These are two different operations and only one of them syncs.
+        A CouchDB `DELETE` throws the document away; LiveSync peers poll
+        the changes feed for *documents*, so a phone that already holds
+        the note is never told anything and keeps its local copy
+        forever. Obsidian's own delete instead keeps the document and
+        sets a `deleted` field inside it -- that edit is a new revision,
+        peers see it, and they drop their copy.
+
+        Every agent delete this platform has done used the first one.
+        Edvard reported the symptom twice (comments.md 2026-08-12: "my
+        Vault did sync multiple times and i still have the old deleted
+        files on my phone... I have had this issue before, as in an
+        agent deleted a file in couchdb but i still have it on my
+        phone"), and Cycle 129 hand-repaired the 167 paths the
+        migration had removed this way. This is that repair moved into
+        the code path, so the next delete anywhere does not reproduce
+        it.
+
+        Measured on the live `obsidian` database 2026-08-12: of 283
+        tombstones Obsidian itself wrote, 282 keep their `children` and
+        `size` intact (the exception is an empty note that never had
+        content). So the flag is the signal and nothing else is
+        rewritten; `read`/`file_docs` already treat it as gone. `mtime`
+        is bumped to match what Obsidian's own deletions do -- that much
+        is measured. That it is specifically what settles a conflict
+        against a peer's stale copy is inference from the plugin's
+        behaviour, not something measured here.
+
+        **The cost, so nobody thinks it was overlooked:** a tombstone
+        keeps the file's text in CouchDB indefinitely, where a hard
+        DELETE eventually became reclaimable by compaction. That is
+        unavoidable -- dropping the content is what stopped the deletion
+        syncing in the first place -- but it means deleted text stays
+        readable to anyone with database access, and the tombstone
+        fraction (309 of 897 documents when `file_docs` last measured
+        it) only ever grows. Reclaiming it belongs to the orphan-chunk
+        and compaction work, not here.
+        """
         path = path.lower()
         db = self.db_for(path)
         status, existing = self.get_doc(path, db=db)
@@ -766,11 +807,18 @@ class VaultClient:
             return "absent"
         if status != 200:
             return f"FAILED_GET({status})"
-        status, _ = _req(
-            "DELETE", self.base, db, self.auth,
-            f"{urllib.parse.quote(path, safe='')}?rev={existing['_rev']}",
-        )
-        return "deleted" if status in (200, 202) else f"FAILED({status})"
+        if existing.get("deleted"):
+            # Already a tombstone. Re-flagging it would burn a revision
+            # and republish a deletion peers have long since applied.
+            # Distinct from "absent" on purpose: "there was nothing
+            # here" and "this was already correctly deleted" are
+            # different answers, and the caller only gets this string.
+            return "already deleted"
+        doc = dict(existing)
+        doc["deleted"] = True
+        doc["mtime"] = int(time.time() * 1000)
+        status, _ = self._doc("PUT", path, doc, db=db)
+        return "deleted" if status in (200, 201) else f"FAILED({status})"
 
 
 def main(argv=None):
