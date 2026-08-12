@@ -396,9 +396,11 @@ def test_a_successful_write_still_exits_zero(couch, tmp_path, capsys):
     assert _cli(["append", PATH, str(body), "## Entries"], capsys)[0] == 0
 
 
-def test_an_option_is_not_mistaken_for_a_marker_or_a_path(couch, tmp_path, capsys):
+def test_an_option_is_not_mistaken_for_a_path(couch, tmp_path, capsys):
     """`--rev-file` is pulled out before the positionals are read, so the
-    path is still argv[1] and a marker beginning with `-` still works."""
+    path is still argv[1] wherever the option was written. `append` and
+    `appends` take no options, so their markers -- which may begin with
+    `-` -- never reach this parser at all."""
     couch.seed(couch.client, PATH, "# Issues\n\n## Entries\n\n- old\n")
     rev_file = tmp_path / "d.rev"
     code, out, _err = _cli(["get", "--rev-file", str(rev_file), PATH], capsys)
