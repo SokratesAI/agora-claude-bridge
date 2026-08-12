@@ -10,12 +10,32 @@ on:
 # succession otherwise run their pipelines in parallel and the LAST one to
 # finish wins -- which is not the same as the newest commit.
 #
-# Measured 2026-08-12: bridge #41 and #40 merged four seconds apart. #40 was
-# the newer commit, but #41's build pushed its digest one second later and
-# overwrote it, pinning the config repo to the commit *before* the endpoint
-# #40 had just added. Every check was green -- CI passed on both, the image
-# built, ArgoCD synced happily -- and the deployed pod silently served a 404
-# for a feature that was merged in main. Nothing anywhere reported an error.
+# Measured 2026-08-12 in this repo. #41 merged at 00:18:38Z and #40 at
+# 00:18:41Z -- three seconds apart, with #40 the newer of the two and
+# carrying #41's commit 4ee2ff7 as its parent. Two pipelines therefore ran
+# concurrently. agora-claude-bridge-config took exactly one commit out of
+# that window, 63af6e3 at 00:20:39Z, pinning the deployment to
+# sha256:dd38617... -- and the pod that came up served a 404 for
+# /health/database, the endpoint #40 had just added. So the deployed image
+# did not contain the newer of the two merges. Every check was green: CI
+# passed on both, both images built, ArgoCD synced, nothing reported an
+# error anywhere.
+#
+# Deliberately NOT claimed, because two primary sources disagree and this
+# comment is not the place to pick a winner:
+#   - which commit's build produced sha256:dd38617. The registry tags say
+#     sha-4ee2ff7 -> dd38617 and sha-f36df04 -> 49201d4
+#     (gh api /orgs/SokratesAI/packages/container/agora-claude-bridge/versions),
+#     but the build-push job logs of BOTH runs 31549742746 and 31549746111
+#     report Digest dd38617 despite different ImageIDs, which cannot be
+#     right either. Unresolved; see the note in nova/resources/issues.md.
+#   - which build *finished* first. An earlier draft of this comment said
+#     #41's pushed "one second later". Nobody ever measured that -- it was a
+#     plausible number that became a fact by being written down and copied
+#     into four repositories, which is what this edit exists to undo.
+#
+# None of that ambiguity touches the fix: two unserialised pipelines both
+# blind-`sed` the same manifest, and only one commit landed.
 #
 # cancel-in-progress stays false deliberately: killing a run partway through
 # update-manifest is the exact failure this is meant to prevent. Queued runs
