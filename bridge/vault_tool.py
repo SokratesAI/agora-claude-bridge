@@ -8,14 +8,30 @@ copy rather than an import because this image has no dependency on
 either of those repos and shouldn't grow one just for this.
 
 Usage (from Bash inside the bridge pod):
-  python3 -m bridge.vault_tool get    <path>
-  python3 -m bridge.vault_tool put    <path> <local_file>
+  python3 -m bridge.vault_tool get    <path> [--rev-file <f>]
+  python3 -m bridge.vault_tool put    <path> <local_file> [--if-rev-file <f>]
   python3 -m bridge.vault_tool puts   <path> -              # content from stdin
   python3 -m bridge.vault_tool append <path> <local_file> [after_marker]
   python3 -m bridge.vault_tool appends <path> [after_marker]    # content from stdin
   python3 -m bridge.vault_tool delete <path>
   python3 -m bridge.vault_tool ls     [prefix]
   python3 -m bridge.vault_tool recent [hours] [prefix]   # what changed lately
+
+Read-modify-write from the shell is two commands with a gap in between,
+and until 2026-08-12 that gap was a silent clobber: whoever wrote during
+it was adopted and overwritten. `get --rev-file f` records the revision
+the read was served at; `put --if-rev-file f` sends it, and CouchDB
+refuses the write with a 409 if anything moved. Pair them on anything
+another writer touches -- `journal-digest.md` above all, which this loop
+rewrites whole every hour by instruction:
+
+  vault_tool get 'a/digest.md' --rev-file /tmp/digest.rev > live.md
+  ...edit live.md...
+  vault_tool put 'a/digest.md' live.md --if-rev-file /tmp/digest.rev
+
+Writes exit non-zero when they fail, and specifically 3 on a conflict, so
+a shell sequence stops instead of continuing as though it had written.
+Unpaired `put` stays unconditional, which is what a new file wants.
 
 Env: CDB_BASE, CDB_USER, CDB_PASS, CDB_DB (default "obsidian"),
 CDB_NOVA_DB (unset = one database, exactly as before routing existed;
@@ -927,6 +943,85 @@ class VaultClient:
         return "deleted" if status in (200, 201) else f"FAILED({status})"
 
 
+#: Written into a `--rev-file` when the path holds no document, and read
+#: back by `--if-rev-file` as `if_rev=None` -- "there should still be
+#: nothing here". Spelled out rather than left as an empty file, because an
+#: empty file is indistinguishable from a `get` that never ran or died
+#: halfway, and those must not be read as an expectation.
+ABSENT_REV = "[absent]"
+
+#: Exit code for a write that lost a conflict. Separate from 1 because it
+#: is the one failure where retrying is right: re-read, re-apply, re-write.
+CONFLICT_EXIT = 3
+
+
+class VaultUsage(Exception):
+    """Bad arguments. Reported on stderr, nothing written."""
+
+
+def _take_option(argv, name):
+    """Pull `--name VALUE` out of `argv`, returning `(value, remaining)`.
+
+    Hand-rolled to match the hand-rolled positional dispatch below rather
+    than converting the whole CLI to argparse -- every existing caller of
+    this tool is a shell line in a vault document or in `prompt.md`, and a
+    parser that starts rejecting `appends <path> -` or treating a marker
+    beginning with `-` as a flag would break them silently.
+    """
+    if name not in argv:
+        return None, argv
+    i = argv.index(name)
+    if i + 1 >= len(argv):
+        raise VaultUsage(f"{name} needs a filename")
+    return argv[i + 1], argv[:i] + argv[i + 2:]
+
+
+def _expected_rev(rev_file):
+    """The revision a conditional write must match, from `get --rev-file`.
+
+    A missing or empty file is an error, not a fallback to an
+    unconditional write. The caller asked for a conditional write and
+    cannot have one; quietly downgrading it to a clobber is the exact
+    failure the option exists to stop, and it would fail that way only
+    when something had already gone wrong.
+    """
+    p = Path(rev_file)
+    text = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+    if not text:
+        raise VaultUsage(
+            f"--if-rev-file {rev_file}: {'empty' if p.exists() else 'no such file'}"
+            f" -- run `get <path> --rev-file {rev_file}` first. Refusing to fall"
+            f" back to an unconditional write."
+        )
+    return None if text == ABSENT_REV else text
+
+
+def _conditional_write(client, path, content, if_rev_file):
+    """`client.write`, conditional only if the caller paired it with a rev.
+
+    No `--if-rev-file` means the unconditional write every caller of this
+    CLI got before today, and that stays the default on purpose: creating a
+    file nobody has read yet is the common case, and requiring a paired
+    `get` for it would make the safe form the annoying one.
+    """
+    if if_rev_file is None:
+        return client.write(path, content)
+    return client.write(path, content, if_rev=_expected_rev(if_rev_file))
+
+
+def _write_exit(result):
+    """Exit code for a write result string.
+
+    A failed write used to exit 0 -- it printed `FAILED(...)` and left the
+    caller's own instructions saying "read the output". A shell sequence
+    does not read output; `prompt.md` step 7 chains four vault writes with
+    `&&`-less newlines and an unnoticed failure there loses a journal entry.
+    """
+    if result == "written":
+        return 0
+    return CONFLICT_EXIT if "409 conflict" in result else 1
+
+
 def main(argv=None):
     # An incomplete document is a read failure, not a result. It exits
     # non-zero and prints to stderr so a caller that pipes `get` into a
@@ -936,6 +1031,9 @@ def main(argv=None):
         return _dispatch(argv)
     except VaultIncompleteDocument as e:
         print(f"[INCOMPLETE DOCUMENT] {e}", file=sys.stderr)
+        return 1
+    except VaultUsage as e:
+        print(f"[usage] {e}", file=sys.stderr)
         return 1
 
 
@@ -947,18 +1045,33 @@ def _dispatch(argv=None):
     client = VaultClient()
     cmd = argv[0]
     if cmd == "get":
-        content = client.read(argv[1])
+        rev_file, argv = _take_option(argv, "--rev-file")
+        content, rev = client.read_rev(argv[1])
+        if rev_file is not None:
+            # Written before the content is printed, so a `get` whose output
+            # is redirected to a file leaves the two consistent -- and a
+            # tombstone (no content, but a live revision) records the
+            # revision, because overwriting one has to carry it.
+            Path(rev_file).write_text(f"{rev or ABSENT_REV}\n", encoding="utf-8")
         print(content if content is not None else f"[not found: {argv[1]}]")
     elif cmd == "put":
+        if_rev_file, argv = _take_option(argv, "--if-rev-file")
         content = Path(argv[2]).read_text(encoding="utf-8")
-        print(f"{client.write(argv[1], content)}: {argv[1]}")
+        result = _conditional_write(client, argv[1], content, if_rev_file)
+        print(f"{result}: {argv[1]}")
+        return _write_exit(result)
     elif cmd == "puts":
+        if_rev_file, argv = _take_option(argv, "--if-rev-file")
         content = sys.stdin.read()
-        print(f"{client.write(argv[1], content)}: {argv[1]}")
+        result = _conditional_write(client, argv[1], content, if_rev_file)
+        print(f"{result}: {argv[1]}")
+        return _write_exit(result)
     elif cmd == "append":
         content = Path(argv[2]).read_text(encoding="utf-8")
         marker = argv[3] if len(argv) > 3 else ""
-        print(f"{client.append(argv[1], content, marker)}: {argv[1]}")
+        result = client.append(argv[1], content, marker)
+        print(f"{result}: {argv[1]}")
+        return _write_exit(result)
     elif cmd == "appends":
         content = sys.stdin.read()
         # `puts` spells stdin as a literal "-", and this command's own usage
@@ -968,7 +1081,9 @@ def _dispatch(argv=None):
         if rest and rest[0] == "-":
             rest = rest[1:]
         marker = rest[0] if rest else ""
-        print(f"{client.append(argv[1], content, marker)}: {argv[1]}")
+        result = client.append(argv[1], content, marker)
+        print(f"{result}: {argv[1]}")
+        return _write_exit(result)
     elif cmd == "delete":
         print(f"{client.delete(argv[1])}: {argv[1]}")
     elif cmd == "ls":
