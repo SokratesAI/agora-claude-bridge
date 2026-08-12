@@ -504,10 +504,20 @@ class VaultClient:
         client was discarding. Hand the `rev` back to `write` as `if_rev`
         and a losing write fails loudly instead of silently winning.
 
-        `rev` is None only when no document exists at that path. Content is
-        None for a missing file *and* for a tombstone, but a tombstone has
-        a revision and writing over it has to carry it -- so the two cases
-        are `(None, None)` and `(None, "<rev>")`, and they are not the same.
+        Content is None for a missing file *and* for a tombstone, but a
+        tombstone has a revision and writing over it has to carry it -- so
+        those two cases are `(None, "<rev>")` and `(None, None)`, and they
+        are not the same.
+
+        **`(None, None)` is not only "no document here".** It is every
+        non-200 from the GET, so a 500 or a timeout collapses into the same
+        answer as a genuine 404, and `append` then reports a live file as
+        `not found` -- which is exactly the failed-read-looks-empty class
+        that runner#117 fixed for the listing tools and did not fix here.
+        The runner's copy of this function says "only when no document
+        exists", which is the claim rather than the behaviour. Stating it
+        accurately here rather than fixing it, because the fix belongs in
+        both clients at once and is a wider change than this one.
 
         Ported from `agora_runner/vault.py` (runner #118), which carries the
         same client against the same database.
