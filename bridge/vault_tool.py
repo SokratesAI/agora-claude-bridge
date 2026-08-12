@@ -122,7 +122,15 @@ HEALTH_PROBE_PATHS = (
     "projects/sokrates/projects/agora/journal-digest.md",
     "projects/sokrates/projects/agora/journal-digest.md.bak",
     "projects/sokrates/projects/nova/nova.md",
-    "projects/sokrates/projects/agora/issues.md",
+    # Was `agora/issues.md` until 2026-08-12, when the three files Edvard
+    # writes by hand moved into the Nova folder in his own vault at his
+    # ask -- *"they can be moved into the Nova folder in my Vault and not
+    # be underneath the agora project folder"*. The rule it probes is
+    # unchanged; the path had to move with the file, or this tuple points
+    # at a document nobody can open. The runner's copy moved in the same
+    # cycle: these two tuples must stay identical or the drift check above
+    # is comparing two different questions.
+    "projects/sokrates/projects/nova/issues.md",
 )
 
 # Stamped onto a fetched doc by file_docs() so a later chunk lookup uses the

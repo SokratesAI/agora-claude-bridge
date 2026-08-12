@@ -17,7 +17,7 @@ from bridge import vault_tool
 
 NOVA_FILE = "projects/sokrates/projects/agora/nova/resources/issues.md"
 DIGEST = "projects/sokrates/projects/agora/journal-digest.md"
-HIS_FILE = "projects/sokrates/projects/agora/issues.md"
+HIS_FILE = "projects/sokrates/projects/nova/issues.md"
 
 
 @pytest.fixture
@@ -72,7 +72,8 @@ class TestDbFor:
     def test_edvards_files_stay_in_his_vault(self, env):
         client = vault_tool.VaultClient()
         for path in (HIS_FILE,
-                     "projects/sokrates/projects/agora/ideas.md",
+                     "projects/sokrates/projects/nova/ideas.md",
+                     "projects/sokrates/projects/nova/notes.md",
                      "projects/sokrates/projects/agora/architecture.md"):
             assert client.db_for(path) == "obsidian", path
 
@@ -299,7 +300,7 @@ class TestDatabaseHealth:
             # `agora/nova/` routes away, and this one does not live there.
             "projects/sokrates/projects/agora/journal-digest.md.bak": "obsidian",
             "projects/sokrates/projects/nova/nova.md": "obsidian",
-            "projects/sokrates/projects/agora/issues.md": "obsidian",
+            "projects/sokrates/projects/nova/issues.md": "obsidian",
         }
 
     def test_probes_cover_both_databases(self, env):
