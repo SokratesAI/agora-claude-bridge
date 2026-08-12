@@ -20,6 +20,7 @@ clients are hand-synced with nothing detecting drift, so this file is
 deliberately the same shape as that one -- a diff between them should
 read as "class method vs module function" and nothing else.
 """
+import io
 import urllib.parse
 from unittest.mock import patch
 
@@ -229,3 +230,200 @@ def test_an_append_to_a_missing_file_is_still_reported_not_created(couch):
     result = couch.client.append("notes/never.md", "- mine")
     assert "not found" in result
     assert couch.accepted == 0
+
+
+# ---------------------------------------------------------------------------
+# The CLI half (2026-08-12, second slice). The client above has been able to
+# do a conditional write since #47 and *no caller passed one*: `prompt.md`
+# step 7 writes the journal and the digest through `vault_tool put`, which
+# had no way to send a revision and no way to report a lost one. The
+# mechanism existed everywhere except the two writes it was built for.
+# ---------------------------------------------------------------------------
+
+
+def _cli(argv, capsys):
+    """`main(argv)`, returning `(exit_code, stdout, stderr)`.
+
+    All three, because `capsys` can only be drained once: a test that reads
+    stdout here and then asks for stderr gets an empty string and passes
+    whatever the tool actually printed.
+    """
+    code = vault_tool.main(argv)
+    cap = capsys.readouterr()
+    return code, cap.out, cap.err
+
+
+def test_get_records_the_revision_it_was_served(couch, tmp_path, capsys):
+    couch.seed(couch.client, PATH, "# Issues\n\n- one\n")
+    rev_file = tmp_path / "d.rev"
+    code, out, _err = _cli(["get", PATH, "--rev-file", str(rev_file)], capsys)
+    assert code == 0
+    assert out == "# Issues\n\n- one\n\n"
+    assert rev_file.read_text().strip() == "1-x"
+
+
+def test_a_paired_get_and_put_refuses_to_overwrite_a_writer_in_between(
+        couch, tmp_path, capsys):
+    """The whole reason this exists, in the shape `prompt.md` actually uses:
+    read the digest to a file, edit it, write it back. Somebody lands in the
+    gap -- which with four cycles an hour is an ordinary Tuesday."""
+    couch.seed(couch.client, PATH, "line A\n")
+    rev_file, body = tmp_path / "d.rev", tmp_path / "live.md"
+    _cli(["get", PATH, "--rev-file", str(rev_file)], capsys)
+    body.write_text("line A\nmine\n")
+
+    couch.seed(couch.client, PATH, "line A\ntheirs\n")   # the other writer
+
+    code, out, _err = _cli(["put", PATH, str(body), "--if-rev-file", str(rev_file)], capsys)
+    assert code == vault_tool.CONFLICT_EXIT == 3
+    assert "409 conflict" in out
+    assert couch.text(PATH) == "line A\ntheirs\n"        # theirs is intact
+    assert "mine" not in couch.text(PATH)
+
+
+def test_the_same_pair_writes_normally_when_nobody_interferes(couch, tmp_path, capsys):
+    """A guard that also blocks the ordinary path is not a guard."""
+    couch.seed(couch.client, PATH, "line A\n")
+    rev_file, body = tmp_path / "d.rev", tmp_path / "live.md"
+    _cli(["get", PATH, "--rev-file", str(rev_file)], capsys)
+    body.write_text("line A\nmine\n")
+
+    code, out, _err = _cli(["put", PATH, str(body), "--if-rev-file", str(rev_file)], capsys)
+    assert code == 0
+    assert out.startswith("written:")
+    assert couch.text(PATH) == "line A\nmine\n"
+
+
+def test_an_unpaired_put_is_still_an_unconditional_overwrite(couch, tmp_path, capsys):
+    """Every existing caller in the vault and in `prompt.md` is unpaired.
+    None of them may start failing today."""
+    couch.seed(couch.client, PATH, "line A\n")
+    body = tmp_path / "live.md"
+    body.write_text("replaced\n")
+    code, _out, err = _cli(["put", PATH, str(body)], capsys)
+    assert code == 0
+    assert couch.text(PATH) == "replaced\n"
+
+
+def test_a_rev_file_for_a_missing_path_means_it_must_still_be_missing(
+        couch, tmp_path, capsys):
+    """The journal-entry case: two cycles pick the same sequence number, both
+    `get` a 404, both `put`. One of them has to lose, and the loser must not
+    be the one whose entry is already there."""
+    rev_file, body = tmp_path / "j.rev", tmp_path / "entry.md"
+    code, out, _err = _cli(["get", "j/071-cycle-71.md", "--rev-file", str(rev_file)], capsys)
+    assert code == 0 and "[not found:" in out
+    assert rev_file.read_text().strip() == vault_tool.ABSENT_REV
+
+    couch.seed(couch.client, "j/071-cycle-71.md", "the other cycle's entry\n")
+    body.write_text("my entry\n")
+    code, out, _err = _cli(
+        ["put", "j/071-cycle-71.md", str(body), "--if-rev-file", str(rev_file)], capsys)
+    assert code == 3, out
+    assert couch.text("j/071-cycle-71.md") == "the other cycle's entry\n"
+
+
+def test_a_missing_rev_file_is_an_error_not_an_unconditional_write(
+        couch, tmp_path, capsys):
+    """The dangerous fallback. A caller that asked for a conditional write
+    and silently got a clobber is worse off than one that never asked."""
+    couch.seed(couch.client, PATH, "line A\n")
+    body = tmp_path / "live.md"
+    body.write_text("mine\n")
+    code, _out, err = _cli(
+        ["put", PATH, str(body), "--if-rev-file", str(tmp_path / "gone.rev")], capsys)
+    assert code == 1
+    assert couch.accepted == 0
+    assert couch.text(PATH) == "line A\n"
+    assert "Refusing to fall back" in err
+
+
+def test_an_empty_rev_file_is_an_error_too(couch, tmp_path, capsys):
+    """A truncated or half-written rev file reads as 'no expectation' if you
+    let it, which is the same clobber one step removed."""
+    couch.seed(couch.client, PATH, "line A\n")
+    body, rev_file = tmp_path / "live.md", tmp_path / "d.rev"
+    body.write_text("mine\n")
+    rev_file.write_text("\n")
+    code, _out, err = _cli(
+        ["put", PATH, str(body), "--if-rev-file", str(rev_file)], capsys)
+    assert code == 1
+    assert couch.text(PATH) == "line A\n"
+
+
+def test_puts_takes_the_same_pairing(couch, tmp_path, capsys, monkeypatch):
+    """`puts` is the stdin form and is what the server-side helpers reach
+    for; leaving it unconditional would have left a second unguarded door."""
+    couch.seed(couch.client, PATH, "line A\n")
+    rev_file = tmp_path / "d.rev"
+    _cli(["get", PATH, "--rev-file", str(rev_file)], capsys)
+    couch.seed(couch.client, PATH, "line A\ntheirs\n")
+
+    monkeypatch.setattr(vault_tool.sys, "stdin", io.StringIO("mine\n"))
+    code, out, _err = _cli(["puts", PATH, "--if-rev-file", str(rev_file)], capsys)
+    assert code == 3, out
+    assert couch.text(PATH) == "line A\ntheirs\n"
+
+
+def test_a_failed_write_exits_non_zero(couch, tmp_path, capsys):
+    """It exited 0 while printing `FAILED`, and this loop's own instructions
+    compensated with "read the output" -- a shell running four chained vault
+    writes does not read output."""
+    body = tmp_path / "live.md"
+    body.write_text("mine\n")
+    with patch.object(vault_tool.VaultClient, "write", return_value="FAILED(503)"):
+        code, out, _err = _cli(["put", PATH, str(body)], capsys)
+    assert code == 1
+    assert "FAILED(503)" in out
+
+
+def test_a_failed_append_exits_non_zero_too(couch, tmp_path, capsys):
+    """Same trap on the capture files: a missing marker printed a failure and
+    exited 0, so a wrapper script counted it as filed."""
+    couch.seed(couch.client, PATH, "# Issues\n\n- old\n")
+    body = tmp_path / "cap.md"
+    body.write_text("- mine\n")
+    code, out, _err = _cli(["append", PATH, str(body), "## Nope"], capsys)
+    assert code == 1
+    assert "after_marker not found" in out
+    assert couch.accepted == 0
+
+
+def test_a_successful_write_still_exits_zero(couch, tmp_path, capsys):
+    couch.seed(couch.client, PATH, "# Issues\n\n## Entries\n\n- old\n")
+    body = tmp_path / "cap.md"
+    body.write_text("- mine\n")
+    assert _cli(["append", PATH, str(body), "## Entries"], capsys)[0] == 0
+
+
+def test_an_option_is_not_mistaken_for_a_marker_or_a_path(couch, tmp_path, capsys):
+    """`--rev-file` is pulled out before the positionals are read, so the
+    path is still argv[1] and a marker beginning with `-` still works."""
+    couch.seed(couch.client, PATH, "# Issues\n\n## Entries\n\n- old\n")
+    rev_file = tmp_path / "d.rev"
+    code, out, _err = _cli(["get", "--rev-file", str(rev_file), PATH], capsys)
+    assert code == 0 and "- old" in out
+    assert rev_file.read_text().strip() == couch.docs[PATH]["_rev"]
+
+
+def test_a_rev_file_option_with_no_value_is_a_usage_error(couch, capsys):
+    code, _out, err = _cli(["get", PATH, "--rev-file"], capsys)
+    assert code == 1
+    assert "needs a filename" in err
+
+
+def test_a_tombstone_rev_is_recorded_so_the_overwrite_can_carry_it(
+        couch, tmp_path, capsys):
+    """`get` prints `[not found]` for a tombstone as well as for a missing
+    file. Recording ABSENT_REV for the tombstone would make every write over
+    a deleted note 409 forever."""
+    couch.seed(couch.client, PATH, "gone\n")
+    couch.docs[PATH]["deleted"] = True
+    rev_file, body = tmp_path / "d.rev", tmp_path / "live.md"
+    _cli(["get", PATH, "--rev-file", str(rev_file)], capsys)
+    assert rev_file.read_text().strip() == "1-x"
+
+    body.write_text("back again\n")
+    code, out, _err = _cli(["put", PATH, str(body), "--if-rev-file", str(rev_file)], capsys)
+    assert code == 0, out
+    assert couch.text(PATH) == "back again\n"

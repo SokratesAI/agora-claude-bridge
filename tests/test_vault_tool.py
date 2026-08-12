@@ -317,7 +317,9 @@ def test_main_appends_with_no_marker_at_all_appends_at_the_end(env):
 
 def test_main_get_prints_not_found_marker(env, capsys):
     with patch.object(vault_tool, "VaultClient") as MockClient:
-        MockClient.return_value.read.return_value = None
+        # `get` reads through `read_rev` since it grew `--rev-file`; it needs
+        # the revision even when there is no content to print.
+        MockClient.return_value.read_rev.return_value = (None, None)
         vault_tool.main(["get", "missing.md"])
     assert "[not found: missing.md]" in capsys.readouterr().out
 
@@ -585,7 +587,7 @@ def test_main_get_reports_an_incomplete_document_on_stderr_and_exits_nonzero(env
     """Exit code and stream both matter: `get x.md > file.md` must leave an
     empty file and a visible error, never a confident partial one."""
     with patch.object(vault_tool, "VaultClient") as MockClient:
-        MockClient.return_value.read.side_effect = vault_tool.VaultIncompleteDocument(
+        MockClient.return_value.read_rev.side_effect = vault_tool.VaultIncompleteDocument(
             "ideas.md: 6 of 184 content chunks missing from the vault (h:vucrv1sugciv)"
         )
         code = vault_tool.main(["get", "ideas.md"])
