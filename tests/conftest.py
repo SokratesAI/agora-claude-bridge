@@ -19,6 +19,7 @@ session removes the race instead of narrowing it. Tests that stub
 fetch_usage themselves nest inside this one and still win.
 """
 from unittest.mock import patch
+import os
 import threading
 
 import pytest
@@ -108,3 +109,37 @@ def isolated_turn_deadline(tmp_path_factory):
     path = str(tmp_path_factory.mktemp("deadline") / "turn-deadline.json")
     with patch.object(deadline, "DEADLINE_FILE", path):
         yield
+
+
+@pytest.fixture(autouse=True, scope="session")
+def no_ambient_vault_routing():
+    """Keeps the pod's own CouchDB config out of the suite.
+
+    Third of the same kind, and the only one whose absence was invisible.
+    `CDB_BASE`, `CDB_DB`, `CDB_NOVA_DB`, `CDB_PASS` and `CDB_USER` are set
+    in the live bridge pod, so a test that builds a `VaultClient` without
+    an `env` fixture of its own inherits them and points at Edvard's real
+    vault -- `recent` then sweeps whichever databases the pod is
+    configured for, which is why three of `test_vault_tool.py`'s
+    assertions fail there and pass in CI.
+
+    **The asymmetry is the whole reason this went unnoticed.** CI runs in
+    a container with none of these set, so the suite is hermetic there by
+    accident rather than by construction, and every cycle that ran the
+    tests in-pod had to decide from scratch whether four red tests were
+    its own fault. `test_no_ambient_couchdb_config_reaches_the_suite` was
+    written to pin this fixture and names it; the fixture itself was never
+    added, so the test that exists to prove the environment is clean was
+    itself one of the four failing.
+
+    Session-scoped and autouse for the same reason as the two above: the
+    thing being guarded is ambient rather than per-test, and a test that
+    sets `CDB_*` deliberately nests inside this one and still wins.
+    """
+    ambient = {k: v for k, v in os.environ.items() if k.startswith("CDB_")}
+    for key in ambient:
+        del os.environ[key]
+    try:
+        yield
+    finally:
+        os.environ.update(ambient)
