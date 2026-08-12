@@ -782,10 +782,23 @@ class VaultClient:
 
         Measured on the live `obsidian` database 2026-08-12: of 283
         tombstones Obsidian itself wrote, 282 keep their `children` and
-        `size` intact -- the flag is the entire signal, so nothing else
-        is touched here. `mtime` is bumped because it is what decides a
-        conflict against a peer's local copy, and `read`/`file_docs`
-        already treat the flag as gone.
+        `size` intact (the exception is an empty note that never had
+        content). So the flag is the signal and nothing else is
+        rewritten; `read`/`file_docs` already treat it as gone. `mtime`
+        is bumped to match what Obsidian's own deletions do -- that much
+        is measured. That it is specifically what settles a conflict
+        against a peer's stale copy is inference from the plugin's
+        behaviour, not something measured here.
+
+        **The cost, so nobody thinks it was overlooked:** a tombstone
+        keeps the file's text in CouchDB indefinitely, where a hard
+        DELETE eventually became reclaimable by compaction. That is
+        unavoidable -- dropping the content is what stopped the deletion
+        syncing in the first place -- but it means deleted text stays
+        readable to anyone with database access, and the tombstone
+        fraction (309 of 897 documents when `file_docs` last measured
+        it) only ever grows. Reclaiming it belongs to the orphan-chunk
+        and compaction work, not here.
         """
         path = path.lower()
         db = self.db_for(path)
@@ -797,7 +810,10 @@ class VaultClient:
         if existing.get("deleted"):
             # Already a tombstone. Re-flagging it would burn a revision
             # and republish a deletion peers have long since applied.
-            return "absent"
+            # Distinct from "absent" on purpose: "there was nothing
+            # here" and "this was already correctly deleted" are
+            # different answers, and the caller only gets this string.
+            return "already deleted"
         doc = dict(existing)
         doc["deleted"] = True
         doc["mtime"] = int(time.time() * 1000)

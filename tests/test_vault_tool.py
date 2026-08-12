@@ -108,10 +108,14 @@ def test_delete_does_not_copy_content_into_the_vault(env):
 # i still have it on my phone"), Cycle 129 hand-repaired the 167 paths the
 # migration removed, and the code path itself stayed broken until Cycle 131.
 def test_delete_writes_a_livesync_tombstone_rather_than_removing_the_doc(env):
+    # Every field `_put_raw` actually writes, so "nothing else is
+    # rewritten" is tested against a real document rather than against a
+    # fixture that omits the fields it would have damaged.
     client, calls = _client_with_fake_req({
         ("GET", "doomed.md"): (200, {"_id": "doomed.md", "path": "doomed.md",
-                                     "children": ["h:1"], "size": 9,
-                                     "ctime": 111, "mtime": 222, "_rev": "1-abc"}),
+                                     "data": "", "children": ["h:1"], "size": 9,
+                                     "ctime": 111, "mtime": 222,
+                                     "type": "plain", "eden": {}, "_rev": "1-abc"}),
         ("PUT", "doomed.md"): (200, {"ok": True}),
     })
     # No _req patch: a real CouchDB DELETE goes through the module-level
@@ -126,20 +130,27 @@ def test_delete_writes_a_livesync_tombstone_rather_than_removing_the_doc(env):
     # tombstones Obsidian wrote itself keep children and size intact.
     assert put["children"] == ["h:1"] and put["size"] == 9
     assert put["ctime"] == 111
-    # mtime is what decides the conflict against a peer's local copy, so a
-    # tombstone carrying the old one can lose to the phone that still has
-    # the file -- which is the whole failure this fixes.
+    # A tombstone Obsidian would not recognise is one that arrives with
+    # its type or its path rewritten, so pin the untouched half too.
+    assert put["type"] == "plain" and put["eden"] == {}
+    assert put["path"] == "doomed.md" and put["data"] == ""
+    # Obsidian's own deletions bump mtime; that much is measured. That it
+    # is specifically what settles a conflict against a peer's stale copy
+    # is inference, so this pins the behaviour and not the explanation.
     assert put["mtime"] > 222
 
 
 def test_delete_of_an_already_tombstoned_file_is_a_no_op(env):
     """Re-flagging burns a revision and republishes a deletion every peer
     applied long ago. `read` already reports these as gone, so `delete`
-    agreeing with it is what keeps the two consistent."""
+    agreeing with it is what keeps the two consistent. The answer is
+    deliberately not "absent" -- "nothing was ever here" and "this was
+    already correctly deleted" are different answers, and the return
+    string is all the caller gets."""
     client, calls = _client_with_fake_req({
         ("GET", "gone.md"): (200, {"_id": "gone.md", "deleted": True, "_rev": "2-x"}),
     })
-    assert client.delete("gone.md") == "absent"
+    assert client.delete("gone.md") == "already deleted"
     assert [c for c in calls if c[0] == "PUT"] == []
 
 

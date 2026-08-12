@@ -148,12 +148,18 @@ class TestChunksFollowTheirDocument:
         assert all(db == "obsidian" for _, db, _ in calls), calls
 
     def test_deleting_a_nova_file_deletes_it_from_nova(self, env):
+        """Asserting only the database left this test passing under the
+        pre-2026-08-12 hard delete, which also routed to `nova` and
+        never wrote a tombstone at all -- and under a tombstone written
+        to the wrong id. It has to see the write land, not just see it
+        aimed at the right database."""
         client, calls = _recording_client({
             ("GET", "nova", NOVA_FILE): (200, {"_id": NOVA_FILE, "_rev": "1-x"}),
             ("PUT", "nova", NOVA_FILE): (200, {}),
         })
-        client.delete(NOVA_FILE)
+        assert client.delete(NOVA_FILE) == "deleted"
         assert all(db == "nova" for _, db, _ in calls), calls
+        assert ("PUT", "nova", NOVA_FILE) in [(m, db, p) for m, db, p in calls], calls
 
 
 class TestListingAcrossBothDatabases:
