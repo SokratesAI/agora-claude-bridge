@@ -288,6 +288,36 @@ class VaultIncompleteDocument(RuntimeError):
     """
 
 
+#: `if_rev` default: "I have no expectation about the current revision,
+#: overwrite whatever is there." Deliberately not `None`, which is a real
+#: and different expectation -- "there should be no document here yet".
+_ANY_REV = object()
+
+#: How many times an append re-reads and retries after losing a conflict.
+#: Three, matching the runner's WRITE_ATTEMPTS. A conflict means another
+#: writer won, so the retry is against a moving target and bounding it is
+#: what stops two writers livelocking on one hot file.
+APPEND_ATTEMPTS = 3
+
+
+def _appended(existing_content, content, after_marker):
+    """The file's new text, or None if `after_marker` matches no line.
+
+    Split out of `append` so the merge can be redone against freshly read
+    text on every retry -- resending a body built from the losing read is
+    the clobber this whole change exists to stop.
+    """
+    if after_marker:
+        lines = existing_content.split("\n")
+        for i, line in enumerate(lines):
+            if line.strip() == after_marker.strip():
+                lines[i + 1:i + 1] = ["", content.strip("\n")]
+                return "\n".join(lines)
+        return None
+    sep = "" if existing_content.endswith("\n\n") else ("\n" if existing_content.endswith("\n") else "\n\n")
+    return existing_content + sep + content.strip("\n") + "\n"
+
+
 class VaultClient:
     def __init__(self):
         self.base = _env("CDB_BASE").rstrip("/")
@@ -460,17 +490,39 @@ class VaultClient:
         return "".join(parts)
 
     def read(self, path):
+        return self.read_rev(path)[0]
+
+    def read_rev(self, path):
+        """`(content, rev)` -- the text, and the revision it was read at.
+
+        Every write through this client is a read-modify-write, and until
+        2026-08-12 the revision the caller read at was thrown away: `write`
+        looked up a *fresh* `_rev` immediately before the PUT, so a writer
+        that landed in between was adopted and overwritten with no error
+        anywhere. CouchDB already solves this -- a PUT carrying a stale
+        `_rev` is rejected with a 409 -- and this is the half of it the
+        client was discarding. Hand the `rev` back to `write` as `if_rev`
+        and a losing write fails loudly instead of silently winning.
+
+        `rev` is None only when no document exists at that path. Content is
+        None for a missing file *and* for a tombstone, but a tombstone has
+        a revision and writing over it has to carry it -- so the two cases
+        are `(None, None)` and `(None, "<rev>")`, and they are not the same.
+
+        Ported from `agora_runner/vault.py` (runner #118), which carries the
+        same client against the same database.
+        """
         db = self.db_for(path.lower())
         status, doc = self.get_doc(path.lower(), db=db)
         if status != 200:
-            return None
+            return None, None
         # A LiveSync tombstone keeps its content chunks, so assemble()
         # happily rebuilds the text of a note that no longer exists --
         # see file_docs(). Deleted means gone; recover from the daily
         # GitHub snapshot, not from here.
         if doc.get("deleted"):
-            return None
-        return self.assemble(doc, path.lower(), db)
+            return None, doc.get("_rev")
+        return self.assemble(doc, path.lower(), db), doc.get("_rev")
 
     def file_docs(self, prefix=""):
         """{doc_id: doc} for every file under `prefix` that still exists.
@@ -678,7 +730,7 @@ class VaultClient:
             if "error" not in row and not (row.get("value") or {}).get("deleted")
         }
 
-    def _put_raw(self, path, content, existing=None):
+    def _put_raw(self, path, content, existing=None, if_rev=_ANY_REV):
         path = path.lower()
         # One lookup, reused for the chunks and the file doc, so a chunk
         # can never be written to a different database than the doc that
@@ -733,38 +785,74 @@ class VaultClient:
         if existing is not None:
             doc["_rev"] = existing["_rev"]
             doc["ctime"] = existing.get("ctime", now_ms)
+        if if_rev is not _ANY_REV:
+            # The caller's expectation beats whatever the lookup above found
+            # -- that lookup exists to carry `ctime` forward, not to decide
+            # who wins. Adopting the current revision here is precisely the
+            # silent clobber `if_rev` was added to stop. `None` means "no
+            # document expected", and a PUT with no `_rev` against a live
+            # document is CouchDB's own way of saying that: it 409s.
+            if if_rev is None:
+                doc.pop("_rev", None)
+            else:
+                doc["_rev"] = if_rev
         status, _ = self._doc("PUT", path, doc, db=db)
-        return "written" if status in (200, 201) else f"FAILED({status})"
+        if status in (200, 201):
+            return "written"
+        if status == 409:
+            # Named, not just numbered. A caller deciding whether to retry
+            # has to tell "someone else wrote first, re-read and try again"
+            # apart from "the vault refused you", and 409 is the only status
+            # where retrying is the right answer rather than a spin.
+            return f"FAILED(409 conflict: {path} changed since it was read)"
+        return f"FAILED({status})"
 
-    def write(self, path, content):
+    def write(self, path, content, if_rev=_ANY_REV):
         """Overwrite (or create) a file. Previous content is not copied
         anywhere first -- the daily GitHub snapshot is the recovery
-        path (see module docstring)."""
+        path (see module docstring).
+
+        2026-08-12: `if_rev` makes the write conditional. Pass the `rev`
+        from `read_rev` and CouchDB rejects the PUT with 409 if anything
+        changed since that read, instead of this method quietly picking up
+        the winner's revision and overwriting them. Pass `None` to mean
+        "this file should not exist yet". Omit it and the write is
+        unconditional, which is what every caller got before and still
+        gets."""
         status, existing = self.get_doc(path.lower(), db=self.db_for(path.lower()))
-        return self._put_raw(path, content, existing if status == 200 else None)
+        return self._put_raw(
+            path, content, existing if status == 200 else None, if_rev=if_rev
+        )
 
     def append(self, path, content, after_marker=""):
         """Add to an EXISTING file without losing what's already there.
         Fails loudly if the file doesn't exist -- 'append' implies
         something to append to, use write to create a new file."""
-        existing_content = self.read(path)
-        if existing_content is None:
-            return f"FAILED(not found: {path} -- use write to create a new file)"
-        if after_marker:
-            lines = existing_content.split("\n")
-            for i, line in enumerate(lines):
-                if line.strip() == after_marker.strip():
-                    lines[i + 1:i + 1] = ["", content.strip("\n")]
-                    return self.write(path, "\n".join(lines))
-            # Asking for a marker and silently getting the opposite end of the
-            # file is how journal.md scrambled its own order: entries meant for
-            # the top landed at the bottom, for cycles, with nothing reported.
-            # An explicit marker is a positional instruction, so failing to
-            # honour it is an error -- same spirit as the not-found check above.
-            return (f"FAILED(after_marker not found in {path}: {after_marker!r} "
-                    f"-- nothing written; omit after_marker to append at the end)")
-        sep = "" if existing_content.endswith("\n\n") else ("\n" if existing_content.endswith("\n") else "\n\n")
-        return self.write(path, existing_content + sep + content.strip("\n") + "\n")
+        result = ""
+        for _ in range(APPEND_ATTEMPTS):
+            existing_content, rev = self.read_rev(path)
+            if existing_content is None:
+                return f"FAILED(not found: {path} -- use write to create a new file)"
+            merged = _appended(existing_content, content, after_marker)
+            if merged is None:
+                # Asking for a marker and silently getting the opposite end of
+                # the file is how journal.md scrambled its own order: entries
+                # meant for the top landed at the bottom, for cycles, with
+                # nothing reported. An explicit marker is a positional
+                # instruction, so failing to honour it is an error -- same
+                # spirit as the not-found check above.
+                return (f"FAILED(after_marker not found in {path}: {after_marker!r} "
+                        f"-- nothing written; omit after_marker to append at the end)")
+            # The whole point of an append is "add mine to whatever is there",
+            # so losing a conflict is not a failure -- it means the file grew
+            # under us and the merge has to be redone against the new text.
+            # Retrying the *write* alone would resend a body built from the
+            # text we lost the race to, which is the clobber written out long
+            # hand. Re-read, re-merge, re-write.
+            result = self.write(path, merged, if_rev=rev)
+            if "409 conflict" not in result:
+                return result
+        return result
 
     def delete(self, path):
         """Tombstone the document the way Obsidian does, instead of
