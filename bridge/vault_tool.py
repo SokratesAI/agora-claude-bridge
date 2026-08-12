@@ -95,6 +95,36 @@ NOVA_DB_FILES = (
 )
 NOVA_DB_TARGETS = NOVA_DB_FOLDERS + NOVA_DB_FILES
 
+# Paths whose routing this process reports on demand. Five distinct
+# behaviours of `db_for`, two of which are regressions rather than
+# examples: a `.bak` beside the digest must NOT follow it into Nova's
+# database, and the Nova folder Edvard asked to keep in his own vault must
+# stay there. The other three are the folder rule, the exact-file rule and
+# a file of his that must never move.
+#
+# **This tuple is a deliberate copy of agora-persona-runner's
+# HEALTH_PROBE_PATHS, and copying it is the point.** The routing rule
+# itself already exists twice, in two repos, with nothing detecting drift
+# -- that is the risk this endpoint exists to measure, not one it
+# introduces. Probing the *same* five paths from both processes is what
+# makes drift a diff of two curls instead of an argument; a shorter or
+# cleverer list here would only make the two answers incomparable, which
+# is the failure it is built to catch.
+#
+# **These are real paths and must stay real.** Journal filenames are
+# `<sequence>-cycle-<n>.md` where the two numbers diverge, so a plausible
+# guess like `121-cycle-121.md` has never existed -- one was in the
+# runner's tuple until a reviewer listed the folder. A probe pointing at a
+# document nobody can open turns the one endpoint built to remove
+# ambiguity into a second thing to disambiguate.
+HEALTH_PROBE_PATHS = (
+    "projects/sokrates/projects/agora/nova/journal/138-cycle-121.md",
+    "projects/sokrates/projects/agora/journal-digest.md",
+    "projects/sokrates/projects/agora/journal-digest.md.bak",
+    "projects/sokrates/projects/nova/nova.md",
+    "projects/sokrates/projects/agora/issues.md",
+)
+
 # Stamped onto a fetched doc by file_docs() so a later chunk lookup uses the
 # database the doc was really read from. Private; never written back --
 # _put_raw builds its document from scratch.
@@ -118,7 +148,7 @@ def _env(name, default=None):
     return value
 
 
-def _req(method, base, db, auth, path, body=None):
+def _req(method, base, db, auth, path, body=None, timeout=60):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(
         f"{base}/{db}/{path}", data=data,
@@ -126,10 +156,20 @@ def _req(method, base, db, auth, path, body=None):
         method=method,
     )
     try:
-        with urllib.request.urlopen(r, timeout=60) as resp:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode() or "{}")
+
+
+# `database_health` only, and deliberately far below the 60s every other
+# call gets. This endpoint probes each database in turn, so two unreachable
+# ones would cost 2 x timeout before reporting anything -- turning the one
+# instrument built to remove a slow uncertain wait into a slow uncertain
+# wait. "Can I reach this database" is also the one question where a slow
+# answer and no answer mean the same thing operationally, so failing fast
+# loses nothing.
+HEALTH_TIMEOUT_SECONDS = 5
 
 
 # Content-defined chunking, in bytes. LiveSync -- the client that wrote
@@ -292,6 +332,52 @@ class VaultClient:
         if any(t.startswith(lowered) for t in NOVA_DB_TARGETS):
             return [self.db, self.nova_db]
         return [self.db]
+
+    def database_health(self):
+        """What this process resolved and what it can actually reach.
+
+        Two different questions, and the gap between them is the whole risk
+        during a migration: a name in `CDB_NOVA_DB` says which database
+        this client *would* ask, never that an answer would come back.
+
+        The shape is byte-for-byte the one agora-persona-runner's
+        `database_health()` returns, minus the `ok` field its handler adds,
+        because comparing the two is the point. Until now the bridge --
+        the client every Nova cycle actually reads the vault through --
+        could only be asked this by importing VaultClient and calling
+        `db_for` by hand, which is a worse instrument than the write-probe
+        it was supposed to replace.
+        """
+        names = {"main": self.db}
+        if self.nova_db:
+            names["nova"] = self.nova_db
+        databases = {}
+        for role, name in names.items():
+            entry = {"name": name, "reachable": False, "doc_count": None, "error": None}
+            try:
+                # The database root, not a document: `_req` builds
+                # `{base}/{db}/{path}`, so an empty path is the db info
+                # endpoint and needs no document to exist.
+                status, info = _req("GET", self.base, urllib.parse.quote(name, safe=""),
+                                    self.auth, "", timeout=HEALTH_TIMEOUT_SECONDS)
+                if status == 200:
+                    entry["reachable"] = True
+                    # Includes chunk documents, not just files -- a Nova
+                    # file is one doc plus ~4KB content chunks. Named
+                    # `doc_count` because that is CouchDB's own field, and
+                    # renaming it here would be a second name for one
+                    # number the runner already reports under the first.
+                    entry["doc_count"] = info.get("doc_count")
+                else:
+                    entry["error"] = f"HTTP {status}"
+            except Exception as e:
+                entry["error"] = str(e)[:200]
+            databases[role] = entry
+        return {
+            "routing_enabled": bool(self.nova_db),
+            "databases": databases,
+            "routes": [{"path": p, "database": self.db_for(p)} for p in HEALTH_PROBE_PATHS],
+        }
 
     def _doc(self, method, doc_id, body=None, db=None):
         return _req(method, self.base, db or self.db_for(doc_id), self.auth,

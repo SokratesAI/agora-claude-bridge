@@ -28,7 +28,7 @@ def env(monkeypatch):
     monkeypatch.setenv("CDB_DB", "obsidian")
     monkeypatch.setenv("CDB_NOVA_DB", "nova")
 
-    def _no_network(method, base, db, auth, path, body=None):
+    def _no_network(method, base, db, auth, path, body=None, timeout=60):
         raise AssertionError(
             f"test made a real _req call ({method} {db}/{path}) -- patch "
             "vault_tool._req for this test instead"
@@ -47,7 +47,7 @@ def _recording_client(responses):
     client = vault_tool.VaultClient()
     calls = []
 
-    def fake_req(method, base, db, auth, path, body=None):
+    def fake_req(method, base, db, auth, path, body=None, timeout=60):
         # _doc percent-encodes the doc id, so keys are written unquoted
         # here and the fake undoes it -- otherwise every expectation is a
         # hand-encoded string nobody can read.
@@ -255,3 +255,105 @@ def test_switch_off_behaves_exactly_as_before(env_off):
     })
     assert client.read(NOVA_FILE) == "x"
     assert [db for _, db, _ in calls] == ["obsidian"]
+
+
+class TestDatabaseHealth:
+    """`database_health()` -- what this process resolved, and what it can
+    actually reach.
+
+    The bridge is the client every Nova cycle reads the vault through, and
+    until this existed the only way to ask it which database it had picked
+    was to import VaultClient and call `db_for` by hand. That mattered on
+    2026-08-12, with an irreversible delete of 165 files from `obsidian`
+    waiting on the answer.
+    """
+
+    def _health_client(self, info_by_db):
+        client = vault_tool.VaultClient()
+        seen = []
+
+        def fake_req(method, base, db, auth, path, body=None, timeout=60):
+            seen.append({"method": method, "db": db, "path": path, "timeout": timeout})
+            return info_by_db.get(urllib.parse.unquote(db), (404, {"error": "not_found"}))
+
+        vault_tool._req = fake_req
+        return client, seen
+
+    def test_reports_the_database_each_probe_path_resolves_to(self, env):
+        client, _ = self._health_client({
+            "obsidian": (200, {"doc_count": 13196}),
+            "nova": (200, {"doc_count": 713}),
+        })
+        routes = {r["path"]: r["database"] for r in client.database_health()["routes"]}
+        assert routes == {
+            "projects/sokrates/projects/agora/nova/journal/138-cycle-121.md": "nova",
+            "projects/sokrates/projects/agora/journal-digest.md": "nova",
+            # The two regressions rather than examples. A `.bak` beside the
+            # digest is Edvard's file and must not follow it, and the Nova
+            # folder he asked to keep is in *his* vault -- everything under
+            # `agora/nova/` routes away, and this one does not live there.
+            "projects/sokrates/projects/agora/journal-digest.md.bak": "obsidian",
+            "projects/sokrates/projects/nova/nova.md": "obsidian",
+            "projects/sokrates/projects/agora/issues.md": "obsidian",
+        }
+
+    def test_probes_cover_both_databases(self, env):
+        """A probe list that only ever names one database proves nothing --
+        it would look identical to routing being switched off."""
+        client, _ = self._health_client({"obsidian": (200, {}), "nova": (200, {})})
+        resolved = {r["database"] for r in client.database_health()["routes"]}
+        assert resolved == {"obsidian", "nova"}
+
+    def test_reports_names_and_doc_counts_when_reachable(self, env):
+        client, _ = self._health_client({
+            "obsidian": (200, {"doc_count": 13196}),
+            "nova": (200, {"doc_count": 713}),
+        })
+        health = client.database_health()
+        assert health["routing_enabled"] is True
+        assert health["databases"] == {
+            "main": {"name": "obsidian", "reachable": True,
+                     "doc_count": 13196, "error": None},
+            "nova": {"name": "nova", "reachable": True,
+                     "doc_count": 713, "error": None},
+        }
+
+    def test_an_unreachable_database_is_reported_not_raised(self, env):
+        """Reachability is the answer, so failing to reach one cannot be an
+        exception -- that would lose the half of the report that says which
+        database is fine."""
+        client, _ = self._health_client({
+            "obsidian": (200, {"doc_count": 13196}),
+            "nova": (500, {"error": "boom"}),
+        })
+        dbs = client.database_health()["databases"]
+        assert dbs["main"]["reachable"] is True
+        assert dbs["nova"]["reachable"] is False
+        assert dbs["nova"]["error"] == "HTTP 500"
+
+    def test_a_raising_transport_is_reported_not_raised(self, env):
+        client = vault_tool.VaultClient()
+
+        def boom(*a, **kw):
+            raise OSError("connection refused")
+
+        vault_tool._req = boom
+        dbs = client.database_health()["databases"]
+        assert dbs["main"]["reachable"] is False
+        assert "connection refused" in dbs["main"]["error"]
+
+    def test_probes_use_the_short_timeout_not_the_default(self, env):
+        """Two unreachable databases at the 60s default is a two-minute
+        wait from the one instrument built to replace a slow uncertain
+        wait."""
+        client, seen = self._health_client({"obsidian": (200, {}), "nova": (200, {})})
+        client.database_health()
+        assert [c["timeout"] for c in seen] == [vault_tool.HEALTH_TIMEOUT_SECONDS] * 2
+        assert vault_tool.HEALTH_TIMEOUT_SECONDS < 60
+
+    def test_switch_off_reports_one_database_and_no_routing(self, env_off):
+        client, _ = self._health_client({"obsidian": (200, {"doc_count": 13196})})
+        health = client.database_health()
+        assert health["routing_enabled"] is False
+        assert list(health["databases"]) == ["main"]
+        assert {r["database"] for r in health["routes"]} == {"obsidian"}

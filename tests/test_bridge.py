@@ -2207,3 +2207,97 @@ def test_a_journal_card_reply_does_not_arm_it(tmp_path):
 def test_an_ordinary_turn_does_not_arm_it(tmp_path):
     """The default every other caller gets, including this suite."""
     assert _watcher_armed_for("hello", tmp_path) is False
+
+
+# --- GET /health/database ---------------------------------------------
+#
+# The bridge is the vault client every Nova cycle actually reads through,
+# and it holds its own copy of the routing rule. nova-site's /api/health
+# answers for the runner's copy; nothing answered for this one, so
+# confirming it agreed meant importing VaultClient and calling `db_for` by
+# hand -- a worse instrument than the write-probe that replaced.
+
+def _health_payload(reachable=True):
+    return {
+        "routing_enabled": True,
+        "databases": {
+            "main": {"name": "obsidian", "reachable": True,
+                     "doc_count": 13196, "error": None},
+            "nova": {"name": "nova", "reachable": reachable,
+                     "doc_count": 713 if reachable else None,
+                     "error": None if reachable else "HTTP 500"},
+        },
+        "routes": [{"path": "projects/sokrates/projects/agora/journal-digest.md",
+                    "database": "nova"}],
+    }
+
+
+def _patch_client(payload=None, exc=None):
+    from bridge import vault_tool
+
+    class FakeClient:
+        def __init__(self):
+            if exc is not None:
+                raise exc
+
+        def database_health(self):
+            return payload
+
+    return patch.object(vault_tool, "VaultClient", FakeClient)
+
+
+def test_health_database_reports_routing_and_reachability():
+    handler, sent = _make_handler({}, path="/health/database")
+    with _patch_client(_health_payload()):
+        handler.do_GET()
+    assert sent["status"] == 200
+    assert sent["payload"]["ok"] is True
+    assert sent["payload"]["databases"]["nova"]["doc_count"] == 713
+    assert sent["payload"]["routes"][0]["database"] == "nova"
+
+
+def test_health_database_is_503_when_a_database_is_unreachable():
+    handler, sent = _make_handler({}, path="/health/database")
+    with _patch_client(_health_payload(reachable=False)):
+        handler.do_GET()
+    assert sent["status"] == 503
+    assert sent["payload"]["ok"] is False
+    # The half that still works has to survive the failure of the other --
+    # "which database is broken" is the whole question.
+    assert sent["payload"]["databases"]["main"]["reachable"] is True
+
+
+def test_health_database_reports_an_unconstructable_client_rather_than_raising():
+    """The real failure mode, not a stand-in for it.
+
+    This test used to inject `RuntimeError`, which `except Exception`
+    catches -- so it was green whether or not the handler dealt with what
+    `VaultClient()` actually raises. `_env()` raises **SystemExit** for a
+    missing variable, and SystemExit derives from BaseException, so the
+    original `except Exception` did not catch it: the request thread
+    unwound without calling _send and the caller got a dropped connection
+    with no status. So no fake client here -- the real one is constructed
+    with the variable genuinely absent.
+    """
+    import os
+    handler, sent = _make_handler({}, path="/health/database")
+    with patch.dict(os.environ):
+        os.environ.pop("CDB_BASE", None)
+        handler.do_GET()
+    assert sent["status"] == 503, "a missing env var must be reported, not raised"
+    assert "CDB_BASE" in sent["payload"]["error"]
+
+
+def test_readiness_health_stays_green_when_couchdb_is_unreachable():
+    """The reason /health/database is a separate path at all.
+
+    /health is this pod's readiness probe. Folding the database check into
+    it would pull the platform's only bridge out of its Service over a
+    CouchDB blip -- an outage caused by the monitoring, not the fault. The
+    bridge can still serve /generate with CouchDB down.
+    """
+    handler, sent = _make_handler({}, path="/health")
+    with _patch_client(_health_payload(reachable=False)):
+        handler.do_GET()
+    assert sent["status"] == 200
+    assert sent["payload"] == {"status": "ok", "draining": False}
