@@ -714,3 +714,23 @@ def test_split_chunks_caps_a_chunk_that_mixes_ordinary_lines_and_a_long_one(env)
     chunks = vault_tool._split_chunks(content)
     assert "".join(chunks) == content
     assert max(len(c.encode("utf-8")) for c in chunks) <= vault_tool.CHUNK_MAX_BYTES
+
+
+def test_no_ambient_couchdb_config_reaches_the_suite():
+    """Pins the `no_ambient_vault_routing` fixture in conftest.
+
+    Honest limitation, stated rather than papered over: this can only fail
+    where the ambient environment actually carries `CDB_*` -- the bridge
+    pod, not CI. That is precisely the case the fixture exists for, and
+    the case CI structurally cannot see, so a test that only bites there
+    is the right shape rather than a weak one. Deleting the fixture turns
+    this green in CI and red in the pod, which is the same asymmetry that
+    made the bug worth fixing.
+    """
+    import os
+    leaked = sorted(k for k in os.environ if k.startswith("CDB_"))
+    assert leaked == [], (
+        f"{leaked} visible to tests -- a test that builds a VaultClient "
+        "without an `env` fixture would point at the live vault, and "
+        "`recent` would sweep whichever databases the pod is configured for"
+    )
