@@ -219,6 +219,37 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # only turn the honest 503 below into a connection refused.
             self._send(200, {"status": "ok", "draining": _shutdown_requested})
             return
+        if self.path == "/health/database":
+            # Deliberately NOT folded into /health, and not because of
+            # tidiness: /health is this pod's readiness probe, so a 503
+            # here would pull the bridge out of the Service. CouchDB being
+            # briefly unreachable does not mean the bridge cannot serve
+            # /generate, and taking the whole platform's only bridge down
+            # over a database blip would be a self-inflicted outage.
+            #
+            # Never cached, for the same reason nova-site's /api/health is
+            # not: this is asked precisely when a config flip has just
+            # happened, so a stale answer is the wrong answer at exactly
+            # the moment it matters.
+            #
+            # Unauthenticated, like /health above. It exposes two database
+            # names and two doc counts on a ClusterIP with no ingress, and
+            # the entire value of it is being one curl -- a token would put
+            # it back behind the hand-rolled lookup it exists to replace.
+            try:
+                from bridge.vault_tool import VaultClient
+                health = VaultClient().database_health()
+            except Exception as e:
+                # A client that cannot even be constructed (CDB_BASE unset)
+                # is a real, reportable answer, not a stack trace.
+                self._send(503, {"error": str(e)[:300], "ok": False})
+                return
+            unreachable = [
+                role for role, db in health["databases"].items() if not db["reachable"]
+            ]
+            health["ok"] = not unreachable
+            self._send(200 if health["ok"] else 503, health)
+            return
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
