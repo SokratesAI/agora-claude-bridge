@@ -12,22 +12,30 @@ on:
 #
 # Measured 2026-08-12 in this repo. #41 merged at 00:18:38Z and #40 at
 # 00:18:41Z -- three seconds apart, with #40 the newer of the two and
-# carrying #41's commit 4ee2ff7 as its parent. The config repo was then
-# pinned to sha256:dd38617..., which is the image built from 4ee2ff7; the
-# image built from #40's commit f36df04 is sha256:49201d4... and was never
-# deployed. Every check was green -- CI passed on both, both images built,
-# ArgoCD synced -- and the deployed pod served a 404 for /health/database,
-# which #40 had just added. Nothing anywhere reported an error.
+# carrying #41's commit 4ee2ff7 as its parent. Two pipelines therefore ran
+# concurrently. agora-claude-bridge-config took exactly one commit out of
+# that window, 63af6e3 at 00:20:39Z, pinning the deployment to
+# sha256:dd38617... -- and the pod that came up served a 404 for
+# /health/database, the endpoint #40 had just added. So the deployed image
+# did not contain the newer of the two merges. Every check was green: CI
+# passed on both, both images built, ArgoCD synced, nothing reported an
+# error anywhere.
 #
-# (Those digests are the evidence, and they are checkable:
-#  gh api /orgs/SokratesAI/packages/container/agora-claude-bridge/versions
-#  maps sha-4ee2ff7 and sha-f36df04 to two different images.)
+# Deliberately NOT claimed, because two primary sources disagree and this
+# comment is not the place to pick a winner:
+#   - which commit's build produced sha256:dd38617. The registry tags say
+#     sha-4ee2ff7 -> dd38617 and sha-f36df04 -> 49201d4
+#     (gh api /orgs/SokratesAI/packages/container/agora-claude-bridge/versions),
+#     but the build-push job logs of BOTH runs 31549742746 and 31549746111
+#     report Digest dd38617 despite different ImageIDs, which cannot be
+#     right either. Unresolved; see the note in nova/resources/issues.md.
+#   - which build *finished* first. An earlier draft of this comment said
+#     #41's pushed "one second later". Nobody ever measured that -- it was a
+#     plausible number that became a fact by being written down and copied
+#     into four repositories, which is what this edit exists to undo.
 #
-# What is deliberately NOT claimed here: which build *finished* first. An
-# earlier draft of this comment said #41's pushed "one second later", and
-# nobody ever measured that -- it was a plausible number that became a fact
-# by being written down and copied into four repositories. The digests above
-# are what actually settles which image won.
+# None of that ambiguity touches the fix: two unserialised pipelines both
+# blind-`sed` the same manifest, and only one commit landed.
 #
 # cancel-in-progress stays false deliberately: killing a run partway through
 # update-manifest is the exact failure this is meant to prevent. Queued runs
