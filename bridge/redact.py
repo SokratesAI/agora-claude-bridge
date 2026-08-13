@@ -44,10 +44,30 @@ _PATTERNS = (
     # is unguessable but the NAME beside it is not. Only the value is
     # replaced -- the name stays, because knowing that ANTHROPIC_API_KEY is
     # set is exactly the kind of thing he wants to be able to see.
+    #
+    # Two of those three shapes were missed until Cycle 170, and the drift
+    # probes in the runner's tools/sync_contract.py found both on their first
+    # run: JSON quotes the NAME too, so `"couchdb_password": "x"` put a `"`
+    # between the name and the colon and nothing matched; and `_PASS` is
+    # neither `PASSWD` nor `PASSWORD`, while `CDB_PASS` is the name this very
+    # system holds its CouchDB password under. `_PASS` carries the underscore
+    # on purpose -- a bare `pass:` is an ordinary English word, and "second
+    # pass: completed" is exactly the over-redaction the keep-everything rule
+    # forbids.
     ("value", re.compile(
-        r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)S?)"
-        r"(\s*[=:]\s*\"?)"
-        r"([^\s\"',}]{8,})"
+        r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|_PASS|API[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)S?)"
+        r"(\"?\s*[=:]\s*\"?)"
+        # The lookahead is load-bearing and was not in the pre-Cycle-170
+        # version, because that version could not reach this position at all
+        # in JSON. `_PATTERNS` runs in order, so by the time this one sees
+        # the CLI credentials file the anthropic-key pattern has already
+        # replaced the token with `[redacted: anthropic key]` -- and
+        # `[redacted:` is 10 characters none of which are excluded below, so
+        # this pattern matched the marker as if it were the value and
+        # produced `[redacted: value] anthropic key]`. Caught by
+        # test_tool_output_is_redacted_on_the_way_out, which had been green
+        # for weeks and went red on the widening.
+        r"((?!\[redacted:)[^\s\"',}]{8,})"
     )),
 )
 
