@@ -1,4 +1,5 @@
 """Credentials must not reach the conversation through tool output."""
+import json
 from unittest.mock import patch
 
 from bridge import activity
@@ -73,6 +74,52 @@ def test_ordinary_output_passes_through_untouched():
         "ghcr.io/sokratesai/agora@sha256:c62194fc96e80b42aaee3cc15199a32902d6406c\n"
     )
     assert redact(diff) == diff
+
+
+def test_json_quotes_the_name_too_and_the_value_is_still_found():
+    """`"couchdb_password": "x"` -- the shape the module comment claimed to
+    cover and did not. The closing quote of a JSON key sat between the name
+    and the colon, so nothing matched. Found by the drift probes in the
+    runner's tools/sync_contract.py rather than by anyone reading this file.
+    The quote is kept in the replacement, so the document still parses --
+    the half a `not in out` assertion cannot see."""
+    out = redact('{"couchdb_password": "notarealpassword", "db": "nova"}')
+    assert out == '{"couchdb_password": "[redacted: value]", "db": "nova"}'
+    assert json.loads(out)["couchdb_password"] == "[redacted: value]"
+
+
+def test_the_name_this_system_keeps_its_own_password_under_is_covered():
+    """`CDB_PASS` is neither PASSWD nor PASSWORD, and it is the live one."""
+    out = redact("CDB_PASS: notarealpassword1234\nCDB_USER: nova")
+    assert "CDB_PASS: [redacted: value]" in out
+    assert "notarealpassword1234" not in out
+    assert "CDB_USER: nova" in out
+
+
+def test_the_english_word_pass_is_not_eaten():
+    """Why `_PASS` carries its underscore. Over-redacting prose is the
+    failure this module exists to avoid, so the widening above is pinned
+    from both sides -- otherwise the next cycle drops the underscore to
+    catch one more case and quietly starts editing narration."""
+    for text in ("second pass: completed successfully",
+                 "a first pass at the digest: reasonable",
+                 "The password rotation is in decisions/adr-0012.md."):
+        assert redact(text) == text
+
+
+def test_a_marker_this_module_wrote_is_not_redacted_a_second_time():
+    """`_PATTERNS` runs in order and each pass sees the previous pass's
+    output. The credentials file names its fields `accessToken` and
+    `refreshToken`, so once the anthropic pattern has left
+    `[redacted: anthropic key]` behind, the value pattern is looking at a
+    name it recognises followed by a marker it wrote itself -- and
+    `[redacted:` is a legal value shape. The label came out as
+    `[redacted: value] anthropic key]`, which names the wrong pattern."""
+    out = redact(CREDENTIALS_FILE)
+    assert "[redacted: anthropic key]" in out
+    assert "[redacted: value]" not in out
+    assert json.loads(out)["claudeAiOauth"]["accessToken"] == (
+        "[redacted: anthropic key]")
 
 
 def test_non_strings_pass_through():

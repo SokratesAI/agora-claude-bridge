@@ -76,7 +76,7 @@ jobs:
   # two hand-written copies of one client against one CouchDB. Cycles 136-142,
   # 148, 151 and 167 each wrote the same fix into both by hand, and nothing
   # noticed a miss. The comparison lives in the runner as
-  # tools/vault_contract.py and is checked out here rather than copied --
+  # tools/sync_contract.py and is checked out here rather than copied --
   # a second copy of the drift checker is the drift it checks for.
   #
   # This job is the mirror of the runner's, and both are needed: the runner's
@@ -108,7 +108,7 @@ jobs:
           python-version: "3.12"
       # Run from the runner checkout so the tool imports as `tools.`, and
       # point back out at this repo's copy.
-      - run: python -m tools.vault_contract agora_runner/vault.py ../bridge/vault_tool.py
+      - run: python -m tools.sync_contract . ..
         working-directory: .runner
 
   build-push:
