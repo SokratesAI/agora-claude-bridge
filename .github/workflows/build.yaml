@@ -59,10 +59,19 @@ jobs:
       - name: Secret scan
         # gitleaks/gitleaks-action@v2 requires a paid GITLEAKS_LICENSE for org repos —
         # the underlying gitleaks CLI is free/OSS, run that directly instead.
+        #
+        # This scans the whole commit HISTORY, so a credential-shaped string that
+        # reaches main fails every future run on main, not just its own PR — and
+        # the fix at that point is a history rewrite. That is why the failure
+        # message below spells out the escape hatch: the moment to use it is now,
+        # on the PR, not after merge.
         run: |
           curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
             | tar -xz -C /usr/local/bin gitleaks
-          gitleaks detect --source . --no-banner --redact
+          gitleaks detect --source . --no-banner --redact || {
+            echo "::error::Secret scan failed. If the finding is a FABRICATED test fixture, append '# gitleaks:allow' to that line and push again — it is per-line, stays visible in review, and needs no config file. If it is a REAL credential: do not allowlist it, rotate it, and do not merge this branch (the scan reads history, so the leak survives deleting the line)."
+            exit 1
+          }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -108,6 +117,9 @@ jobs:
           python-version: "3.12"
       # Run from the runner checkout so the tool imports as `tools.`, and
       # point back out at this repo's copy.
+      # The CI-workflow pair is compared as parsed YAML rather than as text,
+      # so this job needs pyyaml even though the other two pairs do not.
+      - run: pip install pyyaml
       - run: python -m tools.sync_contract . ..
         working-directory: .runner
 
