@@ -941,12 +941,15 @@ class VaultClient:
         "this file should not exist yet". Omit it and the write is
         unconditional, which is what every caller got before and still
         gets."""
-        lower = path.lower()
-        try:
-            existing = self._doc_to_overwrite(lower, db=self.db_for(lower))
-        except VaultUnreadableDocument as e:
-            return f"FAILED(unreadable: {e})"
-        return self._put_raw(path, content, existing, if_rev=if_rev)
+        # The pre-write lookup that used to sit here is gone rather than
+        # fixed. It asked `_put_raw`'s own question one frame early and then
+        # handed the answer down -- and `_put_raw` re-asks it whenever what
+        # it gets is None, so on a file that really is absent this GET ran
+        # twice. Writing the missing/unreadable fix into both was writing it
+        # twice too: a mutation check reverting only this site failed
+        # nothing, because the lookup below caught every case anyway. One
+        # lookup, one place, one answer, and no second copy to drift.
+        return self._put_raw(path, content, if_rev=if_rev)
 
     def append(self, path, content, after_marker=""):
         """Add to an EXISTING file without losing what's already there.

@@ -47,7 +47,7 @@ class FakeCouch:
         self.reads = 0
         #: {nth file-doc read: fn(couch)} -- another writer landing just
         #: before that read is served. Read 1 is the caller's own; read 2
-        #: is the lookup inside `write`. **Two is the one that matters,
+        #: is the lookup inside `_put_raw`. **Two is the one that matters,
         #: and getting this wrong is why the first version of these tests
         #: passed against the bug.** An interloper that lands after read 2
         #: is caught either way, because the unconditional path has
