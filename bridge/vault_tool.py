@@ -816,8 +816,8 @@ class VaultClient:
 
         It raises rather than returning a sentinel because "absent" and
         "unreadable" already share a vocabulary on the read side. It is
-        caught at both write entry points rather than allowed to escape,
-        because the write contract is a string -- "written" or
+        caught by its single caller, `_put_raw`, rather than allowed to
+        escape, because the write contract is a string -- "written" or
         "FAILED(...)" is what every caller and the CLI branch on.
 
         What the old behaviour actually cost, in the two shapes it took:
