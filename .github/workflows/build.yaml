@@ -72,6 +72,45 @@ jobs:
       - run: python -m compileall bridge run.py
       - run: pytest tests/ -q
 
+  # bridge/vault_tool.py and agora_runner/vault.py in agora-persona-runner are
+  # two hand-written copies of one client against one CouchDB. Cycles 136-142,
+  # 148, 151 and 167 each wrote the same fix into both by hand, and nothing
+  # noticed a miss. The comparison lives in the runner as
+  # tools/vault_contract.py and is checked out here rather than copied --
+  # a second copy of the drift checker is the drift it checks for.
+  #
+  # This job is the mirror of the runner's, and both are needed: the runner's
+  # only runs when the runner changes, so a one-sided edit to this file would
+  # otherwise reach main with nothing having compared it to anything.
+  #
+  # Separate from `test` so a token that cannot reach the other repo fails on
+  # its own line, and not a dependency of build-push: drift is a fact about
+  # both repos, not a reason to stop shipping one of them.
+  vault-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate installation token scoped to the runner repo only
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ORG_APP_ID }}
+          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+          owner: SokratesAI
+          repositories: agora-persona-runner
+      - uses: actions/checkout@v4
+        with:
+          repository: SokratesAI/agora-persona-runner
+          token: ${{ steps.app-token.outputs.token }}
+          path: .runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Run from the runner checkout so the tool imports as `tools.`, and
+      # point back out at this repo's copy.
+      - run: python -m tools.vault_contract agora_runner/vault.py ../bridge/vault_tool.py
+        working-directory: .runner
+
   build-push:
     if: github.ref == 'refs/heads/main'
     needs: test
