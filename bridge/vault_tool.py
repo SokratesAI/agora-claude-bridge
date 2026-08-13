@@ -804,6 +804,49 @@ class VaultClient:
             if "error" not in row and not (row.get("value") or {}).get("deleted")
         }
 
+    def _doc_to_overwrite(self, doc_id, db=None):
+        """The document a write is about to replace, or None if there is none.
+
+        The third and last copy of the missing/unreadable conflation the
+        reads lost in runner#148 / bridge#49. Both write sites did
+        `existing if status == 200 else None`, so a 500, a 503 or a 401 on
+        the pre-write lookup made a live document look absent. Only a 404
+        means absent here, exactly as in `read_rev`; anything else raises
+        and the caller turns it into a `FAILED(...)` string.
+
+        It raises rather than returning a sentinel because "absent" and
+        "unreadable" already share a vocabulary on the read side. It is
+        caught at both write entry points rather than allowed to escape,
+        because the write contract is a string -- "written" or
+        "FAILED(...)" is what every caller and the CLI branch on.
+
+        What the old behaviour actually cost, in the two shapes it took:
+
+        - With a real `if_rev` -- which is every `put --if-rev-file`, so
+          every journal entry and every digest write this loop makes --
+          `doc["_rev"]` comes from the caller and the PUT *succeeds*. The
+          only thing `existing` still carries there is `ctime`, which
+          silently became "now". A successful write that quietly rewrites
+          the file's creation time is the failure nobody would notice.
+        - With `if_rev=None` or unconditional, the PUT goes out with no
+          `_rev` and 409s against the live document. Safe, but
+          misattributed: the caller is told the file "changed since it was
+          read" when nothing changed and the database was refusing. That
+          string is load bearing -- `_write_exit` turns it into
+          `CONFLICT_EXIT`, `append` retries on it, and Nova's own
+          instructions say exit 3 means re-read and try again. Retrying is
+          the one wrong response to a 500.
+        """
+        status, existing = self.get_doc(doc_id, db=db)
+        if status == 200:
+            return existing
+        if status == 404:
+            return None
+        raise VaultUnreadableDocument(
+            f"{doc_id}: CouchDB answered HTTP {status} — refusing to treat a "
+            "document it will not let this client read as one that is not there"
+        )
+
     def _put_raw(self, path, content, existing=None, if_rev=_ANY_REV):
         path = path.lower()
         # One lookup, reused for the chunks and the file doc, so a chunk
@@ -816,8 +859,13 @@ class VaultClient:
         chunk_ids = [self._chunk_id_for(t.encode("utf-8")) for t in chunk_texts]
 
         if existing is None:
-            status, found = self.get_doc(path, db=db)
-            existing = found if status == 200 else None
+            # Reached both when the caller genuinely found nothing and when
+            # the caller never looked, so it has to answer the same question
+            # the same way rather than falling back to the old conflation.
+            try:
+                existing = self._doc_to_overwrite(path, db=db)
+            except VaultUnreadableDocument as e:
+                return f"FAILED(unreadable: {e})"
 
         # Chunks are content-addressed, so one that already exists holds
         # exactly this text and does not need rewriting -- that reuse is
@@ -893,10 +941,12 @@ class VaultClient:
         "this file should not exist yet". Omit it and the write is
         unconditional, which is what every caller got before and still
         gets."""
-        status, existing = self.get_doc(path.lower(), db=self.db_for(path.lower()))
-        return self._put_raw(
-            path, content, existing if status == 200 else None, if_rev=if_rev
-        )
+        lower = path.lower()
+        try:
+            existing = self._doc_to_overwrite(lower, db=self.db_for(lower))
+        except VaultUnreadableDocument as e:
+            return f"FAILED(unreadable: {e})"
+        return self._put_raw(path, content, existing, if_rev=if_rev)
 
     def append(self, path, content, after_marker=""):
         """Add to an EXISTING file without losing what's already there.

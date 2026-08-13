@@ -54,6 +54,15 @@ class FakeCouch:
         #: already taken its revision by then -- so a test that
         #: interleaves there proves nothing about `if_rev`.
         self.interleave = {}
+        #: {doc_id: status} -- a GET of that *file* doc is answered with this
+        #: status instead of the document. Chunk reads and `_all_docs` are
+        #: untouched, which is the point: the failure this models is one
+        #: document's read failing while the database is otherwise up, so the
+        #: chunk writes still succeed and the file PUT still reaches CouchDB.
+        #: A fake that took the whole database down instead would fail at the
+        #: chunk stage and never exercise the branch under test.
+        #: Used by `test_vault_unreadable_is_not_absent_on_write.py`.
+        self.unreadable = {}
 
     def _next_rev(self, doc_id):
         current = self.docs.get(doc_id, {}).get("_rev", "0-x")
@@ -81,6 +90,9 @@ class FakeCouch:
                 hook = self.interleave.pop(self.reads, None)
                 if hook is not None:
                     hook(self)
+                status = self.unreadable.get(rest)
+                if status is not None:
+                    return status, {"error": "server_error"}
             if rest in self.docs:
                 return 200, dict(self.docs[rest])
             return 404, {"error": "not_found"}
