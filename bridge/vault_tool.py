@@ -281,6 +281,36 @@ def _split_chunks(content):
     return chunks
 
 
+class VaultUnreadableDocument(RuntimeError):
+    """CouchDB answered a single-document read with neither 200 nor 404.
+
+    Raised for the same reason `VaultIncompleteDocument` below is: the
+    answer it replaces is *plausible*. `read_rev` collapsed every non-200
+    into `(None, None)`, so a 500, a 503 or a 401 was indistinguishable
+    from a file that does not exist -- and `get` printed
+    `[not found: <path>]` for both.
+
+    The reader that makes this expensive is Nova itself. This CLI is how a
+    cycle reads its own instructions, its journal, and Edvard's capture
+    files at the start of every run. `[not found]` is a fact a cycle acts
+    on: it has written a missing file into the permanent record before
+    (Cycle 9 recorded "Cycle 8 is missing... Unexplained" while the
+    explanation sat in a file it could not see). Two comments further down
+    this file already say, in those words, that "that folder is empty" and
+    "that file does not exist" are things a cycle writes into the journal
+    as fact -- they were written when the *listing* half of this was fixed
+    and the single-document read was left behind.
+
+    404 stays `(None, None)`. It is a real answer, `append` distinguishes
+    it from a tombstone by the `rev` beside it, and `put` needs it to
+    create a file that does not exist yet.
+
+    `main` prints this to stderr and exits non-zero, so a caller piping
+    `get` into a file gets an empty file and a visible error rather than
+    a confident `[not found]` it will act on.
+    """
+
+
 class VaultIncompleteDocument(RuntimeError):
     """A file doc references content chunks that are not in the database.
 
@@ -525,23 +555,41 @@ class VaultClient:
         those two cases are `(None, "<rev>")` and `(None, None)`, and they
         are not the same.
 
-        **`(None, None)` is not only "no document here".** It is every
-        non-200 from the GET, so a 500 or a timeout collapses into the same
-        answer as a genuine 404, and `append` then reports a live file as
-        `not found` -- which is exactly the failed-read-looks-empty class
-        that runner#117 fixed for the listing tools and did not fix here.
-        The runner's copy of this function says "only when no document
-        exists", which is the claim rather than the behaviour. Stating it
-        accurately here rather than fixing it, because the fix belongs in
-        both clients at once and is a wider change than this one.
+        **2026-08-13: `(None, None)` now means only "no document here".**
+        It used to be every non-200 from the GET, so a 500 or a timeout
+        collapsed into the same answer as a genuine 404 -- the
+        failed-read-looks-empty class that runner#117 fixed for the listing
+        tools and did not fix here. The paragraph this replaces described
+        that accurately and deferred the fix, "because the fix belongs in
+        both clients at once and is a wider change than this one". Both
+        clients are being changed now (runner#148), which is the condition
+        that deferral was waiting for.
+
+        It matters most for the reader nobody was counting. `get` is how a
+        Nova cycle reads its own instructions, its journal and Edvard's
+        capture files, and it printed `[not found: <path>]` for a database
+        that would not answer. A cycle that reads that has no way to tell
+        it from a file that is genuinely gone, and this loop writes what it
+        found into a permanent record -- which is the failure two comments
+        further down this same file already warn about for `ls` and for the
+        batch fetch, in those words. Single-document reads were the copy
+        left behind.
+
+        `append` gets the other half: it refused a live file as
+        `not found` and now surfaces the real reason instead.
 
         Ported from `agora_runner/vault.py` (runner #118), which carries the
         same client against the same database.
         """
         db = self.db_for(path.lower())
         status, doc = self.get_doc(path.lower(), db=db)
-        if status != 200:
+        if status == 404:
             return None, None
+        if status != 200:
+            raise VaultUnreadableDocument(
+                f"{path.lower()}: CouchDB answered HTTP {status} on database "
+                f"{db!r} -- refusing to report this as a missing file"
+            )
         # A LiveSync tombstone keeps its content chunks, so assemble()
         # happily rebuilds the text of a note that no longer exists --
         # see file_docs(). Deleted means gone; recover from the daily
@@ -1031,6 +1079,12 @@ def main(argv=None):
         return _dispatch(argv)
     except VaultIncompleteDocument as e:
         print(f"[INCOMPLETE DOCUMENT] {e}", file=sys.stderr)
+        return 1
+    except VaultUnreadableDocument as e:
+        # Same exit path and the same reason: the alternative is a
+        # confident `[not found]` that a cycle reads as a fact about the
+        # vault rather than a fact about the database.
+        print(f"[UNREADABLE DOCUMENT] {e}", file=sys.stderr)
         return 1
     except VaultUsage as e:
         print(f"[usage] {e}", file=sys.stderr)
