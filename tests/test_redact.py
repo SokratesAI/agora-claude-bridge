@@ -1,5 +1,5 @@
-import json
 """Credentials must not reach the conversation through tool output."""
+import json
 from unittest.mock import patch
 
 from bridge import activity
