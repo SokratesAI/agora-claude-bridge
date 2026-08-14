@@ -226,14 +226,27 @@ def test_the_stamp_degrades_to_no_clock_rather_than_a_wrong_one(tmp_path):
     assert "Oslo" not in out
 
 
-def test_the_stamp_repeats_and_is_not_deduplicated(tmp_path):
+def test_the_stamp_repeats_where_a_warning_would_be_suppressed(tmp_path):
     """The deliberate design decision, pinned because it looks like waste to
     anyone optimising later. ~98 tool calls a cycle at ~20 tokens is ~2k
     tokens; the value is being in front of the model at the moment it
-    reasons about time, which a once-a-minute stamp would miss."""
-    outs = [drive_hook(tmp_path, m, "PostToolUse") for m in (40, 39, 38, 37)]
-    assert all(o is not None and o.startswith("Clock:") for o in outs)
-    assert len(outs) == 4
+    reasons about time, which a once-a-minute stamp would miss.
+
+    Driven *past a band crossing* on purpose. Before minute 15 the dedupe
+    machinery is dormant -- band 0 is never "announced" -- so repeated
+    stamps there prove only that nothing suppressed them, which is also
+    what a broken dedupe would look like. Inside a band the suppression is
+    live and demonstrably working on the warning, so a stamp that still
+    fires on every call is the real evidence.
+    """
+    assert drive_hook(tmp_path, 40, "PostToolUse").startswith("Clock:")
+    assert drive_hook(tmp_path, 12, "PostToolUse").startswith("TIME LOW")
+    # Same band, three more calls: the warning is suppressed and the stamp
+    # is not.
+    for minutes in (11, 10, 9):
+        out = drive_hook(tmp_path, minutes, "PostToolUse")
+        assert out.startswith("Clock:"), out
+        assert f"{minutes} min left of this turn" in out
 
 
 def test_the_stamp_is_not_a_warning(tmp_path):
