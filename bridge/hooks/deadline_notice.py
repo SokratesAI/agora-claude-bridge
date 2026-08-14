@@ -11,10 +11,15 @@ Two events, same split as the quota hook:
 - UserPromptSubmit fires once, at the top of a cycle, and always reports.
   "You have 45 minutes" changes what a cycle should attempt, and it only
   gets one chance to hear it before it starts choosing.
-- PostToolUse fires after every tool call -- hundreds per cycle -- and
-  reports only on crossing into a lower band, for the reason spelled out
-  in quota_notice.py: repeating one line on 300 tool calls spends ~18k
-  tokens of context restating a warning.
+- PostToolUse fires after every tool call and does two different things.
+  It announces a *warning* only on crossing into a lower band, for the
+  reason spelled out in quota_notice.py: repeating a full warning on
+  every tool call spends context restating something already heard. But
+  on every other call it now emits a bare clock stamp (stamp_for),
+  because silence between the bands is exactly where the drift this hook
+  exists to correct actually happens. See stamp_for for the measured
+  cost; the median cycle makes ~98 tool calls, not the 300 assumed when
+  this file was written.
 
 The warning bands are measured, not picked for roundness. Across the last
 12 Nova cycles that posted a reply (2026-08-10, from Agora's own message
@@ -151,6 +156,38 @@ def oslo_clock(now=None):
     return stamp.strftime("%H:%M Oslo")
 
 
+def stamp_for(minutes_left, clock="", minutes_gone=None):
+    """The line every other tool result carries -- idea #72, Edvard's own:
+    *"add a timestamp to the return of some tools so you do not get so
+    paranoid of the time ... getting the actual timestamp from some of the
+    tools you use can get you to get a better hold on reality."*
+
+    The bands above fire five times a cycle at most, and the drift they
+    were meant to correct happens between them: twelve cycles have now cut
+    their own scope against a clock they never read, two of them by half an
+    hour. A band announced once at minute 15 does not help a cycle that
+    decided at minute 6 it was nearly out of time. So this is the
+    continuous version -- no advice, no framing, just where the clock
+    actually is, next to a result the session is already reading.
+
+    Cost, measured rather than guessed (the six most recent real cycle
+    transcripts on the PVC): 76, 87, 88, 108, 142, 160 tool calls, median
+    ~98 -- not the 300 the PostToolUse comment above estimates. At ~20
+    tokens of context per stamp that is ~2k tokens a cycle, against a
+    median cycle of 1.46M weighted. That is why this repeats instead of
+    debouncing to once a minute: deduplicating would save nothing worth
+    having, and the whole value is being in front of the model at the
+    moment it reasons about time rather than a minute earlier.
+    """
+    gone = f"{minutes_gone:.0f} min gone, " if minutes_gone is not None else ""
+    if not clock:
+        # No clock beats a wrong clock, same call oslo_clock() makes -- but
+        # the elapsed figures come off a monotonic record, not the zone
+        # database, so they are still worth saying.
+        return f"Clock: {gone}{minutes_left:.0f} min left of this turn."
+    return f"Clock: {clock} · {gone}{minutes_left:.0f} min left of this turn."
+
+
 def message_for(band, minutes_left, timeout_minutes, clock="", minutes_gone=None):
     lead = f"{clock} — " if clock else ""
     if band >= WARN_NEARLY_UP:
@@ -214,18 +251,27 @@ def main():
     # one were heard by a process that no longer exists.
     announced = state.get("band", 0) if state.get("session_id") == session_id else 0
 
+    clock = oslo_clock()
+
     if event == "UserPromptSubmit":
         write_state(session_id, band)
     elif band > announced:
         write_state(session_id, band)
     else:
+        # Nothing new to warn about -- which used to mean silence, and
+        # silence is where the drift lives. Stamp the clock instead.
+        text = stamp_for(minutes_left, clock=clock, minutes_gone=minutes_gone)
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": text,
+        }}))
         return
 
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event,
         "additionalContext": message_for(
             band, minutes_left, timeout_minutes,
-            clock=oslo_clock(), minutes_gone=minutes_gone,
+            clock=clock, minutes_gone=minutes_gone,
         ),
     }}))
 
