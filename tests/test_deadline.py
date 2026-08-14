@@ -136,13 +136,13 @@ def test_the_silent_first_two_thirds_now_reports_position(tmp_path):
     """Ten cycles (175-184) misjudged where they were in the turn, every one
     of them above the 15-minute line, where this hook used to say nothing
     between turn start and TIME LOW."""
-    assert drive_hook(tmp_path, 40, "PostToolUse") is None
+    assert drive_hook(tmp_path, 40, "PostToolUse").startswith("Clock:")
     third = drive_hook(tmp_path, 28, "PostToolUse")
     assert third is not None and third.startswith("Time check:")
     assert "17 min gone" in third
     assert "about 28 of this turn's 45 minutes remain" in third
     # Announced once, like every other band.
-    assert drive_hook(tmp_path, 25, "PostToolUse") is None
+    assert drive_hook(tmp_path, 25, "PostToolUse").startswith("Clock:")
     half = drive_hook(tmp_path, 20, "PostToolUse")
     assert half is not None and "25 min gone" in half
     # A position report must not read as a deadline, or it becomes the
@@ -199,32 +199,89 @@ def test_first_prompt_always_reports_even_with_the_whole_turn_left(tmp_path):
     assert "killed with no reply posted" in out
 
 
-def test_post_tool_use_says_nothing_while_there_is_time(tmp_path):
-    assert drive_hook(tmp_path, 40, "PostToolUse") is None
+def test_post_tool_use_stamps_the_clock_while_there_is_time(tmp_path):
+    """It used to say nothing here. Silence between the bands is where the
+    drift lives -- idea #72."""
+    out = drive_hook(tmp_path, 40, "PostToolUse")
+    assert out.startswith("Clock:")
+    assert "5 min gone" in out and "40 min left of this turn" in out
+    assert not out.startswith("TIME")
+
+
+def test_the_stamp_carries_the_oslo_wall_clock(tmp_path):
+    """Edvard's ask is the wall clock specifically -- "getting the actual
+    timestamp ... can get you to get a better hold on reality"."""
+    with patch.object(deadline_notice, "oslo_clock", return_value="23:14 Oslo"):
+        out = drive_hook(tmp_path, 40, "PostToolUse")
+    assert out == "Clock: 23:14 Oslo · 5 min gone, 40 min left of this turn."
+
+
+def test_the_stamp_degrades_to_no_clock_rather_than_a_wrong_one(tmp_path):
+    """Same call oslo_clock() makes: a confidently stated wrong time is the
+    failure being fixed. The elapsed figures come off the record, not the
+    zone database, so they survive."""
+    with patch.object(deadline_notice, "oslo_clock", return_value=""):
+        out = drive_hook(tmp_path, 40, "PostToolUse")
+    assert out == "Clock: 5 min gone, 40 min left of this turn."
+    assert "Oslo" not in out
+
+
+def test_the_stamp_repeats_where_a_warning_would_be_suppressed(tmp_path):
+    """The deliberate design decision, pinned because it looks like waste to
+    anyone optimising later. ~98 tool calls a cycle at ~20 tokens is ~2k
+    tokens; the value is being in front of the model at the moment it
+    reasons about time, which a once-a-minute stamp would miss.
+
+    Driven *past a band crossing* on purpose. Before minute 15 the dedupe
+    machinery is dormant -- band 0 is never "announced" -- so repeated
+    stamps there prove only that nothing suppressed them, which is also
+    what a broken dedupe would look like. Inside a band the suppression is
+    live and demonstrably working on the warning, so a stamp that still
+    fires on every call is the real evidence.
+    """
+    assert drive_hook(tmp_path, 40, "PostToolUse").startswith("Clock:")
+    assert drive_hook(tmp_path, 12, "PostToolUse").startswith("TIME LOW")
+    # Same band, three more calls: the warning is suppressed and the stamp
+    # is not.
+    for minutes in (11, 10, 9):
+        out = drive_hook(tmp_path, minutes, "PostToolUse")
+        assert out.startswith("Clock:"), out
+        assert f"{minutes} min left of this turn" in out
+
+
+def test_the_stamp_is_not_a_warning(tmp_path):
+    """A position line that reads as a deadline becomes the thing it exists
+    to prevent -- so it carries no advice and no wrap-up instructions."""
+    out = drive_hook(tmp_path, 40, "PostToolUse")
+    assert not out.startswith("TIME")
+    assert "journal-digest.md" not in out
+    assert "Start nothing new" not in out
+    assert "size the work" not in out
 
 
 def test_each_band_announces_once_and_only_escalates(tmp_path):
-    """~300 tool calls a cycle: repeating one line on all of them costs
-    ~18k tokens of context restating a warning."""
-    assert drive_hook(tmp_path, 40, "PostToolUse") is None
+    """Repeating a full warning on every tool call costs context restating
+    something already heard -- so a band fires once, and every call in
+    between carries the bare stamp instead."""
+    assert drive_hook(tmp_path, 40, "PostToolUse").startswith("Clock:")
     first = drive_hook(tmp_path, 12, "PostToolUse")
     assert first is not None and first.startswith("TIME LOW")
-    # Same band again, and time still passing inside it: silence.
-    assert drive_hook(tmp_path, 10, "PostToolUse") is None
-    assert drive_hook(tmp_path, 9, "PostToolUse") is None
+    # Same band again, and time still passing inside it: no second warning.
+    assert drive_hook(tmp_path, 10, "PostToolUse").startswith("Clock:")
+    assert drive_hook(tmp_path, 9, "PostToolUse").startswith("Clock:")
     second = drive_hook(tmp_path, 6, "PostToolUse")
     assert second is not None and second.startswith("TIME CRITICAL")
-    assert drive_hook(tmp_path, 5, "PostToolUse") is None
+    assert drive_hook(tmp_path, 5, "PostToolUse").startswith("Clock:")
     third = drive_hook(tmp_path, 2, "PostToolUse")
     assert third is not None and third.startswith("TIME NEARLY UP")
-    assert drive_hook(tmp_path, 1, "PostToolUse") is None
+    assert drive_hook(tmp_path, 1, "PostToolUse").startswith("Clock:")
 
 
 def test_a_new_session_starts_from_a_clean_slate(tmp_path):
     """Bands announced to the previous cycle were heard by a process that
     no longer exists."""
     assert drive_hook(tmp_path, 12, "PostToolUse", session_id="sess-1").startswith("TIME LOW")
-    assert drive_hook(tmp_path, 12, "PostToolUse", session_id="sess-1") is None
+    assert drive_hook(tmp_path, 12, "PostToolUse", session_id="sess-1").startswith("Clock:")
     assert drive_hook(tmp_path, 12, "PostToolUse", session_id="sess-2").startswith("TIME LOW")
 
 
