@@ -7,6 +7,7 @@ halves existed only as a silent `raise` before Cycle 82.
 import io
 import json
 import subprocess
+import sys
 import threading
 import time
 from unittest.mock import patch
@@ -105,13 +106,89 @@ def drive_hook(tmp_path, minutes_left, event, session_id="sess-1", timeout_secon
 
 def test_bands_are_the_measured_thresholds():
     assert deadline_notice.band_for(44) == 0
-    assert deadline_notice.band_for(15.1) == 0
-    assert deadline_notice.band_for(15) == 1
-    assert deadline_notice.band_for(8.1) == 1
-    assert deadline_notice.band_for(8) == 2
-    assert deadline_notice.band_for(3.1) == 2
-    assert deadline_notice.band_for(3) == 3
-    assert deadline_notice.band_for(-5) == 3
+    assert deadline_notice.band_for(30.1) == 0
+    assert deadline_notice.band_for(30) == deadline_notice.POSITION_THIRD
+    assert deadline_notice.band_for(22.1) == deadline_notice.POSITION_THIRD
+    assert deadline_notice.band_for(22) == deadline_notice.POSITION_HALF
+    assert deadline_notice.band_for(15.1) == deadline_notice.POSITION_HALF
+    assert deadline_notice.band_for(15) == deadline_notice.WARN_LOW
+    assert deadline_notice.band_for(8.1) == deadline_notice.WARN_LOW
+    assert deadline_notice.band_for(8) == deadline_notice.WARN_CRITICAL
+    assert deadline_notice.band_for(3.1) == deadline_notice.WARN_CRITICAL
+    assert deadline_notice.band_for(3) == deadline_notice.WARN_NEARLY_UP
+    assert deadline_notice.band_for(-5) == deadline_notice.WARN_NEARLY_UP
+
+
+def test_position_bands_sit_below_the_warnings_so_they_cannot_mute_one():
+    """main() only announces a band strictly higher than the last one, so a
+    position report numbered above TIME LOW would swallow it."""
+    warnings = (
+        deadline_notice.WARN_LOW,
+        deadline_notice.WARN_CRITICAL,
+        deadline_notice.WARN_NEARLY_UP,
+    )
+    for position in (deadline_notice.POSITION_THIRD, deadline_notice.POSITION_HALF):
+        assert all(position < warning for warning in warnings)
+    assert deadline_notice.POSITION_THIRD < deadline_notice.POSITION_HALF
+
+
+def test_the_silent_first_two_thirds_now_reports_position(tmp_path):
+    """Ten cycles (175-184) misjudged where they were in the turn, every one
+    of them above the 15-minute line, where this hook used to say nothing
+    between turn start and TIME LOW."""
+    assert drive_hook(tmp_path, 40, "PostToolUse") is None
+    third = drive_hook(tmp_path, 28, "PostToolUse")
+    assert third is not None and third.startswith("Time check:")
+    assert "17 min gone" in third
+    assert "about 28 of this turn's 45 minutes remain" in third
+    # Announced once, like every other band.
+    assert drive_hook(tmp_path, 25, "PostToolUse") is None
+    half = drive_hook(tmp_path, 20, "PostToolUse")
+    assert half is not None and "25 min gone" in half
+    # A position report must not read as a deadline, or it becomes the
+    # thing it exists to prevent.
+    for out in (third, half):
+        assert "not a warning" in out
+        assert "nothing needs to change" in out
+        assert not out.startswith("TIME")
+    # The warnings still fire underneath them.
+    assert drive_hook(tmp_path, 12, "PostToolUse").startswith("TIME LOW")
+
+
+def test_every_line_carries_the_oslo_wall_clock(tmp_path):
+    """The misreadings are made in wall-clock terms ("certain it was 23:33
+    when it was 23:09"); relative minutes give a drifted cycle nothing to
+    notice the drift against."""
+    with patch.object(deadline_notice, "oslo_clock", return_value="07:32 Oslo"):
+        for minutes in (45, 28, 20, 12, 6, 2):
+            event = "UserPromptSubmit" if minutes == 45 else "PostToolUse"
+            out = drive_hook(tmp_path / f"m{minutes}", minutes, event)
+            assert out is not None and "07:32 Oslo" in out
+
+
+def test_no_clock_is_reported_rather_than_a_wrong_one(tmp_path):
+    """A confidently stated wrong time is the exact failure this fixes, so
+    an unresolvable zone degrades to no clock, not to UTC."""
+    with patch.dict(sys.modules, {"zoneinfo": None}):
+        assert deadline_notice.oslo_clock() == ""
+    with patch.object(deadline_notice, "oslo_clock", return_value=""):
+        out = drive_hook(tmp_path, 28, "PostToolUse")
+    assert out is not None and out.startswith("Time check: 17 min gone")
+
+
+def test_position_reports_without_a_start_time_still_report(tmp_path):
+    """Records written before started_at existed must not silence the band."""
+    record = {"deadline_at": time.time() + 28 * 60, "timeout_seconds": 45 * 60}
+    printed = []
+    stdin = json.dumps({"hook_event_name": "PostToolUse", "session_id": "s"})
+    with patch.object(deadline_notice.deadline, "read", return_value=record), \
+         patch.object(deadline_notice, "STATE_FILE", str(tmp_path / "a.json")), \
+         patch("sys.stdin", io.StringIO(stdin)), \
+         patch("builtins.print", side_effect=lambda s: printed.append(s)):
+        deadline_notice.main()
+    out = json.loads(printed[0])["hookSpecificOutput"]["additionalContext"]
+    assert "about 28 of this turn's 45 minutes remain" in out
+    assert "min gone" not in out
 
 
 def test_first_prompt_always_reports_even_with_the_whole_turn_left(tmp_path):
