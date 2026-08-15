@@ -9,7 +9,7 @@ either of those repos and shouldn't grow one just for this.
 
 Usage (from Bash inside the bridge pod):
   python3 -m bridge.vault_tool get    <path> [--rev-file <f>]
-  python3 -m bridge.vault_tool put    <path> <local_file> [--if-rev-file <f>]
+  python3 -m bridge.vault_tool put    <path> <local_file> [--if-rev-file <f>] [--allow-shrink]
   python3 -m bridge.vault_tool puts   <path> -              # content from stdin
   python3 -m bridge.vault_tool append <path> <local_file> [after_marker]
   python3 -m bridge.vault_tool appends <path> [after_marker]    # content from stdin
@@ -32,6 +32,16 @@ rewrites whole every hour by instruction:
 Writes exit non-zero when they fail, and specifically 3 on a conflict, so
 a shell sequence stops instead of continuing as though it had written.
 Unpaired `put` stays unconditional, which is what a new file wants.
+
+The revision guard does not cover the other way to lose a file, because
+the write that loses it is not in conflict with anybody. On 2026-08-15 a
+cycle read Edvard's 123KB `issues.md`, got an empty body and exit 0, and
+wrote that back over the intact document carrying the correct revision.
+Two answers to that, both in this file: `get` now refuses to serve a
+document whose assembled length disagrees with the `size` the document
+records (`_size_checked`), and `put` refuses to replace a document of any
+real size with a small fraction of it (`_collapse_refusal`), which
+`--allow-shrink` overrides when the truncation is meant.
 
 Env: CDB_BASE, CDB_USER, CDB_PASS, CDB_DB (default "obsidian"),
 CDB_NOVA_DB (unset = one database, exactly as before routing existed;
@@ -339,6 +349,63 @@ class VaultIncompleteDocument(RuntimeError):
 #: and different expectation -- "there should be no document here yet".
 _ANY_REV = object()
 
+#: A write is refused as a collapse when it replaces a document of at
+#: least COLLAPSE_FLOOR bytes with one under COLLAPSE_RATIO of its size.
+#:
+#: Both numbers are chosen against what this vault actually holds rather
+#: than picked for roundness, because a guard that fires on ordinary work
+#: gets routed around and then protects nothing. Measured 2026-08-15: the
+#: files a cycle rewrites whole every cycle are `journal-digest.md`
+#: (35,859 bytes) and the two capture boards (123,586 and larger), and the
+#: routine edit to any of them -- rolling one digest line in thirteen,
+#: appending a capture, striking a bullet -- moves single-digit percent.
+#: Below the floor sit the small JSON ledgers: `claims.json` at 7,765
+#: bytes is above it, `retro-ledger.json` and a near-empty `notes.md` are
+#: under, and there a rewrite really can be most of the file while the
+#: blast radius is a few rows rather than Edvard's backlog.
+#:
+#: One legitimate edit does cross this line, and it is named here rather
+#: than tuned away: a cycle trimming the digest's **Next cycle** list from
+#: twenty-five items to three removes most of that file on purpose. That
+#: write is meant to say so. `--allow-shrink` is one word, the refusal
+#: message names it, and a deliberate three-quarter deletion of a file
+#: Edvard reads is worth one word of intent -- which an accidental one
+#: will never supply.
+#:
+#: Deliberately not a check on emptiness alone. The write that prompted
+#: this was 0 bytes over 123KB, but the same blind read against a
+#: partially-assembled document produces a small non-empty body, and that
+#: is the version nobody would notice.
+#:
+#: Deliberately not a check on emptiness alone. The write that prompted
+#: this was 0 bytes over 123KB, but the same blind read against a
+#: partially-assembled document produces a small non-empty body, and that
+COLLAPSE_FLOOR = 4096
+COLLAPSE_RATIO = 0.25
+
+
+def _collapse_refusal(path, existing, new_bytes, allow_shrink):
+    """`None` if the write may proceed, else the FAILED string to return.
+
+    Split out of `_put_raw` so both the decision and its numbers can be
+    tested without a CouchDB, and so the runner's copy of this client can
+    hold the identical rule."""
+    if allow_shrink or existing is None:
+        return None
+    old_bytes = existing.get("size")
+    if not isinstance(old_bytes, int) or isinstance(old_bytes, bool):
+        return None
+    if old_bytes < COLLAPSE_FLOOR or new_bytes >= old_bytes * COLLAPSE_RATIO:
+        return None
+    return (
+        f"FAILED(collapse: {path} holds {old_bytes} bytes and this write "
+        f"is {new_bytes} -- refusing to replace a document with under "
+        f"{int(COLLAPSE_RATIO * 100)}% of its size. If the read that "
+        "produced this came back short, the document is still intact and "
+        "re-reading is the fix. Pass --allow-shrink if the truncation is "
+        "genuinely what you meant.)"
+    )
+
 #: How many times an append re-reads and retries after losing a conflict.
 #: Three, matching the runner's WRITE_ATTEMPTS. A conflict means another
 #: writer won, so the retry is against a moving target and bounding it is
@@ -500,7 +567,7 @@ class VaultClient:
     def assemble(self, doc, path=None, db=None):
         kids = doc.get("children") or []
         if not kids:
-            return doc.get("data", "")
+            return self._size_checked(doc.get("data", ""), doc, path)
         # Where the doc actually came FROM, never where db_for predicts it
         # should be. Those two agree in steady state and disagree during a
         # migration -- which is exactly when a doc's chunks would be looked
@@ -533,7 +600,47 @@ class VaultClient:
                 f"{', …' if len(missing) > 5 else ''}) -- refusing to serve a "
                 f"partial document; recover with vault_git_revision_history"
             )
-        return "".join(parts)
+        return self._size_checked("".join(parts), doc, path)
+
+    def _size_checked(self, content, doc, path=None):
+        """Return `content`, or raise if the doc says it should be a
+        different length.
+
+        A LiveSync file doc records `size`, the byte length of the text it
+        stands for, and every writer sets it -- this client at `_put_raw`,
+        and Obsidian itself. Measured 2026-08-15 across 37 documents
+        spanning Edvard's phone-written captures, this loop's journal
+        entries, the JSON ledgers and the 291KB frozen archive: `size`
+        equalled `len(content.encode())` exactly, 37 times out of 37, with
+        no document missing the field. So it is a length checksum the
+        vault has been carrying all along and nothing has ever read.
+
+        Reading it closes the failure that `VaultIncompleteDocument` above
+        does not. That one catches a chunk that is *absent*. This catches
+        a document that assembles to the wrong length for any other
+        reason, and the case that matters is the shortest one: `children`
+        empty and `data` empty returns `""` through the early path above,
+        with no chunk missing and nothing to raise about. Cycle 211 read
+        Edvard's 123KB `issues.md` that way -- empty body, exit 0 -- and
+        wrote the empty result back over the live document, which was
+        still intact underneath. The read was the blind half. `_put_raw`
+        refuses the write half.
+
+        Erring toward raising is deliberate: every caller of this client
+        reads before it writes, so a wrong answer here does not stay a
+        read for long."""
+        declared = doc.get("size")
+        if not isinstance(declared, int) or isinstance(declared, bool):
+            return content
+        actual = len(content.encode("utf-8"))
+        if actual == declared:
+            return content
+        raise VaultIncompleteDocument(
+            f"{path or doc.get('path') or doc.get('_id')}: assembled "
+            f"{actual} bytes but the document records {declared} -- "
+            "refusing to serve a document that does not match its own "
+            "recorded length; recover with vault_git_revision_history"
+        )
 
     def read(self, path):
         return self.read_rev(path)[0]
@@ -847,7 +954,8 @@ class VaultClient:
             "document it will not let this client read as one that is not there"
         )
 
-    def _put_raw(self, path, content, existing=None, if_rev=_ANY_REV):
+    def _put_raw(self, path, content, existing=None, if_rev=_ANY_REV,
+                 allow_shrink=False):
         path = path.lower()
         # One lookup, reused for the chunks and the file doc, so a chunk
         # can never be written to a different database than the doc that
@@ -866,6 +974,11 @@ class VaultClient:
                 existing = self._doc_to_overwrite(path, db=db)
             except VaultUnreadableDocument as e:
                 return f"FAILED(unreadable: {e})"
+
+        refusal = _collapse_refusal(path, existing, len(content_bytes),
+                                    allow_shrink)
+        if refusal:
+            return refusal
 
         # Chunks are content-addressed, so one that already exists holds
         # exactly this text and does not need rewriting -- that reuse is
@@ -929,10 +1042,17 @@ class VaultClient:
             return f"FAILED(409 conflict: {path} changed since it was read)"
         return f"FAILED({status})"
 
-    def write(self, path, content, if_rev=_ANY_REV):
+    def write(self, path, content, if_rev=_ANY_REV, allow_shrink=False):
         """Overwrite (or create) a file. Previous content is not copied
         anywhere first -- the daily GitHub snapshot is the recovery
         path (see module docstring).
+
+        2026-08-15: a write that would replace a document with a small
+        fraction of its size is refused unless `allow_shrink` says the
+        truncation is intended -- see `_collapse_refusal`. `if_rev` does
+        not cover this: the write that lost Edvard's `issues.md` carried
+        the correct revision and was, as far as CouchDB could tell, a
+        perfectly ordinary edit.
 
         2026-08-12: `if_rev` makes the write conditional. Pass the `rev`
         from `read_rev` and CouchDB rejects the PUT with 409 if anything
@@ -949,7 +1069,8 @@ class VaultClient:
         # twice too: a mutation check reverting only this site failed
         # nothing, because the lookup below caught every case anyway. One
         # lookup, one place, one answer, and no second copy to drift.
-        return self._put_raw(path, content, if_rev=if_rev)
+        return self._put_raw(path, content, if_rev=if_rev,
+                             allow_shrink=allow_shrink)
 
     def append(self, path, content, after_marker=""):
         """Add to an EXISTING file without losing what's already there.
@@ -1077,6 +1198,18 @@ def _take_option(argv, name):
     return argv[i + 1], argv[:i] + argv[i + 2:]
 
 
+def _take_flag(argv, name):
+    """Pull a valueless `--name` out of `argv`, returning `(present, rest)`.
+
+    Separate from `_take_option` because that one consumes the next
+    argument as a value, and a flag that swallowed the path would be a
+    worse bug than the one it is here to guard."""
+    if name not in argv:
+        return False, argv
+    i = argv.index(name)
+    return True, argv[:i] + argv[i + 1:]
+
+
 def _expected_rev(rev_file):
     """The revision a conditional write must match, from `get --rev-file`.
 
@@ -1097,7 +1230,7 @@ def _expected_rev(rev_file):
     return None if text == ABSENT_REV else text
 
 
-def _conditional_write(client, path, content, if_rev_file):
+def _conditional_write(client, path, content, if_rev_file, allow_shrink=False):
     """`client.write`, conditional only if the caller paired it with a rev.
 
     No `--if-rev-file` means the unconditional write every caller of this
@@ -1106,8 +1239,9 @@ def _conditional_write(client, path, content, if_rev_file):
     `get` for it would make the safe form the annoying one.
     """
     if if_rev_file is None:
-        return client.write(path, content)
-    return client.write(path, content, if_rev=_expected_rev(if_rev_file))
+        return client.write(path, content, allow_shrink=allow_shrink)
+    return client.write(path, content, if_rev=_expected_rev(if_rev_file),
+                        allow_shrink=allow_shrink)
 
 
 def _write_exit(result):
@@ -1163,14 +1297,18 @@ def _dispatch(argv=None):
         print(content if content is not None else f"[not found: {argv[1]}]")
     elif cmd == "put":
         if_rev_file, argv = _take_option(argv, "--if-rev-file")
+        allow_shrink, argv = _take_flag(argv, "--allow-shrink")
         content = Path(argv[2]).read_text(encoding="utf-8")
-        result = _conditional_write(client, argv[1], content, if_rev_file)
+        result = _conditional_write(client, argv[1], content, if_rev_file,
+                                    allow_shrink)
         print(f"{result}: {argv[1]}")
         return _write_exit(result)
     elif cmd == "puts":
         if_rev_file, argv = _take_option(argv, "--if-rev-file")
+        allow_shrink, argv = _take_flag(argv, "--allow-shrink")
         content = sys.stdin.read()
-        result = _conditional_write(client, argv[1], content, if_rev_file)
+        result = _conditional_write(client, argv[1], content, if_rev_file,
+                                    allow_shrink)
         print(f"{result}: {argv[1]}")
         return _write_exit(result)
     elif cmd == "append":
