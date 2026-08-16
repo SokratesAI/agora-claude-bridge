@@ -640,14 +640,30 @@ class VaultClient:
         reader to restore a file that was never damaged. Measured Cycle
         244: four PDFs under `work/platform/resources/reports/` took
         `vault_search` down vault-wide, e.g. assembled 662,428 against a
-        recorded 496,813, and `662428 / 496813 = 1.3333`.
+        recorded 496,813, and `662428 / 496813 = 1.33335`.
 
         Non-`plain` documents are skipped rather than checked with a
-        decode, because each chunk is base64'd and padded separately, so
-        the joined text is not one decodable string -- the excess over
-        4/3 tracks the chunk count (5 chunks, 10 bytes over). Skipping is
-        honest; a check I cannot compute correctly is the thing that
-        caused this.
+        decode, because each chunk appears to be base64'd and padded
+        separately, so the joined text is not one decodable string. A
+        single correct whole-file encoding would be
+        `ceil(496813/3)*4 = 662,420`; the real document is **8**
+        characters longer, in the direction independent per-chunk padding
+        would push it. That is consistent with the theory and does not
+        prove it -- the encoder is Obsidian LiveSync's, which is not
+        vendored here, so it cannot be checked from this repo. Skipping
+        is honest either way; a check I cannot compute correctly is the
+        thing that caused this.
+
+        **What skipping costs, stated rather than left silent.** For a
+        non-`plain` document this gives up one narrow read-side check: a
+        `children` list that is short by an id, where the chunk itself is
+        still in CouchDB and so never shows up as missing above. Content
+        that *changed* is still caught, because chunk ids are content
+        addressed and an altered chunk resolves to nothing. Before this
+        exemption that short-list case was caught for binaries only as a
+        side effect of a comparison that fired on every binary
+        regardless, so the coverage being given up was never separable
+        from the false positive.
 
         A document with no `type` at all is still checked. Only a
         declared non-`plain` type buys the exemption, so a malformed or

@@ -123,8 +123,17 @@ def test_a_binary_attachment_is_not_checked_against_its_decoded_size(client):
 
 def test_a_document_that_declares_plain_is_still_checked(client):
     """The exemption is for binaries only. A doc saying `plain` that
-    assembles short is the Cycle 211 failure and must still raise -- the
-    no-`type` case is pinned by the blind-read test above."""
+    assembles short is the Cycle 211 failure and must still raise.
+
+    **Do not delete this as vacuous.** It survives a full revert of the
+    exemption, because the old code raised here too, so the coarse
+    mutation makes it look like it pins nothing. It is the only test in
+    this file that catches either mutation that matters: widening the
+    branch to `if doctype is not None` -- exempt anything that declares a
+    type at all -- fails this test and nothing else, and swapping the
+    literal to `doctype != "newnote"` fails this and the binary test.
+    Measured Cycle 244, both ways. The no-`type` case is pinned
+    separately by the blind-read test above."""
     with pytest.raises(vault_tool.VaultIncompleteDocument):
         client.assemble(doc(size=REAL_SIZE, type="plain"), path=PATH)
 
