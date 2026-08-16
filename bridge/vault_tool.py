@@ -628,9 +628,36 @@ class VaultClient:
 
         Erring toward raising is deliberate: every caller of this client
         reads before it writes, so a wrong answer here does not stay a
-        read for long."""
+        read for long.
+
+        **The 37-document calibration above could not fail, and that is
+        why it missed binaries.** Every one of the 37 was a markdown or
+        JSON file -- `type: plain` -- where `size` really is
+        `len(content.encode())`. A binary attachment is `type: newnote`,
+        its chunks hold base64 text, and `size` is the *decoded* byte
+        count Obsidian recorded. So the two numbers differ by 4/3 by
+        construction and every binary in the vault raised, telling the
+        reader to restore a file that was never damaged. Measured Cycle
+        244: four PDFs under `work/platform/resources/reports/` took
+        `vault_search` down vault-wide, e.g. assembled 662,428 against a
+        recorded 496,813, and `662428 / 496813 = 1.3333`.
+
+        Non-`plain` documents are skipped rather than checked with a
+        decode, because each chunk is base64'd and padded separately, so
+        the joined text is not one decodable string -- the excess over
+        4/3 tracks the chunk count (5 chunks, 10 bytes over). Skipping is
+        honest; a check I cannot compute correctly is the thing that
+        caused this.
+
+        A document with no `type` at all is still checked. Only a
+        declared non-`plain` type buys the exemption, so a malformed or
+        legacy text doc keeps the guard rather than losing it to a
+        missing field."""
         declared = doc.get("size")
         if not isinstance(declared, int) or isinstance(declared, bool):
+            return content
+        doctype = doc.get("type")
+        if doctype is not None and doctype != "plain":
             return content
         actual = len(content.encode("utf-8"))
         if actual == declared:
