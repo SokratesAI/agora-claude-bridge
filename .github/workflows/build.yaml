@@ -81,37 +81,24 @@ jobs:
       - run: python -m compileall bridge run.py
       - run: pytest tests/ -q
 
-      # bridge/vault_tool.py and agora_runner/vault.py in agora-persona-runner
-      # are two hand-written copies of one client against one CouchDB. Cycles
-      # 136-142, 148, 151 and 167 each wrote the same fix into both by hand,
-      # and nothing noticed a miss. The comparison lives in the runner as
-      # tools/sync_contract.py and is checked out here rather than copied --
-      # a second copy of the drift checker is the drift it checks for.
-      #
-      # This is the mirror of the runner's, and both are needed: the runner's
-      # only runs when the runner changes, so a one-sided edit to this file
-      # would otherwise reach main with nothing having compared it to anything.
-      #
-      # It was its own `vault-drift` job until Cycle 224, for two stated
-      # reasons: a token that cannot reach the other repo should fail on its
-      # own legible line, and drift must never gate a deploy, because it is a
-      # fact about both repos rather than a reason to stop shipping one. Both
-      # still hold; what changed is the price. GitHub rounds every job up to a
-      # whole minute, this one finishes in about nine seconds, and it billed 60
-      # of them twice per merged PR against an allowance the org is roughly 3x
-      # over (idea #73). So it moved in here as a step, which costs nothing
-      # extra, and the two properties are kept explicitly instead of
-      # structurally:
-      #
-      #   - legibility: it is the last step and named, so a drift failure is
-      #     still one line in the log, below a green unit suite.
-      #   - never gating a deploy: `continue-on-error` keeps `test` green on
-      #     main so `build-push` still runs, and the step below turns the
-      #     drift back into a red X on pull requests, where `build-push` is
-      #     skipped anyway and nothing can be blocked by it.
-      #
-      # If that split ever stops being worth the two steps, the honest undo is
-      # to restore the separate job, not to drop the pull-request gate.
+  # bridge/vault_tool.py and agora_runner/vault.py in agora-persona-runner are
+  # two hand-written copies of one client against one CouchDB. Cycles 136-142,
+  # 148, 151 and 167 each wrote the same fix into both by hand, and nothing
+  # noticed a miss. The comparison lives in the runner as
+  # tools/sync_contract.py and is checked out here rather than copied --
+  # a second copy of the drift checker is the drift it checks for.
+  #
+  # This job is the mirror of the runner's, and both are needed: the runner's
+  # only runs when the runner changes, so a one-sided edit to this file would
+  # otherwise reach main with nothing having compared it to anything.
+  #
+  # Separate from `test` so a token that cannot reach the other repo fails on
+  # its own line, and not a dependency of build-push: drift is a fact about
+  # both repos, not a reason to stop shipping one of them.
+  vault-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Generate installation token scoped to the runner repo only
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -125,18 +112,16 @@ jobs:
           repository: SokratesAI/agora-persona-runner
           token: ${{ steps.app-token.outputs.token }}
           path: .runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       # Run from the runner checkout so the tool imports as `tools.`, and
       # point back out at this repo's copy.
-      - name: Vault client contract drift
-        id: drift
-        continue-on-error: true
-        run: python -m tools.sync_contract . ..
+      # The CI-workflow pair is compared as parsed YAML rather than as text,
+      # so this job needs pyyaml even though the other two pairs do not.
+      - run: pip install pyyaml
+      - run: python -m tools.sync_contract . ..
         working-directory: .runner
-      - name: Fail the pull request on drift, never the main-branch deploy
-        if: github.event_name == 'pull_request' && steps.drift.outcome == 'failure'
-        run: |
-          echo "::error::Vault client contract drift -- see the 'Vault client contract drift' step above."
-          exit 1
 
   build-push:
     if: github.ref == 'refs/heads/main'
