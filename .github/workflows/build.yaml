@@ -130,8 +130,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - name: Log in to GHCR
@@ -157,22 +155,31 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # Commits the new image digest to this service's paired config repo, which
-  # ArgoCD's SCM Provider generator auto-deploys — no platform-config PR, no
-  # manual step. Authenticates as a GitHub App installation, scoped by this
-  # step to ONLY this repo's own -config repo (never broader). ORG_APP_ID/
-  # ORG_APP_PRIVATE_KEY are repo-scoped Actions secrets that this Composition
-  # itself provisions on every source repo it creates (see the
-  # source-actions-secret-* resources in this Composition) — not org-level
-  # secrets, which GitHub gates behind a paid plan for private repos. See
-  # Platform-Product-Catalog's _context.md in the vault for why a GitHub App
-  # instead of a PAT. Byte-identical across every service template instance —
-  # nothing here is per-service except GitHub's own repository context, so
-  # nothing needed substituting at repo-creation time.
-  update-manifest:
-    needs: build-push
-    runs-on: ubuntu-latest
-    steps:
+      # Commits the new image digest to this service's paired config repo, which
+      # ArgoCD's SCM Provider generator auto-deploys — no platform-config PR, no
+      # manual step. Authenticates as a GitHub App installation, scoped by this
+      # step to ONLY this repo's own -config repo (never broader). ORG_APP_ID/
+      # ORG_APP_PRIVATE_KEY are repo-scoped Actions secrets that this Composition
+      # itself provisions on every source repo it creates (see the
+      # source-actions-secret-* resources in this Composition) — not org-level
+      # secrets, which GitHub gates behind a paid plan for private repos. See
+      # Platform-Product-Catalog's _context.md in the vault for why a GitHub App
+      # instead of a PAT. Byte-identical across every service template instance —
+      # nothing here is per-service except GitHub's own repository context, so
+      # nothing needed substituting at repo-creation time.
+      #
+      # This was a fourth job, `update-manifest`, until Cycle 224. It is a `sed`
+      # and a `git push` — a few seconds of work billed as a whole minute on
+      # every merge, because GitHub rounds per job. It only ever ran after
+      # `build-push` succeeded, so running it here as that job's last step is
+      # the same order for a minute less. Two things improved by accident: the
+      # digest no longer travels through a job output, and a failed manifest
+      # commit now reddens `build-push` instead of a job Cycle 222 discovered
+      # nothing was watching.
+      #
+      # The config repo is checked out into `.config` rather than the workspace
+      # root, because unlike the old job this one already has this repo's own
+      # source checked out and must not clobber it.
       - name: Generate installation token scoped to the config repo only
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -185,15 +192,17 @@ jobs:
         with:
           repository: ${{ env.CONFIG_REPO }}
           token: ${{ steps.app-token.outputs.token }}
+          path: .config
       - name: Update image digest in manifest.yaml
+        working-directory: .config
         run: |
-          sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-push.outputs.digest }}|" manifest.yaml
+          sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}|" manifest.yaml
           git config user.name "sokratesai-repo-committer[bot]"
           git config user.email "sokratesai-repo-committer[bot]@users.noreply.github.com"
           git add manifest.yaml
           if git diff --staged --quiet; then
             echo "no manifest change, skipping commit"
           else
-            git commit -m "Update image to ${{ needs.build-push.outputs.digest }}"
+            git commit -m "Update image to ${{ steps.build.outputs.digest }}"
             git push
           fi
