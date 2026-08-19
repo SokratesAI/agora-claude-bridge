@@ -83,7 +83,33 @@ def test_a_hand_refreshed_secret_replaces_a_stale_file(tmp_path, monkeypatch):
     _seed(tmp_path, on_disk)
     dest, logged = _run(tmp_path, monkeypatch, newer_secret, NOW)
     assert dest.read_text() == newer_secret
-    assert any("replaced" in m and "a human refreshed it" in m for m in logged)
+    assert any("a human refreshed it" in m for m in logged)
+    assert not any("EXPIRED" in m or "UNREADABLE" in m for m in logged)
+
+
+def test_a_newer_but_still_expired_secret_is_replaced_and_alarmed(tmp_path, monkeypatch):
+    """Review finding on #60. Newer is not usable. A hurried re-auth, or a
+    second stale snapshot, is newer than the dead file and still dead -- and
+    this branch used to log it as 'a human refreshed it' with no alarm, which
+    is the doomed-write-reported-as-success this module exists to stop."""
+    on_disk = _cred(int((NOW - 16 * 86400) * 1000), token="dead")
+    newer_but_dead = _cred(int((NOW - 10 * 86400) * 1000), token="alsodead")
+    _seed(tmp_path, on_disk)
+    dest, logged = _run(tmp_path, monkeypatch, newer_but_dead, NOW)
+    assert dest.read_text() == newer_but_dead
+    alarm = [m for m in logged if "EXPIRED" in m]
+    assert alarm, logged
+    assert "240.0 hours ago" in alarm[0]
+
+
+def test_a_secret_with_no_expiry_is_alarmed_rather_than_trusted(tmp_path, monkeypatch):
+    """Valid JSON the CLI will still reject -- the three-key-split shape in the
+    module docstring. No opinion is a reason to leave a file alone, never a
+    reason to trust one being written."""
+    dest, logged = _run(tmp_path, monkeypatch, '{"access_token": "x"}', NOW)
+    assert dest.exists()
+    assert any("UNREADABLE" in m for m in logged)
+    assert not any(m.startswith("credentials: wrote") for m in logged)
 
 
 def test_equal_expiry_is_not_newer(tmp_path, monkeypatch):

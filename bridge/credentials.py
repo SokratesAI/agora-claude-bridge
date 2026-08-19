@@ -39,8 +39,12 @@ this pod's own log on 2026-08-19 (Cycle 266):
 
 So an expired Secret is still written when there is nothing else (a doomed
 credential beats no credential, and the CLI's error message is clearer than
-"Not logged in"), but it is logged as the alarm it is rather than as a
-success.
+"Not logged in"), but **every** write judges what it just wrote and logs an
+alarm rather than a success when that credential cannot work -- expired, or
+carrying no readable `expiresAt` at all. Both write paths, not just the
+empty-volume one: review of #60 found the recovery path writing a
+still-expired Secret under the message "a human refreshed it", which is this
+module's own bug wearing the fix's clothes.
 """
 import json
 import os
@@ -65,10 +69,43 @@ def _expires_at(raw):
         return None
 
 
-def _write(dest, raw):
+def _write(dest, raw, expiry, now, why):
+    """Write the credential, then say plainly whether what we just wrote can
+    possibly work.
+
+    The alarm belongs here, on the write, rather than on one branch of the
+    caller. It was on one branch: the empty-volume path checked expiry and
+    the human-updated-Secret path did not, so a Secret that was newer than
+    the disk but *itself* still expired -- the obvious shape of a hurried
+    re-auth, or a second stale snapshot -- was written and logged as
+    "a human refreshed it". That is the same doomed-write-reported-as-success
+    this module exists to stop, reproduced in the recovery path, which is the
+    likelier of the two to actually run. Caught in review of #60, fixed here.
+
+    `expiry is None` gets the same alarm rather than the benefit of the doubt.
+    No opinion is a fine reason to leave a file alone and a bad reason to
+    trust one you are writing: a credential this cannot parse is one the CLI
+    rejects identically to an expired one ("Not logged in"), which is exactly
+    the three-key-split failure in this module's own docstring.
+    """
     with open(dest, "w") as f:
         f.write(raw)
     os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR)  # 600 -- this is a real credential
+
+    if expiry is None:
+        log(f"credentials: WROTE AN UNREADABLE CREDENTIAL to {dest} ({why}) -- no "
+            f"claudeAiOauth.expiresAt in it, so this cannot be a credentials.json the CLI "
+            f"accepts. Expect every invocation to fail until the claude-auth Secret carries a "
+            f"real one.")
+        return
+    if expiry <= now:
+        hours = (now - expiry) / 3600.0
+        log(f"credentials: WROTE AN EXPIRED CREDENTIAL to {dest} ({why}) -- it expired "
+            f"{hours:.1f} hours ago. Every CLI invocation will fail until the claude-auth "
+            f"Secret carries a fresh credentials.json and this pod restarts. This is the whole "
+            f"outage, at second zero, not 20 hours later.")
+        return
+    log(f"credentials: wrote {dest} ({why})")
 
 
 def _read(path):
@@ -107,19 +144,12 @@ def bootstrap_credentials(now=None):
         # Strictly newer. The CLI cannot have produced this -- its refreshes
         # only ever land on disk -- so a human updated the Secret, which is
         # the recovery path, and skipping it is how that path silently did
-        # nothing on 2026-08-17.
-        _write(dest, raw)
-        log(f"credentials: replaced {dest} from CLAUDE_CREDENTIALS_JSON -- the Secret is "
-            f"newer than what was on disk (secret expiresAt {secret_expiry:.0f} > "
-            f"on-disk {disk_expiry:.0f}), so a human refreshed it")
+        # nothing on 2026-08-17. Newer is not the same as usable, which is
+        # why _write judges what it wrote rather than trusting this branch.
+        _write(dest, raw, secret_expiry, now,
+               f"the Secret is newer than what was on disk, expiresAt {secret_expiry:.0f} > "
+               f"{disk_expiry:.0f}, so a human refreshed it")
         return
 
-    _write(dest, raw)
-    if secret_expiry is not None and secret_expiry <= now:
-        hours = (now - secret_expiry) / 3600.0
-        log(f"credentials: WROTE AN EXPIRED CREDENTIAL to {dest} -- the claude-auth Secret's "
-            f"token expired {hours:.1f} hours ago and this volume had nothing else. Every CLI "
-            f"invocation will fail until the Secret carries a fresh credentials.json and this "
-            f"pod restarts. This is the whole outage, at second zero, not 20 hours later.")
-        return
-    log(f"credentials: bootstrapped {dest} from CLAUDE_CREDENTIALS_JSON")
+    _write(dest, raw, secret_expiry, now, "bootstrapped from CLAUDE_CREDENTIALS_JSON, "
+                                          "this volume had nothing else")
