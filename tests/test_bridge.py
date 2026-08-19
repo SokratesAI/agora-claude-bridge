@@ -808,11 +808,12 @@ def test_do_post_unknown_path_returns_404():
 
 
 # ---------------------------------------------------------------------------
-# credentials.py -- first-boot-only .credentials.json bootstrap, piping the
-# claude-auth secret's raw JSON straight to disk unmodified. Deliberately
-# never overwrites an existing file -- see the module's own docstring for
-# why (a live token refresh only ever lands on the PVC, never back in the
-# k8s Secret).
+# credentials.py -- .credentials.json bootstrap, piping the claude-auth
+# secret's raw JSON straight to disk unmodified. The rule is "newest wins",
+# not "first boot only": a live token refresh only ever lands on the PVC and
+# so always outranks the k8s Secret's frozen snapshot, but a Secret a human
+# has just re-authed by hand is genuinely newer and must not be ignored --
+# see the module's own docstring, and #60.
 # ---------------------------------------------------------------------------
 
 REAL_CREDS_JSON = json.dumps({
@@ -849,11 +850,32 @@ def test_bootstrap_credentials_sets_owner_only_permissions(tmp_path):
     assert mode == 0o600
 
 
-def test_bootstrap_credentials_never_overwrites_existing_file(tmp_path):
+def test_bootstrap_credentials_never_overwrites_a_newer_file(tmp_path):
+    """The invariant, with a fixture that can actually see it.
+
+    This test used to seed an on-disk credential carrying no `expiresAt` at
+    all, which no real credentials.json does. That routed it into the
+    "cannot parse, leave it alone" branch, so it agreed with the author
+    whether or not the comparison below existed -- it passed identically
+    before #60, when nothing was ever overwritten, and after it. Review of
+    #60 caught it. The seed is now shaped like the real file and dated after
+    the Secret, which is what a live CLI refresh always produces.
+    """
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir(parents=True)
     dest = claude_dir / ".credentials.json"
-    dest.write_text('{"claudeAiOauth": {"accessToken": "already-refreshed-by-cli"}}')
+    on_disk = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "already-refreshed-by-cli",
+            "refreshToken": "sk-ant-ort-refreshed",
+            # REAL_CREDS_JSON expires at 1785608541000; the CLI's own refresh
+            # is always later than the snapshot the Secret froze.
+            "expiresAt": 1785608541000 + 86_400_000,
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max",
+        }
+    })
+    dest.write_text(on_disk)
 
     with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
          patch.dict(os.environ, {"CLAUDE_CREDENTIALS_JSON": REAL_CREDS_JSON}, clear=False):
@@ -861,6 +883,28 @@ def test_bootstrap_credentials_never_overwrites_existing_file(tmp_path):
 
     data = json.loads(dest.read_text())
     assert data["claudeAiOauth"]["accessToken"] == "already-refreshed-by-cli"
+
+
+def test_bootstrap_credentials_takes_a_hand_refreshed_secret(tmp_path):
+    """The other half of "newest wins", and the recovery path: put a fresh
+    credential in the Secret and restart the pod. Before #60 this silently
+    did nothing whenever a file already existed."""
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    dest = claude_dir / ".credentials.json"
+    dest.write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "dead",
+            "expiresAt": 1785608541000 - 86_400_000,
+            "scopes": ["user:inference"],
+        }
+    }))
+
+    with patch.object(credentials, "CLAUDE_HOME", str(tmp_path)), \
+         patch.dict(os.environ, {"CLAUDE_CREDENTIALS_JSON": REAL_CREDS_JSON}, clear=False):
+        credentials.bootstrap_credentials()
+
+    assert dest.read_text() == REAL_CREDS_JSON
 
 
 def test_bootstrap_credentials_skips_when_env_var_missing(tmp_path):
