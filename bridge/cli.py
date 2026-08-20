@@ -24,6 +24,7 @@ no upside to async here since we want serialization, not parallelism.
 """
 import json
 import os
+import shutil
 import stat
 import subprocess
 import threading
@@ -246,9 +247,36 @@ def _slotted(path, slot):
     return f"{root}.{slot}{ext}"
 
 
+def _workspace_for(slot):
+    """CLAUDE_WORKSPACE unchanged for the default (locked) path, or an
+    isolated subdirectory for a turn running outside _invocation_lock.
+
+    Unlike the MCP config/CLI input file _slotted isolates, the workspace
+    is a real git checkout: two turns sharing it would race on the same
+    working tree, `.git/index`, and whatever branch either has checked
+    out. A turn with no slot is either running alone under the lock, or an
+    allow_concurrent turn whose refresh-window gate failed and fell back
+    to the lock -- either way it gets the exact same shared directory
+    every serialized turn has always used, unchanged.
+
+    A concurrent turn always starts from an empty directory (see its
+    cleanup in _run_cli_once's finally) rather than a workspace kept
+    around for reuse: `slot` is a pid+thread-id, and thread idents get
+    reused once a thread exits, so keeping the directory around would
+    risk a later, unrelated turn silently inheriting an earlier one's
+    checkout. The cost is a fresh clone on every concurrent turn that
+    touches git -- acceptable today because allow_concurrent is only used
+    for short turns (comment replies) that mostly don't.
+    """
+    if not slot:
+        return CLAUDE_WORKSPACE
+    return os.path.join(CLAUDE_WORKSPACE, "concurrent", slot)
+
+
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
                   system=None, attachments=None, slot=""):
-    os.makedirs(CLAUDE_WORKSPACE, exist_ok=True)
+    workspace = _workspace_for(slot)
+    os.makedirs(workspace, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
     env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir}
@@ -359,7 +387,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=stdin_handle,
-            cwd=CLAUDE_WORKSPACE,
+            cwd=workspace,
             env=env,
             text=True,
         )
@@ -590,6 +618,14 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 os.remove(input_file)
             except OSError as exc:
                 log(f"cli input cleanup failed: {type(exc).__name__}: {exc}")
+        # The shared CLAUDE_WORKSPACE (slot == "") is never torn down --
+        # it's the persistent checkout every serialized turn reuses, same
+        # as before this existed. Only a concurrent turn's own isolated
+        # directory gets removed, and always, win or lose: _workspace_for's
+        # own reasoning is that a slot must never be found populated by an
+        # earlier, unrelated turn.
+        if slot:
+            shutil.rmtree(workspace, ignore_errors=True)
 
     elapsed = time.monotonic() - t0
     log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "
