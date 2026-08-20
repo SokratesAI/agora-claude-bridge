@@ -61,6 +61,7 @@ def test_payload_carries_cycles_and_drops_other_sessions(tmp_path, monkeypatch):
          "cache_write_1h_tokens": 4},
     ]
     monkeypatch.setattr(publish_costs.analytics, "scan", lambda d=None: rows)
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: None)
     payload = publish_costs.build_payload(
         history_path=_history(tmp_path, [json.dumps({"at": 1.0, "seven_day": 47.0})]))
 
@@ -83,6 +84,126 @@ def test_no_transcripts_publishes_nothing_rather_than_an_empty_ledger(monkeypatc
     monkeypatch.setattr(publish_costs.analytics, "scan", lambda d=None: [])
     assert publish_costs.build_payload() is None
     assert publish_costs.publish(None) is False
+
+
+def _scan_row(session, started, weighted, **over):
+    row = {
+        "session": session, "kind": "cycle", "started_at": started,
+        "ended_at": started, "duration_seconds": 600.0, "turns": 10,
+        "subagent_turns": 0, "tool_calls": 5, "weighted_tokens": weighted,
+        "models": ["claude-opus-5"], "input_tokens": 1, "output_tokens": 2,
+        "cache_read_tokens": 3, "cache_write_5m_tokens": 0,
+        "cache_write_1h_tokens": 4,
+        "weighted_by_field": {"input_tokens": 1.0, "output_tokens": 10.0,
+                              "cache_read_tokens": 0.3,
+                              "cache_write_5m_tokens": 0.0,
+                              "cache_write_1h_tokens": 8.0},
+    }
+    row.update(over)
+    return row
+
+
+def _stored(*sessions):
+    return {
+        "cycles": [{"session": s, "startedAt": f"2026-08-0{i + 1}T00:00:00Z",
+                    "durationSeconds": 100.0, "turns": 5,
+                    "weightedTokens": 1000.0, "models": ["claude-opus-5"]}
+                   for i, s in enumerate(sessions)],
+        "summary": {"totals": {f: 100 for f in publish_costs.analytics.TOKEN_FIELDS},
+                    "totals_weighted": {f: 50.0
+                                        for f in publish_costs.analytics.TOKEN_FIELDS}},
+    }
+
+
+def test_history_the_transcripts_no_longer_reach_is_carried_forward(tmp_path, monkeypatch):
+    """The transcripts do not survive a pod restart; the vault document does.
+
+    Measured 2026-08-20: the bridge came back holding twelve session files
+    while the ledger held 265 cycles. Rebuilding from disk alone published
+    5KB over 310KB, five cycles running.
+    """
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 2000.0)])
+    monkeypatch.setattr(publish_costs, "read_stored",
+                        lambda p=None: _stored("old1", "old2"))
+    payload = publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+
+    assert [c["session"] for c in payload["cycles"]] == ["old1", "old2", "new"]
+    assert payload["summary"]["cycles"] == 3
+    # The summary describes the whole history, not just what is on disk.
+    assert payload["summary"]["total_weighted"] == 4000.0
+    assert payload["summary"]["first_cycle"] == "2026-08-01T00:00:00Z"
+    assert payload["summary"]["last_cycle"] == "2026-08-20T01:00:00Z"
+
+
+def test_the_quota_series_is_carried_forward_too(tmp_path, monkeypatch):
+    """`quota-history.jsonl` is lost in the same restart as the transcripts.
+    Merging only the cycles left the real document at 76,857 bytes against
+    310,060 -- still under the vault's 25% collapse floor, so the publish
+    would have gone on failing with the cycle history already repaired."""
+    stored = _stored("old1")
+    stored["quota"] = [{"at": 1.0, "seven_day": 10.0}, {"at": 2.0, "seven_day": 11.0}]
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: stored)
+    payload = publish_costs.build_payload(history_path=_history(tmp_path, [
+        json.dumps({"at": 2.0, "seven_day": 11.0}),   # the overlapping reading
+        json.dumps({"at": 3.0, "seven_day": 12.0}),
+    ]))
+
+    assert [q["at"] for q in payload["quota"]] == [1.0, 2.0, 3.0]
+
+
+def test_a_resumed_session_is_counted_once_not_twice(monkeypatch):
+    """A cycle still running at the last publish has a longer transcript now.
+    The fresh row replaces the stored one, and its token classes must not be
+    added on top of the totals that already include it."""
+    fresh = _scan_row("old2", "2026-08-02T00:00:00Z", 7777.0)
+    monkeypatch.setattr(publish_costs.analytics, "scan", lambda d=None: [fresh])
+    monkeypatch.setattr(publish_costs, "read_stored",
+                        lambda p=None: _stored("old1", "old2"))
+    payload = publish_costs.build_payload()
+
+    assert [c["session"] for c in payload["cycles"]] == ["old1", "old2"]
+    assert payload["cycles"][1]["weightedTokens"] == 7777.0
+    # 100 stored - 1 for the session re-measured + 1 for the fresh scan.
+    assert payload["summary"]["totals"]["input_tokens"] == 100
+
+
+def test_an_unreadable_stored_ledger_stops_the_publish(monkeypatch):
+    """A failed read looks exactly like a first run, and the two must not be
+    confused: publishing a transcripts-only rebuild over a good ledger is the
+    data loss this whole path exists to prevent."""
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored",
+                        lambda p=None: publish_costs.UNREADABLE)
+    assert publish_costs.build_payload() is None
+
+
+def test_read_stored_tells_a_missing_document_from_a_broken_read(monkeypatch):
+    class Proc:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        return seen["proc"]
+
+    monkeypatch.setattr(publish_costs.subprocess, "run", fake_run)
+
+    seen["proc"] = Proc(0, "[not found: some/path.json]")
+    assert publish_costs.read_stored() is None
+
+    seen["proc"] = Proc(1, "")
+    assert publish_costs.read_stored() is publish_costs.UNREADABLE
+
+    seen["proc"] = Proc(0, "not json at all")
+    assert publish_costs.read_stored() is publish_costs.UNREADABLE
+
+    seen["proc"] = Proc(0, '{"cycles": []}')
+    assert publish_costs.read_stored() == {"cycles": []}
 
 
 def test_publish_reports_failure_when_the_client_prints_failed(monkeypatch):
