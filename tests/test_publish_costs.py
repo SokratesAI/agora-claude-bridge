@@ -1,5 +1,6 @@
 """The cost record that goes into the vault, where the site can actually read it."""
 import json
+import os
 
 import pytest
 
@@ -116,11 +117,13 @@ def _stored(*sessions):
 
 
 def test_history_the_transcripts_no_longer_reach_is_carried_forward(tmp_path, monkeypatch):
-    """The transcripts do not survive a pod restart; the vault document does.
+    """The transcripts reach back a few hours; the vault document reaches back
+    to 2026-08-03.
 
-    Measured 2026-08-20: the bridge came back holding twelve session files
-    while the ledger held 265 cycles. Rebuilding from disk alone published
-    5KB over 310KB, five cycles running.
+    Measured 2026-08-20: the bridge was holding twelve session files while the
+    ledger held 265 cycles. Rebuilding from disk alone published 5KB over
+    310KB, five cycles running. That the window is short is the fact this
+    depends on; *why* it is short is not a pod restart, and is open.
     """
     monkeypatch.setattr(publish_costs.analytics, "scan",
                         lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 2000.0)])
@@ -137,10 +140,13 @@ def test_history_the_transcripts_no_longer_reach_is_carried_forward(tmp_path, mo
 
 
 def test_the_quota_series_is_carried_forward_too(tmp_path, monkeypatch):
-    """`quota-history.jsonl` is lost in the same restart as the transcripts.
+    """`quota-history.jsonl` goes back no further than the transcripts do.
     Merging only the cycles left the real document at 76,857 bytes against
     310,060 -- still under the vault's 25% collapse floor, so the publish
-    would have gone on failing with the cycle history already repaired."""
+    would have gone on failing with the cycle history already repaired.
+
+    Both files being short has one cause and it is not a pod restart, which is
+    what this docstring used to say; see `publish_costs`' module docstring."""
     stored = _stored("old1")
     stored["quota"] = [{"at": 1.0, "seven_day": 10.0}, {"at": 2.0, "seven_day": 11.0}]
     monkeypatch.setattr(publish_costs.analytics, "scan",
@@ -312,3 +318,79 @@ def test_refresh_survives_a_build_that_raises(monkeypatch):
 
     monkeypatch.setattr(publish_costs.analytics, "scan", boom)
     assert publish_costs.refresh() is False
+
+
+def _transcript(dirpath, name, mtime):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    path = dirpath / name
+    path.write_text("{}\n", encoding="utf-8")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_retention_hours_is_the_age_of_the_oldest_transcript(tmp_path):
+    """The span the disk is holding, not the age of the newest write. Three
+    cycles read a short window as proof of a pod restart; this is the number
+    that separates a restart from a pruner when it is read as a series."""
+    root = tmp_path / "projects" / "-data-workspace"
+    _transcript(root, "old.jsonl", 1000.0)
+    _transcript(root, "new.jsonl", 8200.0)
+
+    assert publish_costs.retention_hours(str(tmp_path / "projects"),
+                                         now=10000.0) == 2.5
+
+
+def test_retention_hours_ignores_files_that_are_not_transcripts(tmp_path):
+    """`.claude/projects` also holds caches and lock files, and an ancient one
+    of those would report a retention window the transcripts do not have."""
+    root = tmp_path / "projects" / "-data-workspace"
+    _transcript(root, "session.jsonl", 6400.0)
+    stale = root / "notes.txt"
+    stale.write_text("x", encoding="utf-8")
+    os.utime(stale, (0.0, 0.0))
+
+    assert publish_costs.retention_hours(str(tmp_path / "projects"),
+                                         now=10000.0) == 1.0
+
+
+def test_retention_hours_is_none_when_there_is_nothing_to_measure(tmp_path):
+    """A missing directory and an empty one both mean "no reading", not zero.
+    Zero would read as "the disk was wiped this instant", which is the exact
+    false alarm this function exists to stop."""
+    empty = tmp_path / "projects"
+    empty.mkdir()
+    assert publish_costs.retention_hours(str(empty)) is None
+    assert publish_costs.retention_hours(str(tmp_path / "nope")) is None
+
+
+def test_a_publish_says_how_much_the_disk_is_holding(tmp_path, monkeypatch):
+    """The log line is the whole delivery mechanism -- the number is useless
+    unless it lands somewhere a later cycle can read without running `find`.
+
+    The reading is stubbed rather than built from a real mtime: what is under
+    test here is the wiring and the formatting, and keying that on the wall
+    clock would make it a test that agrees with the author most of the time.
+    The three tests above own whether the number itself is right."""
+    lines = []
+    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None: 2.0)
+    monkeypatch.setattr(publish_costs, "log", lines.append)
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: _stored("old1"))
+
+    publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+    assert any("disk holds 2.0h" in line for line in lines)
+
+
+def test_a_disk_with_nothing_to_measure_logs_a_question_mark(tmp_path, monkeypatch):
+    """Not `0.0h`, which would read as "the disk was wiped this instant" -- the
+    exact false alarm the whole change exists to stop."""
+    lines = []
+    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None: None)
+    monkeypatch.setattr(publish_costs, "log", lines.append)
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: _stored("old1"))
+
+    publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+    assert any("disk holds ?" in line for line in lines)

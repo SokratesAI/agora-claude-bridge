@@ -25,14 +25,29 @@ reading (quota.py) and never off a human deciding it is time.
 
 **The vault document is the record; the transcripts are a window onto the
 last few hours.** This module had that backwards until 2026-08-20 and rebuilt
-the whole document from `analytics.scan` every cycle. The transcripts do not
-survive a bridge pod restart: the pod came up at 2026-08-19T19:27Z holding
-twelve session files, the oldest under two hours old, against a vault ledger
-of 265 cycles going back to 08-03. Five cycles in a row then tried to publish
-5-10KB over 310KB, and the only thing that stopped them was `vault_tool`'s
-collapse guard -- whose error text suggests passing `--all`, i.e. suggests
-doing the destructive thing. So `build_payload` now merges into what the
-vault already holds and refuses to publish at all when it cannot read it.
+the whole document from `analytics.scan` every cycle: the pod came up at
+2026-08-19T19:27Z holding twelve session files, the oldest under two hours
+old, against a vault ledger of 265 cycles going back to 08-03. Five cycles in
+a row then tried to publish 5-10KB over 310KB, and the only thing that
+stopped them was `vault_tool`'s collapse guard -- whose error text suggests
+passing `--all`, i.e. suggests doing the destructive thing. So
+`build_payload` now merges into what the vault already holds and refuses to
+publish at all when it cannot read it.
+
+**Why the window is short is *not* the pod restart, and saying so cost three
+cycles.** The obvious reading of that 19:27Z measurement was that the PVC
+does not survive a restart, and it is wrong. Measured 2026-08-20T02:20Z, one
+hour after the pod restarted at 01:26Z: 1,212 files under `CLAUDE_HOME`
+predate that restart, 23 of the 25 transcripts among them. The volume is a
+Bound PVC (`agora-claude-bridge-data`, created 2026-08-17T16:42Z) and every
+ReplicaSet since has mounted it. So transcripts *do* survive a restart, and
+something else prunes them to a rolling window whose cause is not yet
+identified -- filed rather than guessed at.
+
+Nothing above changes because of that: merging into the vault is the right
+design whether the window is short because of a restart or because of a
+pruner, and it is `retention_hours` below that makes the difference visible
+in the log instead of inferable from a coincidence.
 
 Everything here is best-effort by contract. It is called from a daemon thread
 on the way out of a cycle, after the work is done and while the reply is
@@ -40,6 +55,7 @@ already being written -- a failure to publish costs must never cost a cycle
 its reply, so every entry point returns False rather than raising.
 """
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -78,6 +94,49 @@ def _cycle_row(row):
         "weightedTokens": row["weighted_tokens"],
         "models": row["models"],
     }
+
+
+def retention_hours(projects_dir=None, now=None):
+    """How many hours of transcript the disk is currently holding, or None if
+    there are none to measure.
+
+    One number, logged once a cycle, because the question it answers is the one
+    three cycles in a row got wrong by inference: *is the short transcript
+    window a pod restart or a pruner?* A restart makes this fall to roughly the
+    age of the current pod and climb steadily after; a pruner holds it flat at
+    the retention limit across restarts. Neither is distinguishable from a
+    single reading, which is exactly why it has to be in a series rather than
+    in a cycle's memory -- the same argument `quota-history.jsonl` exists for.
+
+    Measured off mtimes rather than the parsed rows: a transcript too damaged
+    for `analytics.scan` still dates the disk, and this must never be the thing
+    that breaks a publish.
+
+    Two things it is honest about rather than defended against. There is no
+    `try` around the walk, because `os.walk` defaults to `onerror=None` and
+    already swallows a missing or unreadable directory into an empty iteration
+    -- a handler there could never run, and dead code that looks like a guard
+    is worse than no guard. And the reading only lands in the pod log, so the
+    series it belongs to is the one inside a single pod's lifetime: several
+    cycles' worth, which is enough to see flat-versus-climbing, and not a
+    record that outlives the pod. Making it durable is a bigger change than
+    the question currently justifies.
+    """
+    projects_dir = projects_dir or analytics.PROJECTS_DIR
+    oldest = None
+    for root, _dirs, files in os.walk(projects_dir):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                stamp = os.path.getmtime(os.path.join(root, name))
+            except OSError:
+                continue
+            if oldest is None or stamp < oldest:
+                oldest = stamp
+    if oldest is None:
+        return None
+    return round(max(0.0, (now or time.time()) - oldest) / 3600.0, 1)
 
 
 def read_quota_history(path=None):
@@ -121,12 +180,15 @@ UNREADABLE = object()
 def read_stored(vault_path=VAULT_PATH):
     """The ledger already in the vault: a dict, None, or `UNREADABLE`.
 
-    The transcripts this module scans do **not** survive a bridge pod restart.
-    Measured 2026-08-20: the pod came up at 19:27Z with twelve session files on
-    it, the oldest under two hours old, while the vault ledger held 265 cycles
-    going back to 2026-08-03. So the vault document is the durable record and
-    the PVC is a window onto the last few hours -- which is the opposite of
-    what this module assumed when it rebuilt the whole document every cycle.
+    The transcripts this module scans go back only a few hours, while the vault
+    ledger holds every cycle since 2026-08-03. So the vault document is the
+    durable record and the PVC is a window -- which is the opposite of what
+    this module assumed when it rebuilt the whole document every cycle.
+
+    Do not restate that as "the transcripts do not survive a pod restart".
+    They do; see the module docstring for the measurement. The short window has
+    some other cause, and the difference matters here because a restart is an
+    event you can wait out while a pruner is not.
 
     `vault_tool get` prints `[not found: ...]` and exits 0 for a path that has
     never been written, so a missing document is a successful read of nothing.
@@ -177,9 +239,12 @@ def merge_cycles(stored_cycles, fresh_cycles):
 def merge_quota(stored_quota, fresh_quota):
     """Union of two quota series, keyed by reading time, oldest first.
 
-    `quota-history.jsonl` sits on the same disk as the transcripts and is lost
-    in the same restart, so the series needs exactly the same treatment as the
-    cycles. Measured 2026-08-20: 2,414 stored readings against 73 on disk, and
+    `quota-history.jsonl` sits on the same disk as the transcripts and reaches
+    back no further, so the series needs exactly the same treatment as the
+    cycles. Not because a restart loses it -- it does not; see the module
+    docstring for the measurement that settles that, and do not reintroduce
+    the restart as the reason here, which is where it survived a first pass at
+    correcting it. Measured 2026-08-20: 2,414 stored readings against 73 on disk, and
     the two do not overlap at all -- the stored series ends 08-17, the file
     begins 08-19. Merging only the cycles left the document at 76,857 bytes
     against 310,060, which is still under `vault_tool`'s 25% collapse floor,
@@ -317,8 +382,10 @@ def build_payload(projects_dir=None, history_path=None, vault_path=VAULT_PATH):
             f"-> {len(merged)}), refusing to publish")
         return None
     added = len(merged) - len(stored_cycles)
+    held = retention_hours(projects_dir)
     log(f"cost publish: {len(stored_cycles)} stored + {len(fresh)} on disk "
-        f"-> {len(merged)} cycles ({added} new)")
+        f"-> {len(merged)} cycles ({added} new), "
+        f"disk holds {'?' if held is None else f'{held}h'}")
     return {
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "cycles": merged,
