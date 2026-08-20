@@ -111,22 +111,29 @@ def retention_hours(projects_dir=None, now=None):
     Measured off mtimes rather than the parsed rows: a transcript too damaged
     for `analytics.scan` still dates the disk, and this must never be the thing
     that breaks a publish.
+
+    Two things it is honest about rather than defended against. There is no
+    `try` around the walk, because `os.walk` defaults to `onerror=None` and
+    already swallows a missing or unreadable directory into an empty iteration
+    -- a handler there could never run, and dead code that looks like a guard
+    is worse than no guard. And the reading only lands in the pod log, so the
+    series it belongs to is the one inside a single pod's lifetime: several
+    cycles' worth, which is enough to see flat-versus-climbing, and not a
+    record that outlives the pod. Making it durable is a bigger change than
+    the question currently justifies.
     """
     projects_dir = projects_dir or analytics.PROJECTS_DIR
     oldest = None
-    try:
-        for root, _dirs, files in os.walk(projects_dir):
-            for name in files:
-                if not name.endswith(".jsonl"):
-                    continue
-                try:
-                    stamp = os.path.getmtime(os.path.join(root, name))
-                except OSError:
-                    continue
-                if oldest is None or stamp < oldest:
-                    oldest = stamp
-    except OSError:
-        return None
+    for root, _dirs, files in os.walk(projects_dir):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                stamp = os.path.getmtime(os.path.join(root, name))
+            except OSError:
+                continue
+            if oldest is None or stamp < oldest:
+                oldest = stamp
     if oldest is None:
         return None
     return round(max(0.0, (now or time.time()) - oldest) / 3600.0, 1)
@@ -232,9 +239,12 @@ def merge_cycles(stored_cycles, fresh_cycles):
 def merge_quota(stored_quota, fresh_quota):
     """Union of two quota series, keyed by reading time, oldest first.
 
-    `quota-history.jsonl` sits on the same disk as the transcripts and is lost
-    in the same restart, so the series needs exactly the same treatment as the
-    cycles. Measured 2026-08-20: 2,414 stored readings against 73 on disk, and
+    `quota-history.jsonl` sits on the same disk as the transcripts and reaches
+    back no further, so the series needs exactly the same treatment as the
+    cycles. Not because a restart loses it -- it does not; see the module
+    docstring for the measurement that settles that, and do not reintroduce
+    the restart as the reason here, which is where it survived a first pass at
+    correcting it. Measured 2026-08-20: 2,414 stored readings against 73 on disk, and
     the two do not overlap at all -- the stored series ends 08-17, the file
     begins 08-19. Merging only the cycles left the document at 76,857 bytes
     against 310,060, which is still under `vault_tool`'s 25% collapse floor,
