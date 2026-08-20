@@ -15,8 +15,17 @@ from bridge.config import BRIDGE_TOKEN, PORT
 from bridge.log import log
 from bridge.sessions import clear_session_id, get_session_id, set_session_id
 from bridge.cli import (
-    ClaudeCliError, UsageLimitError, SESSION_NOT_FOUND, DISCOVERED_FULL_TOOL_ROSTER, run_turn,
+    ClaudeCliError, UsageLimitError, SESSION_NOT_FOUND, AUTH_EXPIRED,
+    DISCOVERED_FULL_TOOL_ROSTER, run_turn,
 )
+
+# How long to wait before retrying a turn that lost the OAuth refresh race
+# (cli.AUTH_EXPIRED) before picking it back up. Not tuned against a real
+# race caught live -- 7s sits inside the 5-10s Edvard asked for, long
+# enough that the winner's write to .credentials.json has almost certainly
+# landed (a token exchange is a single HTTP round trip), short enough that
+# a caller waiting on this reply doesn't notice much beyond normal latency.
+AUTH_RETRY_DELAY_SECONDS = 7
 
 
 # Set by the SIGTERM/SIGINT handler, read by start_server's main thread and
@@ -108,6 +117,31 @@ def _await_drain():
             _in_flight_changed.wait(timeout=30)
 
 
+def _run_turn_with_auth_retry(**kwargs):
+    """run_turn, retried once after a short wait if this turn lost the
+    OAuth refresh race (cli.AUTH_EXPIRED) -- the reactive backstop for
+    whatever cli.run_turn's proactive refresh_window_clear() gate misses,
+    or for a caller running outside that gate altogether. By the time this
+    wakes up and retries, whichever invocation won the race has already
+    written the refreshed token to .credentials.json; run_turn reads that
+    file fresh on the retry the same as it does on any other call, so
+    there's nothing to pass forward from the failed attempt beyond calling
+    it again with the same arguments.
+
+    Every call site in generate() below goes through this rather than
+    calling cli.run_turn directly, including the SESSION_NOT_FOUND retry --
+    a retry can lose the race too, and there's no reason that second
+    attempt should get one fewer chance than the first."""
+    try:
+        return run_turn(**kwargs)
+    except ClaudeCliError as e:
+        if str(e) != AUTH_EXPIRED:
+            raise
+        log(f"lost the OAuth refresh race, retrying once after {AUTH_RETRY_DELAY_SECONDS}s")
+        time.sleep(AUTH_RETRY_DELAY_SECONDS)
+        return run_turn(**kwargs)
+
+
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
              activity=None, mcp=None, attachments=None, allow_concurrent=False):
     """One turn for one conversation. The system/persona prompt goes to the
@@ -165,8 +199,8 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     clear of its refresh window and falls back to the lock otherwise, so
     no caller has to reason about the credential itself."""
     if stateless:
-        text, thinking, _ = run_turn(
-            prompt, session_id=None, model=model,
+        text, thinking, _ = _run_turn_with_auth_retry(
+            message=prompt, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
             allow_concurrent=allow_concurrent,
@@ -177,8 +211,8 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     disallowed_tools = DISCOVERED_FULL_TOOL_ROSTER if restricted else None
 
     try:
-        text, thinking, new_session_id = run_turn(
-            prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
+        text, thinking, new_session_id = _run_turn_with_auth_retry(
+            message=prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
             allow_concurrent=allow_concurrent,
         )
@@ -186,8 +220,8 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
         if str(e) == SESSION_NOT_FOUND:
             log(f"conversation={conversation_id}: stored session gone, retrying fresh")
             clear_session_id(conversation_id)
-            text, thinking, new_session_id = run_turn(
-                prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
+            text, thinking, new_session_id = _run_turn_with_auth_retry(
+                message=prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
                 activity=activity, mcp=mcp, system=system, attachments=attachments,
                 allow_concurrent=allow_concurrent,
             )

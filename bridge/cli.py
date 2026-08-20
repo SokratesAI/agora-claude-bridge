@@ -39,6 +39,18 @@ from bridge.quota import QuotaWatcher, write_hook_settings
 
 SESSION_NOT_FOUND = "\x00SESSION_NOT_FOUND"
 
+# A turn that lost the OAuth refresh-token race: another invocation
+# refreshed first and this one's token was invalidated mid-turn. Distinct
+# from SESSION_NOT_FOUND (the *conversation's* session is gone) and from
+# UsageLimitError (a real, hours-long subscription cap) -- this is neither,
+# and the right response is neither "start fresh" nor "stop retrying". The
+# winner has already written the new token to .credentials.json by the
+# time anything downstream of the race can act on this, so a short wait
+# and a plain retry (see server.generate's _run_turn_with_auth_retry)
+# should just pick it up. See cli.py's own module docstring for why the
+# lock is still the default and this is a backstop, not a replacement.
+AUTH_EXPIRED = "\x00AUTH_EXPIRED"
+
 # 2026-08-01 design reversal: v1 shipped with a hardcoded, always-on
 # --disallowedTools restriction (the 8 "obvious" tools -- Bash/Read/Write/
 # Edit/Glob/Grep/WebFetch/WebSearch). Live-tested and found genuinely
@@ -193,6 +205,18 @@ def _detect_usage_limit(text):
     differ. Update this the first time a real cap is actually hit."""
     lowered = text.lower()
     return "usage limit" in lowered or "you've hit your limit" in lowered or "rate limit" in lowered
+
+
+def _detect_auth_expired(text):
+    """Best-effort text match for a turn that lost the OAuth refresh race
+    (see AUTH_EXPIRED). Unverified against a real race caught live in this
+    pod -- publicly reported symptoms (anthropics/claude-code#24317) are an
+    `invalid_grant` from the token endpoint and a CLI prompt to run
+    `/login`, both distinct enough from ordinary error text to be worth
+    matching narrowly rather than broadly. Update this the first time a
+    real race is actually caught here."""
+    lowered = text.lower()
+    return "invalid_grant" in lowered or "please run /login" in lowered or "please run claude /login" in lowered
 
 
 def _report_subagent_event(event, subagent, reporter, tool_names, subagent_names):
@@ -371,6 +395,15 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     thinking_parts = []
     new_session_id = session_id or ""
     saw_error = None
+    # A lost auth race can plausibly fail before the CLI's stream-json
+    # format is even up -- stderr merged onto the same stdout the JSON
+    # parser reads (Popen's stderr=STDOUT above), printed as plain text
+    # rather than a structured error_during_execution event. Buffered
+    # separately so it can still be checked for AUTH_EXPIRED once the
+    # process exits, without treating ordinary non-JSON chatter as a
+    # reason to raise on its own -- see the check just above "CLI produced
+    # no text output" below.
+    non_json_lines = []
 
     # Narrates each tool call to the caller as it happens (activity.py).
     # A no-op when the caller didn't ask for it, which is why there's no
@@ -421,6 +454,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 event = json.loads(line)
             except json.JSONDecodeError:
                 log(f"CLI non-JSON stdout: {line[:300]!r}")
+                non_json_lines.append(line)
                 continue
 
             t = event.get("type", "")
@@ -544,6 +578,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                     log(f"CLI error_during_execution: {error_text[:300]}")
                     if any("No conversation found" in str(e) for e in errors):
                         saw_error = (SESSION_NOT_FOUND, "")
+                    elif _detect_auth_expired(error_text):
+                        saw_error = (AUTH_EXPIRED, error_text[:300])
                     elif _detect_usage_limit(error_text):
                         saw_error = ("usage_limit", error_text[:300])
                     else:
@@ -596,10 +632,24 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         f"text_len={len(''.join(text_parts))} thinking_len={len(''.join(thinking_parts))} "
         f"new_session={new_session_id}")
 
+    # A lost auth race can plausibly fail before stream-json is even up,
+    # landing as plain non-JSON text rather than a structured
+    # error_during_execution event -- see non_json_lines' own comment.
+    # Scoped to "produced nothing at all": a turn that wrote real text and
+    # merely logged an unrelated line containing this wording (e.g. a tool
+    # reading a doc that mentions /login) must not be reclassified as a
+    # lost race on the strength of that line alone.
+    if saw_error is None and not text_parts and non_json_lines:
+        raw = " ".join(non_json_lines)
+        if _detect_auth_expired(raw):
+            saw_error = (AUTH_EXPIRED, raw[:300])
+
     if saw_error is not None:
         kind, detail = saw_error
         if kind == SESSION_NOT_FOUND:
             raise ClaudeCliError(SESSION_NOT_FOUND)
+        if kind == AUTH_EXPIRED:
+            raise ClaudeCliError(AUTH_EXPIRED)
         if kind == "usage_limit":
             raise UsageLimitError(detail)
         raise ClaudeCliError(detail)

@@ -468,6 +468,57 @@ def test_run_turn_ignores_non_json_lines(tmp_path):
     assert text == "answer"
 
 
+def test_run_turn_raises_auth_expired_sentinel_on_invalid_grant(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "result", "subtype": "error_during_execution",
+         "errors": ["invalid_grant: token already used"]},
+    )
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        with pytest.raises(cli.ClaudeCliError, match=cli.AUTH_EXPIRED):
+            cli.run_turn("hello")
+
+
+def test_run_turn_raises_auth_expired_from_raw_non_json_output_when_nothing_else_came_back(tmp_path):
+    """A lost race can plausibly fail before stream-json is even up --
+    plain stderr text merged onto stdout, not a structured event."""
+    lines = ["Invalid grant, please run /login to reauthenticate\n"]
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        with pytest.raises(cli.ClaudeCliError, match=cli.AUTH_EXPIRED):
+            cli.run_turn("hello")
+
+
+def test_run_turn_does_not_misclassify_real_text_over_an_unrelated_login_mention(tmp_path):
+    """A turn that actually produced text must not be reclassified as a
+    lost auth race just because some unrelated non-JSON line mentioned
+    /login -- e.g. a tool printing a doc's own content."""
+    lines = [
+        "some tool logged: see /login docs for reference\n",
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "answer"}]}}) + "\n",
+        json.dumps({"type": "result", "session_id": "sess-1", "subtype": "success"}) + "\n",
+    ]
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
+        text, _, _ = cli.run_turn("hello")
+    assert text == "answer"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("invalid_grant: token already used", True),
+    ("Please run /login to reauthenticate", True),
+    ("please run claude /login", True),
+    ("You've hit your usage limit, resets in 4 hours", False),
+    ("Something else went wrong entirely", False),
+    ("", False),
+])
+def test_detect_auth_expired(text, expected):
+    assert cli._detect_auth_expired(text) is expected
+
+
 def test_run_turn_serializes_via_module_level_lock(tmp_path):
     """The lock must actually be acquired around the real subprocess call --
     verified by patching Popen to assert the lock is held at call time."""
@@ -1358,6 +1409,97 @@ def test_generate_keeps_allow_concurrent_on_the_session_not_found_retry():
          patch.object(server, "run_turn", side_effect=fake_run_turn):
         server.generate("conv-1", "system", "hi", allow_concurrent=True)
     assert seen == [True, True]
+
+
+# --- _run_turn_with_auth_retry: the reactive backstop for a lost OAuth
+# refresh race (cli.AUTH_EXPIRED) --------------------------------------------
+
+def test_auth_retry_wrapper_retries_once_after_the_delay_and_succeeds(monkeypatch):
+    calls = []
+    slept = []
+
+    def fake_run_turn(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise server.ClaudeCliError(server.AUTH_EXPIRED)
+        return "reply", "thinking", "sess-1"
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+    monkeypatch.setattr(server.time, "sleep", lambda s: slept.append(s))
+
+    result = server._run_turn_with_auth_retry(message="hi", session_id=None)
+
+    assert result == ("reply", "thinking", "sess-1")
+    assert len(calls) == 2
+    assert calls[0] == calls[1]  # identical args on the retry
+    assert slept == [server.AUTH_RETRY_DELAY_SECONDS]
+
+
+def test_auth_retry_wrapper_gives_up_after_one_retry(monkeypatch):
+    """Not an infinite retry loop -- a second consecutive loss surfaces as
+    a real failure rather than hanging the caller."""
+    calls = []
+
+    def fake_run_turn(**kwargs):
+        calls.append(kwargs)
+        raise server.ClaudeCliError(server.AUTH_EXPIRED)
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+    monkeypatch.setattr(server.time, "sleep", lambda s: None)
+
+    with pytest.raises(server.ClaudeCliError, match=server.AUTH_EXPIRED):
+        server._run_turn_with_auth_retry(message="hi", session_id=None)
+    assert len(calls) == 2
+
+
+def test_auth_retry_wrapper_does_not_retry_other_cli_errors(monkeypatch):
+    def fake_run_turn(**kwargs):
+        raise server.ClaudeCliError("some other failure")
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+    with patch.object(server.time, "sleep", side_effect=AssertionError("must not sleep/retry")):
+        with pytest.raises(server.ClaudeCliError, match="some other failure"):
+            server._run_turn_with_auth_retry(message="hi", session_id=None)
+
+
+def test_generate_retries_through_a_lost_auth_race_on_the_stateless_path():
+    calls = []
+
+    def fake_run_turn(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise server.ClaudeCliError(server.AUTH_EXPIRED)
+        return "reply", "", "sess-1"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn), \
+         patch.object(server.time, "sleep"):
+        text, thinking = server.generate("conv-1", "system", "hi", stateless=True)
+    assert text == "reply"
+    assert len(calls) == 2
+
+
+def test_generate_composes_auth_retry_with_the_session_not_found_retry():
+    """The SESSION_NOT_FOUND retry call is itself wrapped -- it must not get
+    one fewer chance at recovering from a lost race than the first attempt."""
+    calls = []
+
+    def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
+                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+        calls.append(session_id)
+        if len(calls) == 1:
+            raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
+        if len(calls) == 2:
+            raise server.ClaudeCliError(server.AUTH_EXPIRED)
+        return "reply", "", "sess-new"
+
+    with patch.object(server, "get_session_id", return_value="sess-old"), \
+         patch.object(server, "clear_session_id"), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn), \
+         patch.object(server.time, "sleep"):
+        text, thinking = server.generate("conv-1", "system", "hi")
+    assert text == "reply"
+    assert calls == ["sess-old", None, None]
 
 
 # ---------------------------------------------------------------------------
