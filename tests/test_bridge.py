@@ -2183,6 +2183,91 @@ def test_concurrent_turns_do_not_share_their_mcp_config_path(tmp_path):
     assert paths[2] == shared, "serialized turn changed path"
 
 
+def test_workspace_for_isolates_only_a_concurrent_turn():
+    """A real git checkout, not a disposable per-turn artifact like the MCP
+    config/input file _slotted isolates -- two turns sharing it would race
+    on the same working tree. A serialized turn (no slot) must get the
+    exact same shared directory every turn has always used."""
+    with patch.object(cli, "CLAUDE_WORKSPACE", "/data/workspace"):
+        assert cli._workspace_for("") == "/data/workspace"
+        assert cli._workspace_for("7-9") == "/data/workspace/concurrent/7-9"
+
+
+def test_serialized_turn_uses_the_shared_workspace_unchanged(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    seen = _lock_probe_cwd(tmp_path, workspace)
+    assert seen["cwd"] == workspace
+
+
+def test_concurrent_turn_gets_an_isolated_workspace_that_exists_at_call_time(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        seen = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
+    assert seen["cwd"] != workspace
+    assert seen["cwd"].startswith(workspace)
+    assert "concurrent" in seen["cwd"]
+    assert seen["cwd_existed_at_call_time"] is True
+
+
+def test_concurrent_workspace_is_removed_after_the_turn_but_the_shared_one_is_not(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        seen = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
+    assert not os.path.exists(seen["cwd"]), "a concurrent turn must not leave its workspace behind"
+
+    seen = _lock_probe_cwd(tmp_path, workspace)
+    assert os.path.isdir(seen["cwd"]), "the shared workspace must survive a serialized turn"
+
+
+def test_concurrent_turn_clears_a_slot_a_killed_turn_left_behind(tmp_path):
+    """The `finally` cleanup is the normal path, not a guarantee: it does
+    not run when the process is killed (pod eviction, OOM, SIGKILL), and
+    `shutil.rmtree(..., ignore_errors=True)` accepts a partial removal in
+    silence. Slots collide in ordinary operation -- `slot` is
+    pid+thread-ident, the pid is fixed for the pod's life and CPython
+    reuses a thread ident once that thread exits -- so a later turn really
+    can be handed the directory an earlier one left behind. The invariant
+    has to be enforced where it is needed, at the start of the turn."""
+    workspace = str(tmp_path / "workspace")
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        first = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
+
+    # Same test, same thread, so the next concurrent turn gets the same
+    # slot -- stage exactly what a killed turn would have stranded there.
+    stranded = first["cwd"]
+    os.makedirs(os.path.join(stranded, ".git"), exist_ok=True)
+    with open(os.path.join(stranded, "half-written-branch.txt"), "w") as fh:
+        fh.write("a checkout from a turn that never got to its finally")
+
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        second = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
+
+    assert second["cwd"] == stranded, "same thread must reuse the same slot for this to test anything"
+    assert second["cwd_entries_at_call_time"] == [], (
+        "a concurrent turn inherited a previous turn's checkout: "
+        f"{second['cwd_entries_at_call_time']}")
+
+
+def _lock_probe_cwd(tmp_path, workspace, **run_turn_kwargs):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+        seen["cwd_existed_at_call_time"] = os.path.isdir(kwargs.get("cwd") or "")
+        seen["cwd_entries_at_call_time"] = sorted(os.listdir(kwargs.get("cwd") or "."))
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", workspace), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", **run_turn_kwargs)
+    return seen
+
+
 # --- which invocations publish the cost record ----------------------------
 
 # The real strings, copied from agora_runner/heartbeats.py:288-290, not
