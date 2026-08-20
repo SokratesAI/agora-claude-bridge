@@ -166,8 +166,74 @@ def test_a_resumed_session_is_counted_once_not_twice(monkeypatch):
 
     assert [c["session"] for c in payload["cycles"]] == ["old1", "old2"]
     assert payload["cycles"][1]["weightedTokens"] == 7777.0
-    # 100 stored - 1 for the session re-measured + 1 for the fresh scan.
+    # 100 stored, and nothing added: the stored totals already counted old2.
     assert payload["summary"]["totals"]["input_tokens"] == 100
+
+
+def test_a_session_already_counted_is_never_added_a_second_time(monkeypatch):
+    """Two generations, which is the only shape that can see this.
+
+    Feed the output of one merge back in as the next one's stored document.
+    The first version of this arithmetic subtracted the re-measured session
+    and added the whole scan back; the overlap is a subset of the scan, so
+    those terms cancelled and it was a tautology no single-call fixture could
+    fail. Reviewer finding, and it was right.
+    """
+    def build(stored, scan):
+        monkeypatch.setattr(publish_costs.analytics, "scan", lambda d=None: scan)
+        monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: stored)
+        return publish_costs.build_payload()
+
+    first = _scan_row("s1", "2026-08-01T00:00:00Z", 10.0, input_tokens=10)
+    gen1 = build(None, [first])
+    assert gen1["summary"]["totals"]["input_tokens"] == 10
+
+    # Same session, re-scanned alongside a genuinely new one.
+    second = _scan_row("s2", "2026-08-02T00:00:00Z", 20.0, input_tokens=7)
+    gen2 = build(gen1, [first, second])
+    assert [c["session"] for c in gen2["cycles"]] == ["s1", "s2"]
+    # 10 carried + 7 for s2 only. s1 is not counted twice.
+    assert gen2["summary"]["totals"]["input_tokens"] == 17
+    assert gen2["summary"]["total_weighted"] == 30.0
+
+    # And again: a third generation with nothing new must not move the totals.
+    gen3 = build(gen2, [first, second])
+    assert gen3["summary"]["totals"]["input_tokens"] == 17
+
+
+def test_a_duplicate_stored_row_does_not_wedge_publishing_forever(monkeypatch):
+    """The shrink guard must not become a door that never reopens.
+
+    A stored document holding one duplicate `session` legitimately collapses
+    in the merge. Compared against the raw row count that reads as data loss
+    and every future publish refuses, over one malformed row, forever.
+    """
+    stored = _stored("dup", "other")
+    stored["cycles"].append(dict(stored["cycles"][0]))  # three rows, two sessions
+    # Nothing new on disk, so the merge can only shrink: 3 rows in, 2 out.
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("dup", "2026-08-01T00:00:00Z", 5.0)])
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: stored)
+    payload = publish_costs.build_payload()
+
+    assert payload is not None, "one duplicate row must not wedge every future publish"
+    assert [c["session"] for c in payload["cycles"]] == ["dup", "other"]
+
+
+def test_refresh_reads_and_writes_the_same_document(monkeypatch):
+    """`vault_path` has to reach both halves, or refresh merges from the
+    production ledger and overwrites a different path with the result."""
+    seen = {}
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored",
+                        lambda p=None: seen.setdefault("read", p) and None)
+    monkeypatch.setattr(publish_costs, "publish",
+                        lambda payload, vault_path=None: seen.update(wrote=vault_path) or True)
+    publish_costs.refresh(vault_path="some/other/ledger.json")
+
+    assert seen["read"] == "some/other/ledger.json"
+    assert seen["wrote"] == "some/other/ledger.json"
 
 
 def test_an_unreadable_stored_ledger_stops_the_publish(monkeypatch):

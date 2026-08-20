@@ -211,11 +211,25 @@ def merge_summary(stored_summary, scan_rows, merged_cycles, stored_sessions=()):
 
     The per-token-class totals are the exception, because `_cycle_row` does
     not keep them and the rows they came from are gone. They are carried
-    forward instead: stored totals, minus the contribution of any session the
-    scan has re-measured, plus the whole scan. That is exact rather than
-    approximate as long as no session is counted twice, which is what
-    `stored_sessions` -- the session ids the stored summary already counted --
-    is passed in for.
+    forward instead: the stored totals plus the classes of every session the
+    stored summary had *not* already counted.
+
+    **That is an accumulation, not a recomputation, and it has one limit worth
+    stating plainly rather than dressing up.** A session already counted keeps
+    the numbers it was counted with; if its transcript grew since, the growth
+    never reaches these five counters. In this system it cannot -- `publish`
+    runs after `proc.wait()`, so a transcript is closed before it is ever
+    scanned (`quota.py` says so, and a reviewer checked it) -- but the ledger
+    is the wrong place to assert that, so: `total_weighted` and every
+    per-cycle `weightedTokens` are recomputed from the rows and are always
+    right; these five are carried and can only be as right as the last write.
+
+    An earlier version of this subtracted the re-measured session and added
+    the whole scan back. That looked like exact accounting and was a
+    tautology: the overlap is a subset of the scan, so the two terms cancel
+    and the result is identical to the line below, with a misleading docstring
+    on top. The test that was supposed to pin it could not fail, because no
+    single-generation fixture can make the overlap anything but a subset.
 
     `other_sessions` deliberately counts only what is on disk now. It is the
     one field here that cannot be carried forward (non-cycle sessions never
@@ -228,16 +242,15 @@ def merge_summary(stored_summary, scan_rows, merged_cycles, stored_sessions=()):
     stored_sessions = set(stored_sessions)
     stored_raw = (stored_summary or {}).get("totals") or {}
     stored_weighted = (stored_summary or {}).get("totals_weighted") or {}
-    overlap = [r for r in fresh_cycles if r["session"] in stored_sessions]
-    ov_raw, ov_weighted = _class_totals(overlap)
-    fr_raw, fr_weighted = _class_totals(fresh_cycles)
+    uncounted = [r for r in fresh_cycles if r["session"] not in stored_sessions]
+    new_raw, new_weighted = _class_totals(uncounted)
 
     totals = {
-        f: int(stored_raw.get(f, 0)) - ov_raw[f] + fr_raw[f]
+        f: int(stored_raw.get(f, 0)) + new_raw[f]
         for f in analytics.TOKEN_FIELDS
     }
     totals_weighted = {
-        f: round(float(stored_weighted.get(f, 0)) - ov_weighted[f] + fr_weighted[f], 1)
+        f: round(float(stored_weighted.get(f, 0)) + new_weighted[f], 1)
         for f in analytics.TOKEN_FIELDS
     }
     class_grand = sum(totals_weighted.values())
@@ -293,9 +306,15 @@ def build_payload(projects_dir=None, history_path=None, vault_path=VAULT_PATH):
     stored_sessions = {r.get("session") for r in stored_cycles if isinstance(r, dict)}
     fresh = [_cycle_row(r) for r in rows if r["kind"] == "cycle"]
     merged = merge_cycles(stored_cycles, fresh)
-    if len(merged) < len(stored_cycles):
-        log(f"cost publish: merge lost rows ({len(stored_cycles)} -> {len(merged)}), "
-            "refusing to publish")
+    # Against the count of distinct stored sessions, not of stored rows. A
+    # stored document that already holds a duplicate `session`, or a row with
+    # none at all, legitimately collapses here -- and comparing against the
+    # raw row count would make that a door that never reopens: every future
+    # publish would refuse, forever, over one malformed row, and the only
+    # sign of it would be a log line nobody is watching for.
+    if len(merged) < len(stored_sessions - {None}):
+        log(f"cost publish: merge lost rows ({len(stored_sessions)} stored sessions "
+            f"-> {len(merged)}), refusing to publish")
         return None
     added = len(merged) - len(stored_cycles)
     log(f"cost publish: {len(stored_cycles)} stored + {len(fresh)} on disk "
@@ -359,7 +378,10 @@ def publish(payload, vault_path=VAULT_PATH):
 def refresh(projects_dir=None, history_path=None, vault_path=VAULT_PATH):
     """Build and publish in one call. Never raises -- see the module docstring."""
     try:
-        payload = build_payload(projects_dir, history_path)
+        # `vault_path` has to reach both halves. Merging from the default
+        # document and then writing the result to a different one would read
+        # one ledger and overwrite another with it.
+        payload = build_payload(projects_dir, history_path, vault_path)
     except Exception as exc:
         log(f"cost publish: build failed: {type(exc).__name__}: {exc}")
         return False
