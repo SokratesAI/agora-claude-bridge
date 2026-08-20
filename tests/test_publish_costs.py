@@ -1,7 +1,6 @@
 """The cost record that goes into the vault, where the site can actually read it."""
 import json
 import os
-import time
 
 import pytest
 
@@ -366,15 +365,32 @@ def test_retention_hours_is_none_when_there_is_nothing_to_measure(tmp_path):
 
 def test_a_publish_says_how_much_the_disk_is_holding(tmp_path, monkeypatch):
     """The log line is the whole delivery mechanism -- the number is useless
-    unless it lands somewhere a later cycle can read without running `find`."""
-    root = tmp_path / "projects" / "-data-workspace"
-    _transcript(root, "session.jsonl", time.time() - 7200.0)
+    unless it lands somewhere a later cycle can read without running `find`.
+
+    The reading is stubbed rather than built from a real mtime: what is under
+    test here is the wiring and the formatting, and keying that on the wall
+    clock would make it a test that agrees with the author most of the time.
+    The three tests above own whether the number itself is right."""
     lines = []
+    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None: 2.0)
     monkeypatch.setattr(publish_costs, "log", lines.append)
     monkeypatch.setattr(publish_costs.analytics, "scan",
                         lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
     monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: _stored("old1"))
 
-    publish_costs.build_payload(projects_dir=str(tmp_path / "projects"),
-                                history_path=str(tmp_path / "none.jsonl"))
+    publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
     assert any("disk holds 2.0h" in line for line in lines)
+
+
+def test_a_disk_with_nothing_to_measure_logs_a_question_mark(tmp_path, monkeypatch):
+    """Not `0.0h`, which would read as "the disk was wiped this instant" -- the
+    exact false alarm the whole change exists to stop."""
+    lines = []
+    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None: None)
+    monkeypatch.setattr(publish_costs, "log", lines.append)
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: _stored("old1"))
+
+    publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+    assert any("disk holds ?" in line for line in lines)
