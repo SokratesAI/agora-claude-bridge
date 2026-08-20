@@ -2219,6 +2219,35 @@ def test_concurrent_workspace_is_removed_after_the_turn_but_the_shared_one_is_no
     assert os.path.isdir(seen["cwd"]), "the shared workspace must survive a serialized turn"
 
 
+def test_concurrent_turn_clears_a_slot_a_killed_turn_left_behind(tmp_path):
+    """The `finally` cleanup is the normal path, not a guarantee: it does
+    not run when the process is killed (pod eviction, OOM, SIGKILL), and
+    `shutil.rmtree(..., ignore_errors=True)` accepts a partial removal in
+    silence. Slots collide in ordinary operation -- `slot` is
+    pid+thread-ident, the pid is fixed for the pod's life and CPython
+    reuses a thread ident once that thread exits -- so a later turn really
+    can be handed the directory an earlier one left behind. The invariant
+    has to be enforced where it is needed, at the start of the turn."""
+    workspace = str(tmp_path / "workspace")
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        first = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
+
+    # Same test, same thread, so the next concurrent turn gets the same
+    # slot -- stage exactly what a killed turn would have stranded there.
+    stranded = first["cwd"]
+    os.makedirs(os.path.join(stranded, ".git"), exist_ok=True)
+    with open(os.path.join(stranded, "half-written-branch.txt"), "w") as fh:
+        fh.write("a checkout from a turn that never got to its finally")
+
+    with patch.object(cli, "refresh_window_clear", return_value=True):
+        second = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
+
+    assert second["cwd"] == stranded, "same thread must reuse the same slot for this to test anything"
+    assert second["cwd_entries_at_call_time"] == [], (
+        "a concurrent turn inherited a previous turn's checkout: "
+        f"{second['cwd_entries_at_call_time']}")
+
+
 def _lock_probe_cwd(tmp_path, workspace, **run_turn_kwargs):
     lines = _stream_json_lines(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
@@ -2229,6 +2258,7 @@ def _lock_probe_cwd(tmp_path, workspace, **run_turn_kwargs):
     def fake_popen(cmd, **kwargs):
         seen["cwd"] = kwargs.get("cwd")
         seen["cwd_existed_at_call_time"] = os.path.isdir(kwargs.get("cwd") or "")
+        seen["cwd_entries_at_call_time"] = sorted(os.listdir(kwargs.get("cwd") or "."))
         return FakeProc(lines)
 
     with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \

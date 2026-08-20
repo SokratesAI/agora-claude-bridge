@@ -276,6 +276,18 @@ def _workspace_for(slot):
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
                   system=None, attachments=None, slot=""):
     workspace = _workspace_for(slot)
+    if slot:
+        # _workspace_for's invariant is "a concurrent turn always starts
+        # empty", and the `finally` below cannot carry that on its own: it
+        # does not run at all if the process is killed (pod eviction, OOM,
+        # SIGKILL), and `ignore_errors=True` accepts a partial removal in
+        # silence. Slots collide in normal operation -- `slot` is
+        # pid+thread-ident, the pid is fixed for the pod's life and CPython
+        # reuses thread idents once a thread exits -- so a later, unrelated
+        # turn really can be handed a directory an earlier one left behind.
+        # Clear it at the point of use, where the invariant is actually
+        # needed, instead of trusting the previous turn's exit path.
+        shutil.rmtree(workspace, ignore_errors=True)
     os.makedirs(workspace, exist_ok=True)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
