@@ -177,6 +177,34 @@ def _classify(opening):
     return "other", "none"
 
 
+#: Directory the CLI writes a subagent's own transcript into, as a sibling of
+#: the parent session's `<id>.jsonl` and named after it:
+#: `<projects>/<slug>/<session-id>/subagents/agent-<agent-id>.jsonl`.
+SUBAGENT_DIR = "subagents"
+
+
+def subagent_parent(path):
+    """The session id that spawned this transcript, or None if it is not a
+    subagent's.
+
+    The link is the directory name and nothing else has to be joined to find
+    it. That matters because the obvious-looking alternative does not work:
+    `parse_transcript` used to count subagent turns by reading `isSidechain`
+    off records in the *parent* transcript, and that key is `false` on every
+    record the harness has ever written -- 75,435 of them across 329
+    transcripts (Cycle 228), and again on this cycle's own live session while
+    a subagent was running. A subagent gets its own file; it never appears in
+    its parent's. So the counter read a flag that is never set, reported 0 for
+    all 228 cycles, and the test pinning it built a record shape by hand and
+    therefore could not fail.
+    """
+    parent = os.path.dirname(path)
+    if os.path.basename(parent) != SUBAGENT_DIR:
+        return None
+    session = os.path.basename(os.path.dirname(parent))
+    return session or None
+
+
 def _usage_totals(usage):
     """Flatten one API `usage` block into our five counters.
 
@@ -303,23 +331,32 @@ def parse_transcript(path):
             model = message.get("model") or ""
             if model:
                 models.add(model)
-            if record.get("isSidechain"):
-                subagent_turns += 1
             bucket = by_model.setdefault(model, dict.fromkeys(TOKEN_FIELDS, 0))
             for field, value in _usage_totals(usage).items():
                 totals[field] += value
                 bucket[field] += value
 
     kind, trigger = _classify(opening)
+    parent = subagent_parent(path)
+    if parent:
+        # A subagent's opening message is its brief, which matches no cycle
+        # marker, so `_classify` calls it "other" -- the same bucket as a
+        # two-turn probe. It is not one: it is work this loop paid for, on
+        # behalf of a named cycle, and `summarize` drops "other" entirely.
+        kind, trigger = "subagent", "delegated"
     row = {
         "session": os.path.basename(path).replace(".jsonl", ""),
         "kind": kind,
         "trigger": trigger,
+        "parent_session": parent or "",
         "started_at": first_ts or "",
         "ended_at": last_ts or "",
         "duration_seconds": _duration(first_ts, last_ts),
         "turns": len(seen_messages),
+        # Filled in by `scan`, which is the first place that can see a
+        # cycle's children. A row parsed on its own does not know.
         "subagent_turns": subagent_turns,
+        "subagent_weighted_tokens": 0.0,
         "tool_calls": tool_calls,
         "models": sorted(models),
     }
@@ -352,7 +389,8 @@ def _duration(first_ts, last_ts):
 
 
 def scan(projects_dir=None):
-    """Every transcript under the projects dir, oldest first."""
+    """Every transcript under the projects dir, oldest first, with each
+    subagent's cost added to the row of the cycle that spawned it."""
     projects_dir = projects_dir or PROJECTS_DIR
     rows = []
     for root, _dirs, files in os.walk(projects_dir):
@@ -363,6 +401,40 @@ def scan(projects_dir=None):
                 except OSError:
                     continue
     rows.sort(key=lambda r: r["started_at"] or "")
+    attribute_subagents(rows)
+    return rows
+
+
+def attribute_subagents(rows):
+    """Roll each subagent row up onto its parent's, in place.
+
+    The subagent rows are left in the list rather than folded away: they carry
+    their own model, duration and tool count, and a delegated read that ran
+    four minutes on Sonnet is a different object from the cycle that waited on
+    it. What the parent gains is the two numbers you cannot get by looking at
+    it alone -- how many turns were delegated, and what they cost.
+
+    `weighted_tokens` on the parent deliberately does **not** absorb the
+    child's. That column means "what this session was charged", it is what
+    `calibration.py` joins against quota readings, and double-counting a
+    charge that already appears on the child's own row would skew the
+    constant. The rolled-up cost is its own column so a reader can add them
+    when the question is "what did this cycle cost all in" and not when it is
+    not.
+
+    An orphan -- a subagent whose parent transcript has been pruned off the
+    disk -- keeps its own row and lands nowhere. That is the honest outcome
+    and it is visible as a `subagent` row with a `parent_session` matching
+    nothing, rather than being silently dropped or silently reattributed.
+    """
+    by_session = {r["session"]: r for r in rows}
+    for row in rows:
+        parent = by_session.get(row["parent_session"])
+        if parent is None or parent is row:
+            continue
+        parent["subagent_turns"] += row["turns"]
+        parent["subagent_weighted_tokens"] = round(
+            parent["subagent_weighted_tokens"] + row["weighted_tokens"], 1)
     return rows
 
 
@@ -441,8 +513,10 @@ def summarize(rows):
     one, and a mean alone would describe a cycle that does not exist.
     """
     cycles = [r for r in rows if r["kind"] == "cycle"]
+    subagents = [r for r in rows if r["kind"] == "subagent"]
     if not cycles:
-        return {"cycles": 0, "other_sessions": len(rows)}
+        return {"cycles": 0, "other_sessions": len(rows) - len(subagents),
+                "subagent_sessions": len(subagents)}
     weighted = [r["weighted_tokens"] for r in cycles]
     totals = {f: sum(r[f] for r in cycles) for f in TOKEN_FIELDS}
     weighted_totals = {
@@ -453,7 +527,13 @@ def summarize(rows):
     grand = sum(weighted)
     return {
         "cycles": len(cycles),
-        "other_sessions": len(rows) - len(cycles),
+        "other_sessions": len(rows) - len(cycles) - len(subagents),
+        # Kept out of `total_weighted`, which is the cycles' own charge. This
+        # is the delegated spend beside it -- the number that was 0 for 228
+        # cycles because nothing ever counted it.
+        "subagent_sessions": len(subagents),
+        "subagent_weighted": round(
+            sum(r["weighted_tokens"] for r in subagents), 1),
         "first_cycle": cycles[0]["started_at"],
         "last_cycle": cycles[-1]["started_at"],
         "totals": totals,

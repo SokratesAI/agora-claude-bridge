@@ -90,6 +90,11 @@ def _cycle_row(row):
         "durationSeconds": row["duration_seconds"],
         "turns": row["turns"],
         "subagentTurns": row["subagent_turns"],
+        # Beside `weightedTokens`, never folded into it: that column is what
+        # this session was charged, and the subagent's own charge is on the
+        # subagent's row. A chart that wants the all-in cost of a cycle adds
+        # the two; one that wants the charge does not.
+        "subagentWeightedTokens": row.get("subagent_weighted_tokens", 0.0),
         "toolCalls": row["tool_calls"],
         "weightedTokens": row["weighted_tokens"],
         "models": row["models"],
