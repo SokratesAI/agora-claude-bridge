@@ -274,14 +274,101 @@ def test_duration_spans_first_to_last_record(tmp_path):
     assert analytics.parse_transcript(path)["duration_seconds"] == 750.0
 
 
-def test_subagent_turns_are_tracked_separately(tmp_path):
-    path = _write(tmp_path, "s.jsonl", [
-        _user("[Automatic heartbeat trigger"),
-        _assistant("msg_a", USAGE),
-        _assistant("msg_b", USAGE, isSidechain=True),
+def _spawn(tmp_path, session, agent_id, records):
+    """A cycle transcript plus one subagent's, in the layout the CLI writes:
+    `<session>.jsonl` and `<session>/subagents/agent-<id>.jsonl`."""
+    subdir = tmp_path / session / analytics.SUBAGENT_DIR
+    subdir.mkdir(parents=True)
+    path = subdir / f"agent-{agent_id}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return str(path)
+
+
+def test_a_subagent_transcript_is_not_filed_as_other(tmp_path):
+    """Its opening message is a brief, not a heartbeat, so `_classify` calls
+    it "other" -- the bucket `summarize` throws away. The directory it sits
+    in is what says otherwise."""
+    path = _spawn(tmp_path, "sess-1", "abc", [
+        _user("You are gathering opening state for Nova"),
+        _assistant("msg_a", USAGE, model="claude-sonnet-5"),
     ])
 
     row = analytics.parse_transcript(path)
 
-    assert row["turns"] == 2
-    assert row["subagent_turns"] == 1
+    assert row["kind"] == "subagent"
+    assert row["trigger"] == "delegated"
+    assert row["parent_session"] == "sess-1"
+
+
+def test_a_plain_transcript_has_no_parent(tmp_path):
+    path = _write(tmp_path, "sess-1.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE),
+    ])
+
+    row = analytics.parse_transcript(path)
+
+    assert row["kind"] == "cycle"
+    assert row["parent_session"] == ""
+    assert row["subagent_turns"] == 0
+
+
+def test_subagent_cost_lands_on_the_cycle_that_spawned_it(tmp_path):
+    _write(tmp_path, "sess-1.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE),
+    ])
+    _spawn(tmp_path, "sess-1", "abc", [
+        _user("You are gathering opening state for Nova"),
+        _assistant("msg_b", USAGE, model="claude-sonnet-5"),
+        _assistant("msg_c", USAGE, model="claude-sonnet-5"),
+    ])
+
+    rows = analytics.scan(str(tmp_path))
+    cycle = next(r for r in rows if r["kind"] == "cycle")
+    child = next(r for r in rows if r["kind"] == "subagent")
+
+    assert cycle["subagent_turns"] == 2
+    assert cycle["subagent_weighted_tokens"] == child["weighted_tokens"]
+    assert child["turns"] == 2
+    # Beside the cycle's own charge, never inside it -- the child's tokens
+    # are already counted once, on the child's row. One Opus message at
+    # `USAGE` is what this cycle spent and all it spent.
+    assert cycle["weighted_tokens"] == analytics.weighted_tokens(
+        analytics._usage_totals(USAGE), "claude-opus-5")
+    assert cycle["subagent_weighted_tokens"] > 0
+
+
+def test_an_orphaned_subagent_lands_nowhere_and_keeps_its_row(tmp_path):
+    """Transcripts are pruned on a rolling window, so a child can outlive the
+    parent's file. Reattributing it to something else, or dropping it, would
+    both be worse than leaving it visibly parentless."""
+    _spawn(tmp_path, "sess-gone", "abc", [
+        _user("You are gathering opening state for Nova"),
+        _assistant("msg_b", USAGE, model="claude-sonnet-5"),
+    ])
+
+    rows = analytics.scan(str(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "subagent"
+    assert rows[0]["parent_session"] == "sess-gone"
+
+
+def test_summarize_reports_delegated_spend_apart_from_the_cycles(tmp_path):
+    _write(tmp_path, "sess-1.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE),
+    ])
+    _spawn(tmp_path, "sess-1", "abc", [
+        _user("You are gathering opening state for Nova"),
+        _assistant("msg_b", USAGE, model="claude-sonnet-5"),
+    ])
+
+    summary = analytics.summarize(analytics.scan(str(tmp_path)))
+
+    assert summary["cycles"] == 1
+    # The subagent is no longer swept in with the probes.
+    assert summary["other_sessions"] == 0
+    assert summary["subagent_sessions"] == 1
+    assert summary["subagent_weighted"] > 0

@@ -90,6 +90,11 @@ def _cycle_row(row):
         "durationSeconds": row["duration_seconds"],
         "turns": row["turns"],
         "subagentTurns": row["subagent_turns"],
+        # Beside `weightedTokens`, never folded into it: that column is what
+        # this session was charged, and the subagent's own charge is on the
+        # subagent's row. A chart that wants the all-in cost of a cycle adds
+        # the two; one that wants the charge does not.
+        "subagentWeightedTokens": row.get("subagent_weighted_tokens", 0.0),
         "toolCalls": row["tool_calls"],
         "weightedTokens": row["weighted_tokens"],
         "models": row["models"],
@@ -299,10 +304,26 @@ def merge_summary(stored_summary, scan_rows, merged_cycles, stored_sessions=()):
     `other_sessions` deliberately counts only what is on disk now. It is the
     one field here that cannot be carried forward (non-cycle sessions never
     reach the document, so there is nothing to add to), and nothing reads it.
+
+    **It is also the reason this function has to be read next to
+    `analytics.summarize` rather than on its own.** The two are independent
+    implementations of the same cycles-vs-everything-else arithmetic, and when
+    `summarize` learned about subagents this one silently did not: it computed
+    `other_sessions` as everything that is not a cycle, so all 50 delegated
+    runs on disk were counted as probes, and the document written to the vault
+    disagreed with the function beside it (66 against 16). The subagent split
+    is duplicated here on purpose rather than delegated, because this
+    summary is built from `merged_cycles` and cannot call `summarize` -- so
+    the guard is a test that runs both over one row set and compares them.
     """
     fresh_cycles = [r for r in scan_rows if r["kind"] == "cycle"]
+    subagents = [r for r in scan_rows if r["kind"] == "subagent"]
     if not merged_cycles:
-        return {"cycles": 0, "other_sessions": len(scan_rows)}
+        return {"cycles": 0,
+                "other_sessions": len(scan_rows) - len(subagents),
+                "subagent_sessions": len(subagents),
+                "subagent_weighted": round(
+                    sum(r["weighted_tokens"] for r in subagents), 1)}
 
     stored_sessions = set(stored_sessions)
     stored_raw = (stored_summary or {}).get("totals") or {}
@@ -324,7 +345,10 @@ def merge_summary(stored_summary, scan_rows, merged_cycles, stored_sessions=()):
     durations = [r["durationSeconds"] for r in merged_cycles if r.get("durationSeconds")]
     return {
         "cycles": len(merged_cycles),
-        "other_sessions": len(scan_rows) - len(fresh_cycles),
+        "other_sessions": len(scan_rows) - len(fresh_cycles) - len(subagents),
+        "subagent_sessions": len(subagents),
+        "subagent_weighted": round(
+            sum(r["weighted_tokens"] for r in subagents), 1),
         "first_cycle": merged_cycles[0].get("startedAt"),
         "last_cycle": merged_cycles[-1].get("startedAt"),
         "totals": totals,
