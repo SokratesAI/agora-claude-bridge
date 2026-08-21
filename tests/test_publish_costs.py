@@ -394,3 +394,36 @@ def test_a_disk_with_nothing_to_measure_logs_a_question_mark(tmp_path, monkeypat
 
     publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
     assert any("disk holds ?" in line for line in lines)
+
+
+def test_merge_summary_agrees_with_analytics_summarize_on_what_is_not_a_cycle(tmp_path):
+    """The two are independent implementations of the same cycles-vs-rest
+    split, and only one of them learned about subagents. Before the fix this
+    counted all 50 delegated runs on the live disk as probes -- 66 "other"
+    sessions against `summarize`'s 16 -- and wrote that disagreement into the
+    vault. Nothing compared them, so nothing said so.
+
+    Runs both over one row set and compares the fields they both claim to
+    answer. It fails on either implementation drifting, in either direction.
+    """
+    rows = [
+        _scan_row("cycle-a", "2026-08-11T09:00:00Z", 900000.0),
+        _scan_row("probe", "2026-08-11T09:30:00Z", 100.0, kind="other"),
+        _scan_row("agent-1", "2026-08-11T09:05:00Z", 5000.0,
+                  kind="subagent", parent_session="cycle-a"),
+        _scan_row("agent-2", "2026-08-11T09:10:00Z", 7000.0,
+                  kind="subagent", parent_session="cycle-a"),
+    ]
+    merged = publish_costs.merge_cycles([], [publish_costs._cycle_row(r)
+                                             for r in rows if r["kind"] == "cycle"])
+
+    published = publish_costs.merge_summary(None, rows, merged)
+    direct = publish_costs.analytics.summarize(rows)
+
+    for field in ("cycles", "other_sessions", "subagent_sessions",
+                  "subagent_weighted"):
+        assert published[field] == direct[field], field
+    # And the values are the real ones, not two copies of the same mistake.
+    assert published["other_sessions"] == 1
+    assert published["subagent_sessions"] == 2
+    assert published["subagent_weighted"] == 12000.0

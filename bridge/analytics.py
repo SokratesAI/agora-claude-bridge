@@ -130,6 +130,15 @@ def model_price_ratio(model):
 # sends now. Anything else in the directory (probes, one-off manual
 # sessions) is still parsed but reported as kind "other", because mixing a
 # 2-turn probe into a per-cycle average quietly drags it down.
+#
+# "Other" is a discard, though -- `summarize` drops it -- and that made this
+# opening-message test the only thing standing between a session and being
+# thrown away. Subagent transcripts open with a brief rather than a marker
+# and were discarded for 228 cycles on exactly that basis; `subagent_parent`
+# now catches them by their path instead. Anything else the CLI starts
+# writing into this directory will land in "other" the same silent way, so
+# a new kind of session is a thing to look for, not something that will
+# announce itself.
 CYCLE_MARKERS = (
     "You are Nova",
     "[Automatic heartbeat trigger",
