@@ -69,6 +69,42 @@ RUN (type -p wget >/dev/null || apt-get update && apt-get install -y --no-instal
 # back to sha256 if this is ever missing, same as agora_runner/vault.py).
 RUN pip install --no-cache-dir xxhash
 
+# tini -- an init at PID 1, whose whole job is reaping orphans.
+#
+# Without it `python run.py` is PID 1. Any process whose parent dies is
+# reparented to PID 1, and PID 1 is expected to wait() on it; this process only
+# ever waits on pids it spawned itself, so every adopted orphan stayed a zombie
+# forever -- and a zombie still holds a pid slot.
+#
+# Measured on the live pod 2026-08-22 at 27h uptime, which is what turns this
+# from a known container footgun into this pod's actual cause of death:
+# /sys/fs/cgroup/pids.current was 9248 while PID 1 itself held 33MB RSS and 5
+# threads, and every sampled entry of /proc/1/task/1/children (2012, 60045,
+# 117134 -- old, middle and recent) was `git` in state Z with PPid 1. The pod
+# had hit its pids cgroup limit, so nothing in it could fork: the readiness
+# probe had been failing for 57 minutes with EOF, the server logged
+# `RuntimeError: can't start new thread` out of socketserver on every request,
+# and every shell command died with `fork: Resource temporarily unavailable`.
+# Memory and CPU were nowhere near their limits (576Mi/2Gi, 40m/1), which is
+# why this reads as an idle, healthy pod on every dashboard.
+#
+# tini only reaps what reparents to *it*. The bridge's own subprocesses stay
+# children of the python process and are still waited on by subprocess.Popen,
+# so cli.run_turn's exit-code and timeout handling is untouched. An in-process
+# SIGCHLD reaper would not be safe here for exactly that reason: it could reap
+# the `claude` subprocess before proc.wait() does, and Popen reports a stolen
+# child as exit 0 -- silently turning a failed turn into a successful one.
+#
+# Deliberately NOT `-g`. That forwards signals to the whole process group,
+# which would kill the in-flight `claude` turn that bridge/server.py's drain
+# exists to let finish. Plain `--` signals only the direct child, which is the
+# behaviour the drain was written against.
+#
+# Its own layer, near the bottom, so the npm/kubectl/gh layers above stay
+# cached rather than rebuilding for a one-package install.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 # No requirements.txt otherwise -- the bridge itself is stdlib-only at runtime.
 COPY bridge/ bridge/
@@ -77,4 +113,5 @@ COPY run.py .
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin bridge
 USER bridge
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "run.py"]
