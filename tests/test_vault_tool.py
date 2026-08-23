@@ -270,6 +270,11 @@ def test_main_recent_warns_loudly_when_the_list_is_incomplete(env, capsys):
     out = capsys.readouterr().out
     assert "INCOMPLETE" in out
     assert "projects/a.md" in out
+    # and it names the window, because that is the number the caller typed --
+    # but never a bare total, since under truncation the count is the cap and
+    # the real answer is unknown.
+    assert "the last 6h" in out
+    assert "[1 file(s) modified in the last 6h]" not in out
 
 
 def test_main_recent_says_so_when_nothing_changed(env, capsys):

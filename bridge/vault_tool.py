@@ -1383,15 +1383,18 @@ def _dispatch(argv=None):
         hours = float(argv[1]) if len(argv) > 1 else 24
         prefix = argv[2] if len(argv) > 2 else ""
         rows, truncated = client.recent(hours, prefix)
-        if truncated:
-            print(f"[INCOMPLETE: hit the {DEFAULT_RECENT_LIMIT}-doc cap, so this is an "
-                  f"arbitrary subset, NOT the newest. Use a shorter window.]")
         # The argument is a window in hours. Two cycles have read it as a row
         # count and filed "recent 12 ignores its count argument" as a bug --
         # one seeing 35 rows, one seeing 31 -- because nothing in the output
         # said what the number meant. Naming the window and the row count on
-        # the same line answers that at the point it is misread.
-        if rows:
+        # the same line answers that at the point it is misread. Under
+        # truncation the count is the cap rather than the answer, so that case
+        # says so instead of asserting a total it does not have.
+        if truncated:
+            print(f"[INCOMPLETE: the last {hours:g}h hit the {DEFAULT_RECENT_LIMIT}-doc "
+                  f"cap, so these {len(rows)} are an arbitrary subset, NOT the newest. "
+                  f"Use a shorter window.]")
+        elif rows:
             print(f"[{len(rows)} file(s) modified in the last {hours:g}h]")
         for mtime_ms, path, deleted in rows:
             mark = "  [DELETED]" if deleted else ""
