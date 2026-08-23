@@ -2329,10 +2329,17 @@ def test_workspace_for_isolates_only_a_concurrent_turn():
     """A real git checkout, not a disposable per-turn artifact like the MCP
     config/input file _slotted isolates -- two turns sharing it would race
     on the same working tree. A serialized turn (no slot) must get the
-    exact same shared directory every turn has always used."""
-    with patch.object(cli, "CLAUDE_WORKSPACE", "/data/workspace"):
-        assert cli._workspace_for("") == "/data/workspace"
-        assert cli._workspace_for("7-9") == "/data/workspace/concurrent/7-9"
+    exact same shared directory every turn has always used.
+
+    The slot is a *sibling* of the shared workspace as of 2026-08-23. It
+    used to be `/data/workspace/concurrent/<slot>`, which put a running
+    turn's working tree inside the directory another turn sweeps for its
+    own leftovers."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CONCURRENT_ROOT", None)
+        with patch.object(cli, "CLAUDE_WORKSPACE", "/data/workspace"):
+            assert cli._workspace_for("") == "/data/workspace"
+            assert cli._workspace_for("7-9") == "/data/workspace-concurrent/7-9"
 
 
 def test_serialized_turn_uses_the_shared_workspace_unchanged(tmp_path):
@@ -2346,7 +2353,7 @@ def test_concurrent_turn_gets_an_isolated_workspace_that_exists_at_call_time(tmp
     with patch.object(cli, "refresh_window_clear", return_value=True):
         seen = _lock_probe_cwd(tmp_path, workspace, allow_concurrent=True)
     assert seen["cwd"] != workspace
-    assert seen["cwd"].startswith(workspace)
+    assert not seen["cwd"].startswith(workspace + os.sep)
     assert "concurrent" in seen["cwd"]
     assert seen["cwd_existed_at_call_time"] is True
 
