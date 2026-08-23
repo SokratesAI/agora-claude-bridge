@@ -15,7 +15,9 @@ Usage (from Bash inside the bridge pod):
   python3 -m bridge.vault_tool appends <path> [after_marker]    # content from stdin
   python3 -m bridge.vault_tool delete <path>
   python3 -m bridge.vault_tool ls     [prefix]
-  python3 -m bridge.vault_tool recent [hours] [prefix]   # what changed lately
+  python3 -m bridge.vault_tool recent [hours] [prefix]   # changed in the last
+                                                        # N HOURS -- a window,
+                                                        # not a row count
 
 Read-modify-write from the shell is two commands with a gap in between,
 and until 2026-08-12 that gap was a silent clobber: whoever wrote during
@@ -1384,6 +1386,13 @@ def _dispatch(argv=None):
         if truncated:
             print(f"[INCOMPLETE: hit the {DEFAULT_RECENT_LIMIT}-doc cap, so this is an "
                   f"arbitrary subset, NOT the newest. Use a shorter window.]")
+        # The argument is a window in hours. Two cycles have read it as a row
+        # count and filed "recent 12 ignores its count argument" as a bug --
+        # one seeing 35 rows, one seeing 31 -- because nothing in the output
+        # said what the number meant. Naming the window and the row count on
+        # the same line answers that at the point it is misread.
+        if rows:
+            print(f"[{len(rows)} file(s) modified in the last {hours:g}h]")
         for mtime_ms, path, deleted in rows:
             mark = "  [DELETED]" if deleted else ""
             print(f"{_local_stamp(mtime_ms)}  {path}{mark}")
