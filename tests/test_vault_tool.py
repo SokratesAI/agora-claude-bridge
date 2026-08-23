@@ -270,6 +270,11 @@ def test_main_recent_warns_loudly_when_the_list_is_incomplete(env, capsys):
     out = capsys.readouterr().out
     assert "INCOMPLETE" in out
     assert "projects/a.md" in out
+    # and it names the window, because that is the number the caller typed --
+    # but never a bare total, since under truncation the count is the cap and
+    # the real answer is unknown.
+    assert "the last 6h" in out
+    assert "[1 file(s) modified in the last 6h]" not in out
 
 
 def test_main_recent_says_so_when_nothing_changed(env, capsys):
@@ -277,6 +282,21 @@ def test_main_recent_says_so_when_nothing_changed(env, capsys):
         MockClient.return_value.recent.return_value = ([], False)
         vault_tool.main(["recent", "6"])
     assert "[nothing modified in the last 6h]" in capsys.readouterr().out
+
+
+# `recent <n>` takes a window in hours, and twice a caller read the number as
+# a row count, got more rows back than it asked for, and filed the tool as
+# broken (Nova's issues.md, 2026-08-13 and 2026-08-16). The header says both
+# numbers at once, so the two cannot be confused where they are read.
+def test_main_recent_header_names_the_window_and_the_row_count(env, capsys):
+    with patch.object(vault_tool, "VaultClient") as MockClient:
+        MockClient.return_value.recent.return_value = (
+            [(0, "projects/a.md", False), (0, "projects/b.md", False)], False)
+        vault_tool.main(["recent", "12"])
+    out = capsys.readouterr().out
+    assert "[2 file(s) modified in the last 12h]" in out
+    # and it comes before the rows, since that is where it gets read
+    assert out.index("file(s) modified") < out.index("projects/a.md")
 
 
 def test_local_stamp_is_oslo_not_utc(env):
