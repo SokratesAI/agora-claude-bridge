@@ -38,6 +38,11 @@ from bridge.log import log
 from bridge import quota
 from bridge.quota import QuotaWatcher, write_hook_settings
 
+# A slot directory older than this belongs to a turn that is definitely
+# gone: the CLI itself is killed at CLI_TIMEOUT_SECONDS. See
+# _sweep_stale_slots.
+STALE_SLOT_SECONDS = CLI_TIMEOUT_SECONDS + 600
+
 SESSION_NOT_FOUND = "\x00SESSION_NOT_FOUND"
 
 # A turn that lost the OAuth refresh-token race: another invocation
@@ -273,7 +278,7 @@ def _slotted(path, slot):
 
 def _workspace_for(slot):
     """CLAUDE_WORKSPACE unchanged for the default (locked) path, or an
-    isolated subdirectory for a turn running outside _invocation_lock.
+    isolated directory for a turn running outside _invocation_lock.
 
     Unlike the MCP config/CLI input file _slotted isolates, the workspace
     is a real git checkout: two turns sharing it would race on the same
@@ -288,13 +293,117 @@ def _workspace_for(slot):
     around for reuse: `slot` is a pid+thread-id, and thread idents get
     reused once a thread exits, so keeping the directory around would
     risk a later, unrelated turn silently inheriting an earlier one's
-    checkout. The cost is a fresh clone on every concurrent turn that
-    touches git -- acceptable today because allow_concurrent is only used
-    for short turns (comment replies) that mostly don't.
+    checkout. What used to make that expensive -- a fresh `git clone` per
+    turn -- is what _provision_workspace removes: the checkout is a
+    worktree off the shared clone's own object store, so it costs a
+    checkout rather than a network fetch.
+
+    Slots sit in a *sibling* of CLAUDE_WORKSPACE, not inside it. They were
+    inside it until 2026-08-23, which put a live turn's working tree
+    exactly where another turn's `for d in /data/workspace/*/` sweep would
+    find it -- and nothing in that directory says whether it belongs to a
+    cycle still running or a cycle that died an hour ago.
     """
     if not slot:
         return CLAUDE_WORKSPACE
-    return os.path.join(CLAUDE_WORKSPACE, "concurrent", slot)
+    return os.path.join(_concurrent_root(), slot)
+
+
+def _concurrent_root():
+    """Where a concurrent turn's private workspace lives -- a sibling of the
+    shared one, never a child of it. Derived on each call rather than fixed
+    at import so it follows CLAUDE_WORKSPACE wherever that points.
+    """
+    return (os.environ.get("CLAUDE_CONCURRENT_ROOT")
+            or CLAUDE_WORKSPACE.rstrip("/") + "-concurrent")
+
+
+def _git(args, cwd, timeout=120):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def _shared_repos():
+    """Every git checkout sitting directly in the shared workspace."""
+    try:
+        names = sorted(os.listdir(CLAUDE_WORKSPACE))
+    except OSError:
+        return []
+    return [n for n in names
+            if os.path.isdir(os.path.join(CLAUDE_WORKSPACE, n, ".git"))]
+
+
+def _sweep_stale_slots():
+    """Drop slot directories a killed turn never cleaned up.
+
+    _run_cli_once's `finally` removes a slot on the way out, but it does
+    not run at all if the process dies (pod eviction, OOM, SIGKILL) -- and
+    a worktree outlives the directory it was checked out into, as an entry
+    in the shared clone's `.git/worktrees`. Both halves get cleared here,
+    at the start of a concurrent turn, which is the only moment anything
+    is guaranteed to be looking.
+
+    STALE_SLOT_SECONDS is not a guess: a turn is killed at
+    CLI_TIMEOUT_SECONDS, so a slot older than that plus a margin cannot
+    belong to a turn that is still running.
+    """
+    cutoff = time.time() - STALE_SLOT_SECONDS
+    try:
+        slots = os.listdir(_concurrent_root())
+    except OSError:
+        slots = []
+    for name in slots:
+        path = os.path.join(_concurrent_root(), name)
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        log(f"swept stale concurrent slot: {name}")
+    for repo in _shared_repos():
+        try:
+            _git(["worktree", "prune"], os.path.join(CLAUDE_WORKSPACE, repo))
+        except Exception as exc:
+            log(f"worktree prune failed for {repo}: {type(exc).__name__}: {exc}")
+
+
+def _provision_workspace(workspace):
+    """Check every shared repo out into this turn's own workspace, as a
+    git worktree off that repo's existing object store.
+
+    An empty directory was the old contract, and it is the reason
+    heartbeat cycles could not use this lane: step 1 of a cycle reads its
+    own source, and a cycle that wakes up with no `agora-persona-runner`
+    checkout has to clone one over the network before it can do anything.
+    A worktree gives it the same files against the same objects, with a
+    private working tree and a private index -- which is the whole
+    isolation the lane exists for.
+
+    Detached on purpose. Two worktrees may not have the same branch
+    checked out, so `--detach` is what makes N of these coexist off one
+    clone; a cycle that wants to commit still starts its own branch, from
+    a HEAD that matches what the shared checkout was on.
+
+    A repo that fails to provision is logged and skipped rather than
+    failing the turn: a turn with three of four checkouts can still do
+    most jobs, and a turn that refuses to start can do none.
+    """
+    provisioned = []
+    for repo in _shared_repos():
+        src = os.path.join(CLAUDE_WORKSPACE, repo)
+        dest = os.path.join(workspace, repo)
+        try:
+            res = _git(["worktree", "add", "--detach", "--force", dest, "HEAD"], src)
+        except Exception as exc:
+            log(f"worktree add failed for {repo}: {type(exc).__name__}: {exc}")
+            continue
+        if res.returncode != 0:
+            log(f"worktree add failed for {repo}: {(res.stderr or '').strip()[:200]}")
+            continue
+        provisioned.append(repo)
+    log(f"provisioned {len(provisioned)} worktree(s): {', '.join(provisioned) or 'none'}")
+    return provisioned
 
 
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
@@ -313,9 +422,20 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         # needed, instead of trusting the previous turn's exit path.
         shutil.rmtree(workspace, ignore_errors=True)
     os.makedirs(workspace, exist_ok=True)
+    if slot:
+        # After makedirs, so this turn's own slot has a fresh mtime and the
+        # sweep's age test can never pick it up.
+        _sweep_stale_slots()
+        _provision_workspace(workspace)
     claude_dir = os.path.join(CLAUDE_HOME, ".claude")
     os.makedirs(claude_dir, exist_ok=True)
-    env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir}
+    # NOVA_WORKSPACE is the same directory as cwd, named so a prompt can
+    # say where a file goes without hardcoding /data/workspace -- which is
+    # the shared checkout, and therefore the one path a concurrent turn
+    # must not write to. `cd "$NOVA_WORKSPACE/agora-persona-runner"` is
+    # correct in both lanes; the literal path is only correct in one.
+    env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir,
+           "NOVA_WORKSPACE": workspace}
 
     # Only a turn that actually carries attachments switches to stdin. The
     # text path is what every Nova cycle and every ordinary chat turn runs,
@@ -674,6 +794,16 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         # earlier, unrelated turn.
         if slot:
             shutil.rmtree(workspace, ignore_errors=True)
+            # Removing the directory leaves the shared clone still listing
+            # a worktree that is no longer there, and `git worktree add`
+            # refuses a path an existing entry claims. Prune on the way
+            # out so the common case never depends on the next turn's
+            # sweep; the sweep stays for the turns that never get here.
+            for repo in _shared_repos():
+                try:
+                    _git(["worktree", "prune"], os.path.join(CLAUDE_WORKSPACE, repo))
+                except Exception as exc:
+                    log(f"worktree prune failed for {repo}: {type(exc).__name__}: {exc}")
 
     elapsed = time.monotonic() - t0
     log(f"CLI done: exit={proc.returncode} elapsed={elapsed:.1f}s "
