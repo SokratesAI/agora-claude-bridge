@@ -1383,10 +1383,12 @@ def _dispatch(argv=None):
         hours = float(argv[1]) if len(argv) > 1 else 24
         prefix = argv[2] if len(argv) > 2 else ""
         rows, truncated = client.recent(hours, prefix)
-        # The argument is a window in hours. Two cycles have read it as a row
-        # count and filed "recent 12 ignores its count argument" as a bug --
-        # one seeing 35 rows, one seeing 31 -- because nothing in the output
-        # said what the number meant. Naming the window and the row count on
+        # The argument is a window in hours. Two cycles read it as a row count
+        # and filed the tool as broken -- 2026-08-13, 35 rows, "the count
+        # argument does not cap the result the way its name implies"; and
+        # 2026-08-16, 31 rows, "does not bound the result the way the name
+        # implies" -- because nothing in the output said what the number
+        # meant. Naming the window and the row count on
         # the same line answers that at the point it is misread. Under
         # truncation the count is the cap rather than the answer, so that case
         # says so instead of asserting a total it does not have.
