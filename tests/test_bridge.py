@@ -548,7 +548,8 @@ def test_generate_sends_system_prompt_out_of_band_not_in_the_message():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -574,7 +575,8 @@ def test_generate_resends_the_system_prompt_on_a_resumed_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -594,7 +596,8 @@ def test_generate_retries_fresh_on_session_not_found():
     calls = []
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         calls.append((message, session_id, system))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -616,7 +619,8 @@ def test_generate_retries_fresh_on_session_not_found():
 
 def test_generate_propagates_other_cli_errors_without_retry():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -629,7 +633,8 @@ def test_generate_is_unrestricted_by_default():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -645,7 +650,8 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -661,7 +667,8 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -682,7 +689,8 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -698,7 +706,8 @@ def test_generate_stateless_can_combine_with_restricted():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -1292,7 +1301,8 @@ def test_generate_passes_attachments_to_run_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1310,7 +1320,8 @@ def test_generate_stateless_also_passes_attachments_to_run_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1363,7 +1374,8 @@ def test_generate_passes_allow_concurrent_to_run_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["allow_concurrent"] = allow_concurrent
         return "reply", "", "sess-1"
 
@@ -1381,7 +1393,8 @@ def test_generate_stateless_also_passes_allow_concurrent_to_run_turn():
     captured = {}
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         captured["allow_concurrent"] = allow_concurrent
         return "reply", "", "sess-1"
 
@@ -1397,7 +1410,8 @@ def test_generate_keeps_allow_concurrent_on_the_session_not_found_retry():
     seen = []
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         seen.append(allow_concurrent)
         if session_id is not None:
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -1484,7 +1498,8 @@ def test_generate_composes_auth_retry_with_the_session_not_found_retry():
     calls = []
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-                      mcp=None, system=None, attachments=None, allow_concurrent=False):
+                      mcp=None, system=None, attachments=None, allow_concurrent=False,
+                      conversation_id=""):
         calls.append(session_id)
         if len(calls) == 1:
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
