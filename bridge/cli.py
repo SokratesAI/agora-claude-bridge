@@ -319,8 +319,18 @@ def _concurrent_root():
 
 
 def _git(args, cwd, timeout=120):
+    """`HOME` is not decoration. `bootstrap_git` writes the HTTPS
+    credential helper into `$CLAUDE_HOME/.gitconfig` (a PVC, so it
+    survives restarts), and the bridge process's own HOME is
+    `/home/bridge`, which has no gitconfig at all. Without the override a
+    network git call here authenticates as nobody: three of the four
+    shared repos are public and fetch fine anonymously, and
+    `platform-config` answers `fatal: could not read Username for
+    'https://github.com'` in 0.4s. Measured on the live clones.
+    """
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                          text=True, timeout=timeout)
+                          text=True, timeout=timeout,
+                          env={**os.environ, "HOME": CLAUDE_HOME})
 
 
 def _shared_repos():
@@ -387,23 +397,49 @@ def _start_point(src):
     safe to run while another turn is sitting in that checkout -- which
     is exactly what made a `git checkout`-based fix here unusable.
 
-    Both halves fall back to `HEAD`, which is the old behaviour: a repo
-    with no `origin/main`, or a fetch that fails because the network is
-    down (it was, this morning), still gets a checkout rather than none.
-    The fetch timeout is shorter than _git's default because this runs
-    before the turn starts and once per shared repo -- a hung fetch would
-    eat the turn's own 45-minute cap without a single tool call in it.
+    Every path falls back to `HEAD`, which is the old behaviour: no
+    remote default branch, a fetch that fails because the network is down
+    (it was, twice this morning), or `git` itself blowing up still gets a
+    checkout rather than none. The whole body is inside the `try` for
+    that reason -- an unguarded call here does not degrade to the old
+    behaviour, it makes `_provision_workspace` skip the repo and hand the
+    turn no checkout at all.
+
+    The timeouts are not about the turn's 45-minute cap: this runs before
+    the CLI starts, so it is charged to the caller and is invisible to the
+    session's own clock. They bound what a hung network call can add on
+    top -- once per shared repo, so four repos is the unit to think in.
     """
+    name = os.path.basename(src)
     try:
         res = _git(["fetch", "--quiet", "origin"], src, timeout=60)
         if res.returncode != 0:
-            log(f"fetch failed for {os.path.basename(src)}: "
-                f"{(res.stderr or '').strip()[:200]}")
+            err = (res.stderr or "").strip()
+            if "cannot lock ref" in err:
+                # Two turns provisioning at once race on the same
+                # remote-tracking ref. Measured: 34 of 45 rounds of three
+                # simultaneous fetches hit this, every one benign -- the
+                # winner has already written the newer value, so the
+                # rev-parse below still reads a fresh ref, and no `.lock`
+                # is left behind. Logging it as a failure would put an
+                # alarming line in the log on most concurrent turns.
+                log(f"fetch for {name} raced another turn (harmless)")
+            else:
+                log(f"fetch failed for {name}: {err[:200]}")
+        # `origin/HEAD` first because it is the general answer -- it is the
+        # remote's own default branch, so a repo on `master` works without
+        # this function knowing about it. Every clone here has one; the
+        # `origin/main` line is the fallback for a clone that does not.
+        for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/main"):
+            res = _git(["rev-parse", "--verify", "--quiet", ref], src, timeout=30)
+            if res.returncode == 0:
+                return ref
     except Exception as exc:
-        log(f"fetch failed for {os.path.basename(src)}: {type(exc).__name__}: {exc}")
-    res = _git(["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"], src)
-    if res.returncode == 0 and res.stdout.strip():
-        return "refs/remotes/origin/main"
+        log(f"start point lookup failed for {name}: {type(exc).__name__}: {exc}")
+    # Say so. A silent fall-through here is the original bug returning in
+    # full, and "which commit did this turn wake up on" is the exact
+    # question that produced this function.
+    log(f"no origin default branch for {name} -- starting from the shared checkout's HEAD")
     return "HEAD"
 
 
@@ -425,6 +461,13 @@ def _provision_workspace(workspace):
     the start point _start_point picked -- freshly fetched `origin/main`
     where there is one, rather than whatever the shared checkout is
     parked on.
+
+    One thing that costs, and it is the price of not starting on an
+    abandoned branch: unmerged work a serialized turn left on a branch in
+    the shared checkout is no longer where this turn wakes up, and
+    `git checkout <that-branch>` cannot reach it either -- git refuses a
+    branch another worktree holds. `git checkout -b <new> <that-branch>`
+    does work. Say that rather than let a turn conclude the work is gone.
 
     A repo that fails to provision is logged and skipped rather than
     failing the turn: a turn with three of four checkouts can still do
