@@ -550,18 +550,30 @@ def test_merge_disk_drops_a_reading_with_no_time_on_it():
 
 def test_a_publish_extends_the_stored_disk_series(tmp_path, monkeypatch):
     """End to end through `build_payload`, because the wiring is where this
-    kind of change dies: the function can be perfect and never called."""
+    kind of change dies: the function can be perfect and never called.
+
+    `projects_dir` is a real fixture directory with a real transcript in it,
+    and that is the whole reason this test is worth reading. The first version
+    called `build_payload()` with no directory, so it measured
+    `analytics.PROJECTS_DIR` -- which exists on the bridge pod holding 228MB
+    and does not exist in CI at all. It asserted `bytesOnDisk >= 0`, passed
+    locally against the real disk, and failed in CI against None the moment
+    the previous commit taught the walk to say "could not read". A test whose
+    result depends on which machine ran it was measuring the machine."""
     monkeypatch.setattr(publish_costs, "log", lambda *a: None)
     monkeypatch.setattr(publish_costs.analytics, "scan",
                         lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
     stored = _stored("old1")
     stored["disk"] = [{"at": 1.0, "bytesOnDisk": 7}]
     monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: stored)
+    projects = tmp_path / "projects"
+    _transcript(projects / "-data-workspace", "session.jsonl", 6400.0)
 
-    payload = publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+    payload = publish_costs.build_payload(projects_dir=str(projects),
+                                          history_path=str(tmp_path / "none.jsonl"))
     assert [r["at"] for r in payload["disk"]][0] == 1.0
     assert len(payload["disk"]) == 2
-    assert payload["disk"][-1]["bytesOnDisk"] >= 0
+    assert payload["disk"][-1]["bytesOnDisk"] == 3
 
 
 def test_a_publish_logs_the_free_space_next_to_the_window(tmp_path, monkeypatch):
