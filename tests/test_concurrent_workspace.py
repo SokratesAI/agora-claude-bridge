@@ -144,6 +144,89 @@ def test_a_slot_can_be_reprovisioned_after_its_directory_was_removed(workspace):
     assert os.path.exists(os.path.join(slot, "repo-a", "README.md"))
 
 
+def _clone_with_origin(origin_path, dest_path):
+    """A shared checkout that has a real `origin` to fetch from."""
+    subprocess.run(["git", "clone", "-q", origin_path, dest_path], check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=dest_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=dest_path, check=True)
+    return dest_path
+
+
+def _read(*parts):
+    with open(os.path.join(*parts)) as fh:
+        return fh.read()
+
+
+def test_worktree_starts_from_origin_main_not_the_branch_shared_is_parked_on(workspace, tmp_path):
+    """Cycle 365 woke up on `nova/status-word-back-on-the-card`, abandoned
+    two cycles earlier, because that is where a serialized turn left the
+    shared checkout. The start point is origin/main, not HEAD."""
+    origin = _repo(str(tmp_path / "origin"))
+    shared = _clone_with_origin(origin, str(workspace / "repo-a"))
+
+    subprocess.run(["git", "checkout", "-qb", "nova/abandoned"], cwd=shared, check=True)
+    with open(os.path.join(shared, "README.md"), "w") as fh:
+        fh.write("dead end\n")
+    subprocess.run(["git", "commit", "-aqm", "abandoned"], cwd=shared, check=True)
+
+    slot = cli._workspace_for("s1")
+    os.makedirs(slot)
+    assert cli._provision_workspace(slot) == ["repo-a"]
+    assert _read(slot, "repo-a", "README.md") == "hello\n"
+
+    # And the shared checkout is left exactly where it was -- the fetch
+    # writes refs and objects, never a working tree, which is what makes
+    # this safe to do under another live turn.
+    assert subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=shared,
+                          capture_output=True, text=True).stdout.strip() == "nova/abandoned"
+    assert _read(shared, "README.md") == "dead end\n"
+
+
+def test_worktree_gets_a_commit_pushed_since_the_shared_clone_last_fetched(workspace, tmp_path):
+    """The other half: nothing in this loop fetches the shared checkout,
+    so without the fetch here every worktree inherits code that ages by
+    the hour."""
+    origin = _repo(str(tmp_path / "origin"))
+    _clone_with_origin(origin, str(workspace / "repo-a"))
+
+    with open(os.path.join(origin, "README.md"), "w") as fh:
+        fh.write("newer\n")
+    subprocess.run(["git", "commit", "-aqm", "newer"], cwd=origin, check=True)
+
+    slot = cli._workspace_for("s1")
+    os.makedirs(slot)
+    assert cli._provision_workspace(slot) == ["repo-a"]
+    assert _read(slot, "repo-a", "README.md") == "newer\n"
+
+
+def test_falls_back_to_head_when_the_repo_has_no_origin_main(workspace):
+    """No remote at all is the old behaviour, and the old behaviour is
+    still a working checkout rather than none."""
+    shared = _repo(str(workspace / "repo-a"))
+    assert cli._start_point(shared) == "HEAD"
+    slot = cli._workspace_for("s1")
+    os.makedirs(slot)
+    assert cli._provision_workspace(slot) == ["repo-a"]
+    assert _read(slot, "repo-a", "README.md") == "hello\n"
+
+
+def test_falls_back_to_head_when_the_fetch_itself_fails(workspace, tmp_path):
+    """github.com was unresolvable for two cycles on 2026-08-24. A turn
+    that cannot fetch still has to start, on whatever it already has."""
+    origin = _repo(str(tmp_path / "origin"))
+    shared = _clone_with_origin(origin, str(workspace / "repo-a"))
+    subprocess.run(["git", "remote", "set-url", "origin", str(tmp_path / "gone")],
+                   cwd=shared, check=True)
+
+    # origin/main survives a failed fetch as a stale remote-tracking ref,
+    # so this is the branch that matters: the fetch is allowed to fail and
+    # provisioning carries on.
+    slot = cli._workspace_for("s1")
+    os.makedirs(slot)
+    assert cli._provision_workspace(slot) == ["repo-a"]
+    assert _read(slot, "repo-a", "README.md") == "hello\n"
+
+
 def test_provision_skips_a_broken_repo_instead_of_failing_the_turn(workspace):
     _repo(str(workspace / "good"))
     broken = workspace / "broken"

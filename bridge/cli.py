@@ -368,6 +368,45 @@ def _sweep_stale_slots():
             log(f"worktree prune failed for {repo}: {type(exc).__name__}: {exc}")
 
 
+def _start_point(src):
+    """Which commit a concurrent turn's worktree should be cut from.
+
+    `HEAD` -- what this used until 2026-08-24 -- is whatever branch the
+    shared checkout happens to be parked on, and nothing ever parks it
+    back. A serialized turn runs `git checkout -b nova/<thing>` in that
+    directory and leaves it there when it ends. On 2026-08-24 the shared
+    `agora-persona-runner` sat on `nova/status-word-back-on-the-card`, a
+    branch whose work had already merged in refined form two cycles
+    earlier and which is not an ancestor of `origin/main`, so every
+    concurrent cycle woke up on abandoned code and had to diff its own
+    work out onto a fresh branch before it could push.
+
+    So: fetch, and start from `origin/main` when there is one. The fetch
+    writes remote-tracking refs and objects into the shared clone's
+    `.git`; it touches neither its working tree nor its index, so it is
+    safe to run while another turn is sitting in that checkout -- which
+    is exactly what made a `git checkout`-based fix here unusable.
+
+    Both halves fall back to `HEAD`, which is the old behaviour: a repo
+    with no `origin/main`, or a fetch that fails because the network is
+    down (it was, this morning), still gets a checkout rather than none.
+    The fetch timeout is shorter than _git's default because this runs
+    before the turn starts and once per shared repo -- a hung fetch would
+    eat the turn's own 45-minute cap without a single tool call in it.
+    """
+    try:
+        res = _git(["fetch", "--quiet", "origin"], src, timeout=60)
+        if res.returncode != 0:
+            log(f"fetch failed for {os.path.basename(src)}: "
+                f"{(res.stderr or '').strip()[:200]}")
+    except Exception as exc:
+        log(f"fetch failed for {os.path.basename(src)}: {type(exc).__name__}: {exc}")
+    res = _git(["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"], src)
+    if res.returncode == 0 and res.stdout.strip():
+        return "refs/remotes/origin/main"
+    return "HEAD"
+
+
 def _provision_workspace(workspace):
     """Check every shared repo out into this turn's own workspace, as a
     git worktree off that repo's existing object store.
@@ -383,7 +422,9 @@ def _provision_workspace(workspace):
     Detached on purpose. Two worktrees may not have the same branch
     checked out, so `--detach` is what makes N of these coexist off one
     clone; a cycle that wants to commit still starts its own branch, from
-    a HEAD that matches what the shared checkout was on.
+    the start point _start_point picked -- freshly fetched `origin/main`
+    where there is one, rather than whatever the shared checkout is
+    parked on.
 
     A repo that fails to provision is logged and skipped rather than
     failing the turn: a turn with three of four checkouts can still do
@@ -394,7 +435,8 @@ def _provision_workspace(workspace):
         src = os.path.join(CLAUDE_WORKSPACE, repo)
         dest = os.path.join(workspace, repo)
         try:
-            res = _git(["worktree", "add", "--detach", "--force", dest, "HEAD"], src)
+            res = _git(["worktree", "add", "--detach", "--force", dest,
+                        _start_point(src)], src)
         except Exception as exc:
             log(f"worktree add failed for {repo}: {type(exc).__name__}: {exc}")
             continue
