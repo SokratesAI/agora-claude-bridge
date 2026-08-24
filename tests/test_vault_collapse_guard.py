@@ -1,7 +1,7 @@
 """A blind read must not read as a short file, and a short write must not
 silently replace a long document.
 
-On 2026-08-15 a cycle read Edvard's 123,586-byte `issues.md` through this
+On 2026-08-15 a cycle read the owner's 123,586-byte `issues.md` through this
 client, got an empty body and exit 0, and wrote the empty result back over
 the document -- which was still fully intact underneath. It was recovered
 from a local copy within the minute, but nothing in the client objected at
@@ -15,7 +15,7 @@ either one alone leaves the door open.
 `_size_checked` is the read half. A LiveSync file doc records `size`, the
 byte length of the text it stands for, and every writer sets it -- this
 client at `_put_raw` and Obsidian itself. Measured 2026-08-15 across 37
-documents (Edvard's phone-written captures, this loop's journal entries,
+documents (the owner's phone-written captures, this loop's journal entries,
 the JSON ledgers, the 291KB frozen archive): `size` equalled
 `len(content.encode())` exactly 37 times out of 37, and no document
 lacked the field. It is a length checksum the vault has always carried
@@ -103,7 +103,7 @@ def test_a_document_with_no_size_field_still_reads(client):
 
 def test_size_is_bytes_not_characters(client):
     """The measurement said bytes. A non-ASCII document is where those two
-    diverge, and getting it backwards would raise on every file Edvard
+    diverge, and getting it backwards would raise on every file the owner
     writes an em-dash into -- which is most of them."""
     text = "Skøyen — Oslo"
     assert len(text.encode("utf-8")) != len(text)

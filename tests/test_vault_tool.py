@@ -67,7 +67,7 @@ def test_read_assembles_chunked_children(env):
 
 def test_write_does_not_copy_previous_content_into_the_vault(env):
     """Overwriting used to write a second document under agora/backups/
-    holding the old content. Edvard asked for that to stop (2026-08-05):
+    holding the old content. The owner asked for that to stop (2026-08-05):
     it doubled the write cost of every edit and left 272 files behind.
     The daily GitHub snapshot is the recovery path instead."""
     client, calls = _client_with_fake_req({
@@ -103,7 +103,7 @@ def test_delete_does_not_copy_content_into_the_vault(env):
 # told and keeps its copy forever. Obsidian instead keeps the document and
 # sets a `deleted` field -- a new revision peers actually see.
 #
-# Every agent delete this platform ever did used CouchDB's. Edvard reported
+# Every agent delete this platform ever did used CouchDB's. The owner reported
 # it twice (comments.md 2026-08-12: "an agent deleted a file in couchdb but
 # i still have it on my phone"), Cycle 129 hand-repaired the 167 paths the
 # migration removed, and the code path itself stayed broken until Cycle 131.
@@ -355,7 +355,7 @@ def test_main_get_prints_not_found_marker(env, capsys):
 # were tombstones. Most were pre-move copies left by a vault reorganisation,
 # sitting one prefix away from their live replacement. One was `kanban.md`,
 # deleted outright with no replacement -- while `prompt.md` still told every
-# cycle to read it as "Edvard's own real backlog", handing four cycles a day
+# cycle to read it as "the owner's own real backlog", handing four cycles a day
 # a board frozen on 2026-07-29 with no way to tell it was gone.
 #
 # `list`/`read` treat deleted as gone. `recent` deliberately does not: it
@@ -434,7 +434,7 @@ def test_the_endkey_sentinel_is_above_every_code_point_not_just_most(env):
     emoji or any other astral character sorts *above* it and drops out of
     its own folder. The vault has no such filename today, which is exactly
     why this needs a test rather than a measurement -- the failure arrives
-    the day Edvard names a note with an emoji, silently, as a folder that
+    the day the owner names a note with an emoji, silently, as a folder that
     is missing one file."""
     astral = "notes/\U0001F600 idea.md"
     docs = [{"_id": "notes/plain.md"}, {"_id": astral}]
@@ -535,7 +535,7 @@ def test_main_recent_marks_a_deleted_file_in_its_output(env, capsys):
 # did not return, so a note with a hole came back as its surviving pieces
 # concatenated -- mid-word, no marker at the seam, parses fine.
 #
-# It happened to Edvard's `ideas.md`: a LiveSync client re-chunked it from 1
+# It happened to the owner's `ideas.md`: a LiveSync client re-chunked it from 1
 # chunk into 184 and 6 never reached the database. `get` printed the other
 # 178. 1238 characters were gone -- the `## Board` heading, its table header,
 # rows #57 to #50, and the tail of the capture sentence he had typed 83

@@ -1,6 +1,6 @@
 """Per-cycle token accounting, read back out of the Claude Code transcripts.
 
-Edvard, 2026-08-08, on raising the cycle rate: "i want you to log how much
+The owner, 2026-08-08, on raising the cycle rate: "i want you to log how much
 tokens are spent and much are left every week so we can optimize the
 cycles. Maybe we can increase it or maybe we should reduce the cycles.
 Only data can tell us this. ... I want you to think in Analytics, measure
@@ -50,7 +50,7 @@ are exactly the thing this loop is trying to spend more of. Cycle 61
 measured the damage from the outside: the three intervals containing Fable
 spend scored ~0.9M weighted per quota point against ~2.6M for the
 Opus-only ones, which was the whole of a 1.68x discrepancy that had been
-sitting in the journal for two cycles as an open question for Edvard.
+sitting in the journal for two cycles as an open question for the owner.
 """
 import json
 import os

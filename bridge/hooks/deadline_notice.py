@@ -52,7 +52,7 @@ per cycle, ~60 tokens, against a documented habit of shipping less.
 Every line also carries the wall clock in Oslo time, because that is the
 unit the misreadings are made in -- a cycle that has drifted reasons in
 "it must be about half past", and relative minutes give it nothing to
-notice the drift against. Oslo specifically: Edvard reads these entries
+notice the drift against. Oslo specifically: The owner reads these entries
 and lives there, and rule 7 of identity.md says so.
 
 Fails silent and open, exactly as quota_notice.py does: a hook that
@@ -157,7 +157,7 @@ def oslo_clock(now=None):
 
 
 def stamp_for(minutes_left, clock="", minutes_gone=None):
-    """The line every other tool result carries -- idea #72, Edvard's own:
+    """The line every other tool result carries -- idea #72, the owner's own:
     *"add a timestamp to the return of some tools so you do not get so
     paranoid of the time ... getting the actual timestamp from some of the
     tools you use can get you to get a better hold on reality."*

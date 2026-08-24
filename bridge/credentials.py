@@ -3,7 +3,7 @@ raw JSON content straight to disk, unmodified. No field-by-field
 reconstruction: an earlier version assembled {"claudeAiOauth": {...}} from
 three separate secret keys (access_token/refresh_token/expires_at), which
 the `claude` CLI's own client-side validation rejected instantly
-("Not logged in") -- the real local credentials.json Edvard generated this
+("Not logged in") -- the real local credentials.json the owner generated this
 from carries additional fields (scopes, etc.) that the 3-key split had
 silently dropped. Piping the whole original file through sidesteps needing
 to know its exact schema at all.
@@ -32,7 +32,7 @@ this pod's own log on 2026-08-19 (Cycle 266):
   `subscriptionType: pro` against the live account's `max`. It wrote that
   and logged `bootstrapped ... from CLAUDE_CREDENTIALS_JSON`, which reads
   as success. The next CLI invocation, 20 hours later, exited 1; every
-  heartbeat after it did too, until Edvard noticed and re-authed by hand.
+  heartbeat after it did too, until the owner noticed and re-authed by hand.
 - The documented recovery -- put a fresh credential in the Secret, restart
   the pod -- could not have worked either, because the dead file now
   existed and `os.path.exists` sent the bootstrap home.

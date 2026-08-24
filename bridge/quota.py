@@ -1,7 +1,7 @@
 """Tracks how much of the Claude subscription quota is left, and makes that
 number reachable from inside the running CLI session.
 
-Edvard, 2026-08-04, after a cycle burned 78% of the quota in one run and
+The owner, 2026-08-04, after a cycle burned 78% of the quota in one run and
 hit the cap mid-sentence: "Maybe an idea for you is to have you get
 alerted if you have 10% or less on your token quota so that you can wrap
 up and prepare to continue the next cycle instead of just hitting a
@@ -27,7 +27,7 @@ Two independent signals, because they fail differently:
 
 The percentages are *utilization* -- how much is USED. Everything this
 module hands out is converted to remaining, because that is the number
-Edvard asked to be warned about and the direction a threshold reads
+the owner asked to be warned about and the direction a threshold reads
 naturally in.
 
 Delivery is a file, not a return value, because the consumer is a hook
@@ -56,7 +56,7 @@ SNAPSHOT_FILE = os.path.join(CLAUDE_HOME, "quota-snapshot.json")
 
 # The snapshot is overwritten on every poll, so it answers "how much is
 # left right now" and nothing else -- no burn rate, no per-cycle cost, no
-# way to tell a spending week from a quiet one. Edvard asked (2026-08-08)
+# way to tell a spending week from a quiet one. The owner asked (2026-08-08)
 # for weekly spend logged so the cycle rate can be tuned on data rather
 # than argument, and that needs a series, not a sample. This is the
 # append-only companion: one JSON object per changed reading, alongside
@@ -121,7 +121,7 @@ POLL_BACKOFF_START_SECONDS = 5
 #
 # Deliberately below FETCH_TIMEOUT_SECONDS (10), so a hung endpoint does
 # outlast this join and write its row late. That is the right way round:
-# a late history row harms nothing, and Edvard is the one who would feel
+# a late history row harms nothing, and the owner is the one who would feel
 # the extra five seconds on his reply. The suite's safety does not rest on
 # this number -- conftest's guard is session-scoped precisely so that it
 # holds for the thread that wins this race rather than losing it.
@@ -179,7 +179,7 @@ WINDOW_SECONDS = {
 def _pace(name, resets_at, used_pct):
     """Used share divided by elapsed share -- 1.0 is exactly on the line.
 
-    Edvard, 2026-08-09, cutting the heartbeat from 72 to 60 minutes: "i
+    The owner, 2026-08-09, cutting the heartbeat from 72 to 60 minutes: "i
     think an aggressive approach is better to start with". That is the
     right instinct and it needs an instrument, because the cadence change
     moves this loop across the line rather than towards it. Measured the

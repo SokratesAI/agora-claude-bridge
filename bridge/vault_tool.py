@@ -37,7 +37,7 @@ Unpaired `put` stays unconditional, which is what a new file wants.
 
 The revision guard does not cover the other way to lose a file, because
 the write that loses it is not in conflict with anybody. On 2026-08-15 a
-cycle read Edvard's 123KB `issues.md`, got an empty body and exit 0, and
+cycle read the owner's 123KB `issues.md`, got an empty body and exit 0, and
 wrote that back over the intact document carrying the correct revision.
 Two answers to that, both in this file: `get` now refuses to serve a
 document whose assembled length disagrees with the `size` the document
@@ -55,7 +55,7 @@ convention -- see CLAUDE.md/memory `feedback-always-use-lowercase-vault-paths`).
 
 Overwrites and deletes are NOT backed up into the vault. They used to
 be, under `agora/backups/<timestamp> <basename>`, which cost one extra
-document per write and grew to 272 of them before Edvard asked for it
+document per write and grew to 272 of them before the owner asked for it
 to stop (2026-08-05): "since the switch to Nova, this is just noise."
 The real safety net was never this copy -- it is the daily snapshot of
 the whole vault into the `SokratesAI/vault` GitHub repo, which keeps
@@ -87,11 +87,11 @@ _ID_MAX = "\U0010FFFF"
 # (2026-08-05). If that happens here, `recent` should stay readable.
 BACKUP_PREFIX = "agora/backups/"
 DEFAULT_RECENT_LIMIT = 2000
-# Times shown to a human are Oslo time, not UTC -- Edvard lives there and
+# Times shown to a human are Oslo time, not UTC -- the owner lives there and
 # asked for it directly (evolve/identity.md rule 7).
 LOCAL_TZ = "Europe/Oslo"
 
-# Nova's files live in their own CouchDB database rather than in Edvard's
+# Nova's files live in their own CouchDB database rather than in the owner's
 # vault (his ask, 2026-08-11: "You have outgrown a poc project that is
 # allowed to use my Vault as a database. Move out and get your own space").
 # The document id in a LiveSync vault IS the lowercased file path, so which
@@ -105,7 +105,7 @@ LOCAL_TZ = "Europe/Oslo"
 # between the writer and the reader serves a file out of the wrong store.
 # Keep them identical, or fix them both in the same cycle.
 #
-# `issues.md` and `ideas.md` deliberately stay in `obsidian`. Edvard offered
+# `issues.md` and `ideas.md` deliberately stay in `obsidian`. The owner offered
 # them ("Take all of 'my' files aswell with you if you want"), but they are
 # the two files Obsidian LiveSync may still write, and a second writer that
 # cannot see this rule would silently re-create them in the vault Nova had
@@ -114,7 +114,7 @@ LOCAL_TZ = "Europe/Oslo"
 # Folders match by prefix; single files must match EXACTLY. Testing
 # everything with startswith routed `journal-digest.md.bak` -- and any other
 # file merely *beginning* with that name -- into Nova's database, which is a
-# file Edvard owns being answered by the wrong store.
+# file the owner owns being answered by the wrong store.
 NOVA_DB_FOLDERS = (
     "projects/sokrates/projects/agora/nova/",
 )
@@ -126,7 +126,7 @@ NOVA_DB_TARGETS = NOVA_DB_FOLDERS + NOVA_DB_FILES
 # Paths whose routing this process reports on demand. Five distinct
 # behaviours of `db_for`, two of which are regressions rather than
 # examples: a `.bak` beside the digest must NOT follow it into Nova's
-# database, and the Nova folder Edvard asked to keep in his own vault must
+# database, and the Nova folder the owner asked to keep in his own vault must
 # stay there. The other three are the folder rule, the exact-file rule and
 # a file of his that must never move.
 #
@@ -150,7 +150,7 @@ HEALTH_PROBE_PATHS = (
     "projects/sokrates/projects/agora/journal-digest.md",
     "projects/sokrates/projects/agora/journal-digest.md.bak",
     "projects/sokrates/projects/nova/nova.md",
-    # Was `agora/issues.md` until 2026-08-12, when the three files Edvard
+    # Was `agora/issues.md` until 2026-08-12, when the three files the owner
     # writes by hand moved into the Nova folder in his own vault at his
     # ask -- *"they can be moved into the Nova folder in my Vault and not
     # be underneath the agora project folder"*. The rule it probes is
@@ -218,7 +218,7 @@ HEALTH_TIMEOUT_SECONDS = 5
 # boundary chosen by the content of the line it follows re-syncs within
 # a chunk or two of the edit, so an append rewrites the tail and nothing
 # else. Measured 2026-08-11 (Cycle 116, research/vault-storage-format.md):
-# one-blob writes left 38.8MB of dead copies in Edvard's database against
+# one-blob writes left 38.8MB of dead copies in the owner's database against
 # 1.4MB of live content -- 27.6x -- because every write stored the whole
 # file again under a new content hash and deleted nothing.
 CHUNK_MIN_BYTES = 2048
@@ -303,7 +303,7 @@ class VaultUnreadableDocument(RuntimeError):
     `[not found: <path>]` for both.
 
     The reader that makes this expensive is Nova itself. This CLI is how a
-    cycle reads its own instructions, its journal, and Edvard's capture
+    cycle reads its own instructions, its journal, and the owner's capture
     files at the start of every run. `[not found]` is a fact a cycle acts
     on: it has written a missing file into the permanent record before
     (Cycle 9 recorded "Cycle 8 is missing... Unexplained" while the
@@ -335,7 +335,7 @@ class VaultIncompleteDocument(RuntimeError):
     Measured, 2026-08-10: `projects/sokrates/projects/agora/ideas.md` was
     re-chunked by a LiveSync client into 184 chunks, 6 of which never
     reached CouchDB. `get` printed the other 178 as if nothing were
-    wrong -- 1238 characters gone, including Edvard's `## Board` heading,
+    wrong -- 1238 characters gone, including the owner's `## Board` heading,
     its table header, rows #57 to #50, and the tail of the capture
     sentence he had just typed. A cycle read that, believed it, and had
     to reconstruct the file from an older revision. A scan of all 686
@@ -364,14 +364,14 @@ _ANY_REV = object()
 #: Below the floor sit the small JSON ledgers: `claims.json` at 7,765
 #: bytes is above it, `retro-ledger.json` and a near-empty `notes.md` are
 #: under, and there a rewrite really can be most of the file while the
-#: blast radius is a few rows rather than Edvard's backlog.
+#: blast radius is a few rows rather than the owner's backlog.
 #:
 #: One legitimate edit does cross this line, and it is named here rather
 #: than tuned away: a cycle trimming the digest's **Next cycle** list from
 #: twenty-five items to three removes most of that file on purpose. That
 #: write is meant to say so. `--allow-shrink` is one word, the refusal
 #: message names it, and a deliberate three-quarter deletion of a file
-#: Edvard reads is worth one word of intent -- which an accidental one
+#: The owner reads is worth one word of intent -- which an accidental one
 #: will never supply.
 #:
 #: Deliberately not a check on emptiness alone. The write that prompted
@@ -471,7 +471,7 @@ class VaultClient:
         wholly inside Nova's folder needs only Nova's database; a prefix
         that is an *ancestor* of it (`""`, or `projects/`) straddles both
         and has to query both or a whole-vault listing quietly loses every
-        Nova file; and anything else is Edvard's alone.
+        Nova file; and anything else is the owner's alone.
         """
         if not self.nova_db:
             return [self.db]
@@ -480,7 +480,7 @@ class VaultClient:
             return [self.nova_db]
         # Deliberately not `lowered in NOVA_DB_FILES -> [nova]`: as a
         # *prefix*, a single file's path also matches its own neighbours (a
-        # `.bak` beside it), and those live in Edvard's database. Querying
+        # `.bak` beside it), and those live in the owner's database. Querying
         # both is the conservative answer and costs one extra request.
         if any(t.startswith(lowered) for t in NOVA_DB_TARGETS):
             return [self.db, self.nova_db]
@@ -611,7 +611,7 @@ class VaultClient:
         A LiveSync file doc records `size`, the byte length of the text it
         stands for, and every writer sets it -- this client at `_put_raw`,
         and Obsidian itself. Measured 2026-08-15 across 37 documents
-        spanning Edvard's phone-written captures, this loop's journal
+        spanning the owner's phone-written captures, this loop's journal
         entries, the JSON ledgers and the 291KB frozen archive: `size`
         equalled `len(content.encode())` exactly, 37 times out of 37, with
         no document missing the field. So it is a length checksum the
@@ -623,7 +623,7 @@ class VaultClient:
         reason, and the case that matters is the shortest one: `children`
         empty and `data` empty returns `""` through the early path above,
         with no chunk missing and nothing to raise about. Cycle 211 read
-        Edvard's 123KB `issues.md` that way -- empty body, exit 0 -- and
+        the owner's 123KB `issues.md` that way -- empty body, exit 0 -- and
         wrote the empty result back over the live document, which was
         still intact underneath. The read was the blind half. `_put_raw`
         refuses the write half.
@@ -718,7 +718,7 @@ class VaultClient:
         that deferral was waiting for.
 
         It matters most for the reader nobody was counting. `get` is how a
-        Nova cycle reads its own instructions, its journal and Edvard's
+        Nova cycle reads its own instructions, its journal and the owner's
         capture files, and it printed `[not found: <path>]` for a database
         that would not answer. A cycle that reads that has no way to tell
         it from a file that is genuinely gone, and this loop writes what it
@@ -758,7 +758,7 @@ class VaultClient:
         place, which is how other clients learn to drop their copy. So a
         deleted note stays in `_all_docs` forever with its content intact,
         and a tool that reads ids without reading the flag hands back
-        files Edvard has thrown away.
+        files the owner has thrown away.
 
         Measured on the live vault 2026-08-07: 309 of 897 documents were
         tombstones -- a third of everything this tool could see. Most were
@@ -889,7 +889,7 @@ class VaultClient:
         out = []
         truncated = False
         # Once Nova's files live in their own database, "what changed
-        # lately" that only asks Edvard's database answers with his edits
+        # lately" that only asks the owner's database answers with his edits
         # and none of Nova's -- and this is the command every cycle opens
         # with, precisely to notice what it does not already know about. A
         # failure is raised rather than warned: a silently short answer
@@ -932,7 +932,7 @@ class VaultClient:
 
         `db` is required rather than derived: a chunk id is a content hash
         with no path, so there is nothing to derive it from, and defaulting
-        would silently ask Edvard's database whether Nova's chunks exist.
+        would silently ask the owner's database whether Nova's chunks exist.
         The answer would be "no" for every one of them, which is merely
         wasteful on write -- but the same mistake on read is a file that
         comes back empty.
@@ -1095,7 +1095,7 @@ class VaultClient:
         2026-08-15: a write that would replace a document with a small
         fraction of its size is refused unless `allow_shrink` says the
         truncation is intended -- see `_collapse_refusal`. `if_rev` does
-        not cover this: the write that lost Edvard's `issues.md` carried
+        not cover this: the write that lost the owner's `issues.md` carried
         the correct revision and was, as far as CouchDB could tell, a
         perfectly ordinary edit.
 
@@ -1160,7 +1160,7 @@ class VaultClient:
         peers see it, and they drop their copy.
 
         Every agent delete this platform has done used the first one.
-        Edvard reported the symptom twice (comments.md 2026-08-12: "my
+        The owner reported the symptom twice (comments.md 2026-08-12: "my
         Vault did sync multiple times and i still have the old deleted
         files on my phone... I have had this issue before, as in an
         agent deleted a file in couchdb but i still have it on my

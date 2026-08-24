@@ -63,7 +63,7 @@ AUTH_EXPIRED = "\x00AUTH_EXPIRED"
 # incomplete: Claude Code ships a much larger built-in tool roster
 # (confirmed live via a real session's own system.init event -- the exact
 # list is DISCOVERED_FULL_TOOL_ROSTER below), and the model found and used
-# an unlisted one ("Monitor") to run real shell commands anyway. Edvard's
+# an unlisted one ("Monitor") to run real shell commands anyway. The owner's
 # call: this service is meant to be as capable as an interactive Claude
 # Code session, same as this very session building it -- restriction should
 # be an explicit per-call opt-in, not a silent, incomplete default. Pass
@@ -540,7 +540,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         "--dangerously-skip-permissions",
         # Everything a subagent does, on the parent's stream. Without this the
         # CLI reports a Task call and then nothing until it returns, which for
-        # a delegated read is several minutes of apparent silence -- Edvard's
+        # a delegated read is several minutes of apparent silence -- the owner's
         # issue #4, "it looks like it does nothing for a long time".
         #
         # Measured on 2.1.226 rather than read off --help, because what it
@@ -708,7 +708,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
             #
             # This is the single most load-bearing line in the loop, and it
             # guards two failures that both put a subagent's words in front of
-            # Edvard as if the persona had said them:
+            # The owner as if the persona had said them:
             #
             #  1. The reply is `pending[-1]` -- the last passage written. A
             #     subagent launched in the background finishes whenever it
@@ -766,7 +766,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                             tool_names[tool_use_id] = name
                         reporter.report(name, block.get("input"), tool_use_id)
             elif t == "user":
-                # What each tool RETURNED. Edvard has asked for this three
+                # What each tool RETURNED. The owner has asked for this three
                 # times -- "I need to see the command with all metadata and
                 # also the output from that command, such as the return of a
                 # echo command" -- and until now this branch did not exist at
@@ -838,7 +838,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
             # Falling through rather than raising, because this process is
             # holding every word the session wrote and used to throw all of
             # it away. Cycle 81 was killed here having already merged its
-            # PR and written its journal entry, and the only thing Edvard
+            # PR and written its journal entry, and the only thing the owner
             # was told is "failed: timed out" -- which reads as "the cycle
             # achieved nothing", the opposite of what happened. The reply
             # built below is now the last thing the session managed to say,
@@ -864,7 +864,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 os.remove(mcp_config)
             except OSError as exc:
                 log(f"mcp config cleanup failed: {type(exc).__name__}: {exc}")
-        # Same reasoning one step further: this one holds whatever Edvard
+        # Same reasoning one step further: this one holds whatever the owner
         # photographed, and the CLI read it before the first event arrived.
         if input_file:
             try:
@@ -921,7 +921,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # sent as narration and is already in the conversation, in order, where
     # it happened. Returning the joined whole on top of that would print the
     # entire run a second time inside the reply bubble -- which is what it
-    # used to do, and is why Edvard's phone kept buzzing with a wall of "let
+    # used to do, and is why the owner's phone kept buzzing with a wall of "let
     # me check the deploy first" instead of an answer. So the reply is the
     # last passage: the thing written once there was nothing left to do.
     #
@@ -949,7 +949,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         # call is the normal shape of this failure -- Cycle 81 died three
         # tool calls into rewriting the digest. So `pending` is empty
         # exactly when this path runs, the selection above falls through to
-        # joining every passage, and Edvard's phone gets the entire
+        # joining every passage, and the owner's phone gets the entire
         # transcript a second time on top of the narration he already
         # watched. That is the wall-of-text regression the comment above
         # exists to prevent, arriving through a different door. The last

@@ -337,7 +337,7 @@ def test_run_turn_without_attachments_still_passes_the_prompt_as_argv(tmp_path):
 
 
 def test_run_turn_deletes_the_input_file_after_the_turn(tmp_path):
-    """It holds whatever Edvard photographed, on a persistent volume, and
+    """It holds whatever the owner photographed, on a persistent volume, and
     the CLI has read it before the first event arrives."""
     lines = _stream_json_lines(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
@@ -1137,7 +1137,7 @@ def test_run_turn_reports_nothing_when_no_activity_block_is_given(tmp_path):
 
 def test_tool_use_is_reported_while_the_session_is_still_running(tmp_path):
     """The whole point. A chip that lands after the turn returns is the
-    'displayed after the process is finished... hindsight logging' Edvard
+    'displayed after the process is finished... hindsight logging' the owner
     complained about -- so assert the post happens before the CLI has even
     emitted its next event, not merely that it happens at some point."""
     posted = []
@@ -1503,7 +1503,7 @@ def test_generate_composes_auth_retry_with_the_session_not_found_retry():
 
 
 # ---------------------------------------------------------------------------
-# activity.py -- what a tool RETURNED (Edvard's issue 1, asked three times:
+# activity.py -- what a tool RETURNED (the owner's issue 1, asked three times:
 # "I need to see the command with all metadata and also the output from that
 # command, such as the return of a echo command")
 # ---------------------------------------------------------------------------
@@ -1654,7 +1654,7 @@ def test_run_turn_reports_a_failed_tool_call_as_an_error(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The narrative between the tool calls (Edvard, 2026-08-04: "how would you
+# The narrative between the tool calls (the owner, 2026-08-04: "how would you
 # like to be presented a story? ... first a narrative, then an action, then a
 # narrative, then an action"). Every passage but the last is narration and
 # goes out live; the last one is the reply.
@@ -1935,7 +1935,7 @@ def test_enter_turn_admits_a_turn_while_serving_normally(drainable_server):
 
 # ---------------------------------------------------------------------------
 # --mcp-config: Agora's own capability tools, handed to the CLI session
-# (2026-08-06). Edvard: "There are different tools for you and Gemini? That
+# (2026-08-06). The owner: "There are different tools for you and Gemini? That
 # should not be the case." The runner hosts them; this side only has to
 # render the flag, and above all has to never render a broken one.
 # ---------------------------------------------------------------------------
@@ -2083,7 +2083,7 @@ def test_a_subagent_finishing_last_does_not_become_the_reply(tmp_path):
 
     A backgrounded subagent finishes whenever it finishes -- routinely after
     the persona has written its closing passage. If its text reached
-    `pending`, the reply posted to Edvard's phone would be the subagent's
+    `pending`, the reply posted to the owner's phone would be the subagent's
     words instead of the persona's. This ordering is copied from a real run.
     """
     lines = _stream_json_lines(

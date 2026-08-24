@@ -209,7 +209,7 @@ def test_post_tool_use_stamps_the_clock_while_there_is_time(tmp_path):
 
 
 def test_the_stamp_carries_the_oslo_wall_clock(tmp_path):
-    """Edvard's ask is the wall clock specifically -- "getting the actual
+    """The owner's ask is the wall clock specifically -- "getting the actual
     timestamp ... can get you to get a better hold on reality"."""
     with patch.object(deadline_notice, "oslo_clock", return_value="23:14 Oslo"):
         out = drive_hook(tmp_path, 40, "PostToolUse")
@@ -412,7 +412,7 @@ def test_salvage_keeps_everything_when_nothing_was_narrated(tmp_path):
 
 def test_timeout_returns_what_the_session_managed_to_say(tmp_path):
     """Cycle 81 was killed here having already merged its PR and written
-    its journal entry, and Edvard was told only "failed: timed out"."""
+    its journal entry, and the owner was told only "failed: timed out"."""
     lines = _stream_json_lines(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "merged the PR"}]}},
         {"type": "assistant", "message": {"content": [

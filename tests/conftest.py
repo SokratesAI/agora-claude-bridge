@@ -118,7 +118,7 @@ def no_ambient_vault_routing():
     Third of the same kind, and the only one whose absence was invisible.
     `CDB_BASE`, `CDB_DB`, `CDB_NOVA_DB`, `CDB_PASS` and `CDB_USER` are set
     in the live bridge pod, so a test that builds a `VaultClient` without
-    an `env` fixture of its own inherits them and points at Edvard's real
+    an `env` fixture of its own inherits them and points at the owner's real
     vault -- `recent` then sweeps whichever databases the pod is
     configured for, which is why three of `test_vault_tool.py`'s
     assertions fail there and pass in CI.
