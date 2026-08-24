@@ -439,24 +439,67 @@ def test_disk_reading_measures_every_file_not_just_transcripts(tmp_path):
     (root / "cache.bin").write_bytes(b"x" * 500)
 
     reading = publish_costs.disk_reading(str(tmp_path / "projects"), now=10000.0)
-    assert reading["transcriptBytes"] == 503
+    assert reading["bytesOnDisk"] == 503
     assert reading["retentionHours"] == 1.0
     assert reading["at"] == 10000.0
 
 
-def test_disk_reading_carries_the_whole_filesystem_not_just_our_share(tmp_path):
+def test_disk_reading_carries_the_whole_filesystem_not_just_our_share(tmp_path,
+                                                                     monkeypatch):
     """The node is what runs out, and this loop's own bytes are a minority of
-    it -- 221MB of transcript against 52GB used on 2026-08-24. A series with
-    only `transcriptBytes` in it could show that number flat while the box
-    filled up underneath it."""
+    it -- 228MB of transcript against 55GB used on 2026-08-24. A series with
+    only `bytesOnDisk` in it could show that number flat while the box filled
+    up underneath it.
+
+    Each field is pinned to its own `statvfs` member rather than checked for
+    plausibility. The first version of this test asserted only
+    `used + free <= total`, and a review found four separate wrong assignments
+    that satisfied it -- including reporting *available* space as the disk's
+    total, and defining `used` as `total - available`, which silently drops the
+    root-reserved blocks. "Looks like a disk" is not an assertion."""
+    class FakeStat:
+        f_frsize = 4096
+        f_blocks = 1000        # 4,096,000 total
+        f_bfree = 400          # 1,638,400 free to root
+        f_bavail = 300         # 1,228,800 free to us
+    monkeypatch.setattr(publish_costs.os, "statvfs", lambda p: FakeStat())
     root = tmp_path / "projects" / "-data-workspace"
     _transcript(root, "session.jsonl", 6400.0)
 
     reading = publish_costs.disk_reading(str(tmp_path / "projects"))
-    assert reading["fsTotalBytes"] > 0
-    assert reading["fsFreeBytes"] is not None
-    assert reading["fsUsedBytes"] is not None
-    assert reading["fsUsedBytes"] + reading["fsFreeBytes"] <= reading["fsTotalBytes"]
+    assert reading["fsTotalBytes"] == 4_096_000        # f_blocks, not f_bavail
+    assert reading["fsFreeBytes"] == 1_228_800         # f_bavail, what we can use
+    assert reading["fsUsedBytes"] == 2_457_600         # total - f_bfree, reserve counted
+
+
+def test_a_walk_that_could_read_nothing_reports_none_not_zero(tmp_path):
+    """`os.walk` swallows a permission error into an empty iteration, so an
+    unreadable tree and a wiped one both total 0. A 0 in this series is the
+    cliff a future cycle reads as "a pruner appeared" -- the one wrong
+    conclusion the series exists to prevent. `retention_hours` already returns
+    None here; this matches it."""
+    empty = tmp_path / "projects"
+    empty.mkdir()
+    assert publish_costs.disk_reading(str(empty))["bytesOnDisk"] is None
+    assert publish_costs.disk_reading(str(tmp_path / "nope"))["bytesOnDisk"] is None
+
+
+def test_a_statvfs_that_is_not_an_oserror_still_cannot_break_a_publish(tmp_path,
+                                                                      monkeypatch):
+    """The contract is "never costs a publish", and `except OSError` did not
+    honour it: `os.statvfs` is absent on some platforms, which is an
+    `AttributeError`, and a path with an embedded null raises `ValueError`.
+    Both would have escaped `build_payload`, which has no guard of its own, and
+    skipped the whole ledger write for that cycle."""
+    monkeypatch.setattr(publish_costs, "log", lambda *a: None)
+    monkeypatch.setattr(publish_costs.os, "statvfs",
+                        lambda p: (_ for _ in ()).throw(AttributeError("no statvfs")))
+    root = tmp_path / "projects" / "-data-workspace"
+    _transcript(root, "session.jsonl", 6400.0)
+
+    reading = publish_costs.disk_reading(str(tmp_path / "projects"))
+    assert reading["fsTotalBytes"] is None
+    assert reading["bytesOnDisk"] == 3
 
 
 def test_an_unstattable_disk_nulls_all_three_fields_together(tmp_path, monkeypatch):
@@ -474,7 +517,7 @@ def test_an_unstattable_disk_nulls_all_three_fields_together(tmp_path, monkeypat
     assert reading["fsTotalBytes"] is None
     assert reading["fsFreeBytes"] is None
     assert reading["fsUsedBytes"] is None
-    assert reading["transcriptBytes"] == 3          # still measured
+    assert reading["bytesOnDisk"] == 3          # still measured
     assert any("could not stat" in line for line in lines)
 
 
@@ -483,26 +526,26 @@ def test_merge_disk_appends_to_the_stored_series_oldest_first():
     took it. A publish that replaced the series instead of extending it would
     leave exactly one row, which is the state that made the pruner question
     unanswerable for four days."""
-    stored = [{"at": 100.0, "transcriptBytes": 1},
-              {"at": 300.0, "transcriptBytes": 3}]
-    merged = publish_costs.merge_disk(stored, {"at": 200.0, "transcriptBytes": 2})
+    stored = [{"at": 100.0, "bytesOnDisk": 1},
+              {"at": 300.0, "bytesOnDisk": 3}]
+    merged = publish_costs.merge_disk(stored, {"at": 200.0, "bytesOnDisk": 2})
     assert [r["at"] for r in merged] == [100.0, 200.0, 300.0]
 
 
 def test_merge_disk_does_not_duplicate_a_reading_two_cycles_took_at_once():
     """Cycles overlap now, so two publishes can land in the same second. Keyed
     by `at` for the same reason `merge_quota` is."""
-    stored = [{"at": 100.0, "transcriptBytes": 1}]
-    merged = publish_costs.merge_disk(stored, {"at": 100.0, "transcriptBytes": 9})
+    stored = [{"at": 100.0, "bytesOnDisk": 1}]
+    merged = publish_costs.merge_disk(stored, {"at": 100.0, "bytesOnDisk": 9})
     assert len(merged) == 1
-    assert merged[0]["transcriptBytes"] == 9
+    assert merged[0]["bytesOnDisk"] == 9
 
 
 def test_merge_disk_drops_a_reading_with_no_time_on_it():
     """A row with no `at` cannot be placed in a series and cannot be deduped;
     silently keeping it would corrupt every later sort."""
     assert publish_costs.merge_disk([{"at": 1.0}], None) == [{"at": 1.0}]
-    assert publish_costs.merge_disk([{"at": 1.0}], {"transcriptBytes": 5}) == [{"at": 1.0}]
+    assert publish_costs.merge_disk([{"at": 1.0}], {"bytesOnDisk": 5}) == [{"at": 1.0}]
 
 
 def test_a_publish_extends_the_stored_disk_series(tmp_path, monkeypatch):
@@ -512,13 +555,13 @@ def test_a_publish_extends_the_stored_disk_series(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_costs.analytics, "scan",
                         lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
     stored = _stored("old1")
-    stored["disk"] = [{"at": 1.0, "transcriptBytes": 7}]
+    stored["disk"] = [{"at": 1.0, "bytesOnDisk": 7}]
     monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: stored)
 
     payload = publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
     assert [r["at"] for r in payload["disk"]][0] == 1.0
     assert len(payload["disk"]) == 2
-    assert payload["disk"][-1]["transcriptBytes"] >= 0
+    assert payload["disk"][-1]["bytesOnDisk"] >= 0
 
 
 def test_a_publish_logs_the_free_space_next_to_the_window(tmp_path, monkeypatch):
@@ -528,7 +571,7 @@ def test_a_publish_logs_the_free_space_next_to_the_window(tmp_path, monkeypatch)
     lines = []
     monkeypatch.setattr(publish_costs, "log", lines.append)
     monkeypatch.setattr(publish_costs, "disk_reading", lambda d=None: {
-        "at": 5.0, "retentionHours": 2.0, "transcriptBytes": 221_000_000,
+        "at": 5.0, "retentionHours": 2.0, "bytesOnDisk": 221_000_000,
         "fsUsedBytes": 52_000_000_000, "fsFreeBytes": 21_000_000_000,
         "fsTotalBytes": 75_000_000_000})
     monkeypatch.setattr(publish_costs.analytics, "scan",
@@ -536,5 +579,5 @@ def test_a_publish_logs_the_free_space_next_to_the_window(tmp_path, monkeypatch)
     monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: _stored("old1"))
 
     publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
-    assert any("disk holds 2.0h / 221MB of transcript, 21.0GB free" in line
+    assert any("disk holds 2.0h / 221MB on disk, 21.0GB free" in line
                for line in lines)

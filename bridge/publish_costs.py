@@ -44,12 +44,13 @@ ReplicaSet since has mounted it. So transcripts *do* survive a restart.
 
 That left "something prunes them to a rolling window, cause not identified"
 standing here for four days, and **it was wrong too: nothing prunes them.**
-Measured 2026-08-24T19:46Z, Cycle 383. The 08-20 note in `merge_quota` below
-records that the file began 08-19; four days on, the oldest transcript is
-*still* dated 08-19 and the window has grown to 121.9 hours. A pruner holds
-that number flat. Nothing was ever removed -- the window looked short on 08-20
-because the data was one day old, and it has accumulated without bound since.
-`retention_hours` has the full working.
+Measured 2026-08-24T19:46Z, Cycle 383: 121.9 hours, oldest transcript dated
+08-19T17:51 -- the same file this paragraph describes as "under two hours old"
+at 19:27Z on 08-19, still on the disk five days later. A pruner holds that
+number flat. Nothing was removed, and the window looked short that night only
+because the data was hours old. The two days between the PVC being created on
+08-17 and the oldest transcript on it are still unexplained and the claim is
+scoped to exclude them; `retention_hours` has the full working.
 
 Nothing above changes because of that: merging into the vault is the right
 design either way. What did change is that the reading is now durable --
@@ -131,16 +132,26 @@ def retention_hours(projects_dir=None, now=None):
     looks like a guard is worse than no guard.
 
     **The question it was written for is now answered: there is no pruner.**
-    Measured 2026-08-24T19:46Z (Cycle 383), against the 2026-08-20 reading
-    recorded in `merge_quota` below. On 08-20 the oldest transcript on the disk
-    was dated 08-19; four days later the oldest transcript on the disk is still
-    dated 08-19, so nothing was removed in between and the window has been
-    growing one day per day -- 121.9 hours by that reading. A pruner would have
-    held it flat. The pod had also restarted twelve minutes before the
-    measurement and the 08-19 files were still there, which rules out the
-    restart a second time. So the short window seen on 08-20 was only ever the
-    age of the data: transcripts began landing here on 08-19 and have
-    accumulated without bound since.
+    Measured 2026-08-24T19:46Z (Cycle 383): 121.9 hours, oldest transcript
+    dated 2026-08-19T17:51. Compare the module docstring above, which records
+    the pod coming up 2026-08-19T19:27Z holding twelve session files with the
+    oldest under two hours old -- i.e. an oldest transcript around 17:30 that
+    day. **That is the same file, still there five days later.** Nothing was
+    removed in between; the window has been growing one day per day, where a
+    pruner would have held it flat. The pod had also restarted twelve minutes
+    before this reading and those files survived, which rules out the restart a
+    second time.
+
+    Cite that measurement and not the one in `merge_quota` below, which a first
+    pass at this paragraph got wrong: `merge_quota`'s "the file begins 08-19"
+    is about `quota-history.jsonl`, a different file with a different writer,
+    and it only *looks* like the same fact.
+
+    What this does not explain is the two days before 08-19. The PVC was
+    created 2026-08-17T16:42Z and the oldest transcript on it is from 08-19, so
+    either something removed them once or `CLAUDE_HOME` moved. "No pruner"
+    covers the five days that have been measured end to end and says nothing
+    about that gap; do not read it wider than that.
 
     That is why the reading is durable now rather than log-only. It used to say
     here that a series inside one pod's lifetime was enough to see
@@ -182,42 +193,62 @@ def disk_reading(projects_dir=None, now=None):
     cost ledger, so "projected" becomes a subtraction rather than a guess.
 
     Four numbers, and each one answers something a different reading cannot.
-    `transcriptBytes` is what this loop writes; `fsUsedBytes`/`fsFreeBytes` are
-    the whole node, which is what actually runs out, and the gap between them
-    is everything on the box that is not mine. `retentionHours` is
+    `bytesOnDisk` is every file under the projects directory, not only the
+    `.jsonl` -- `retention_hours` filters to transcripts because an ancient
+    lock file would misdate the window, and size is the opposite question,
+    since a cache sitting next to the transcripts fills the same disk. It is
+    deliberately *not* called `transcriptBytes` for that reason, and it will
+    not reproduce a `du` figure either: `getsize` follows symlinks, counts each
+    hardlink separately, and reports apparent rather than block size.
+    `fsUsedBytes`/`fsFreeBytes` are the whole node, which is what actually runs
+    out, and the gap between them is everything on the box that is not mine --
+    the PVC is `local-path`, so `statvfs` returns the node's figures and the
+    nominal 1Gi is not enforced and not what lands here. `retentionHours` is
     `retention_hours` above, kept in the same row so a future cycle can see the
-    window and the size move together -- transcript bytes climbing while the
-    window stays flat means a pruner has appeared, and neither number says that
-    alone.
+    window and the size move together -- bytes climbing while the window stays
+    flat means a pruner has appeared, and neither number says that alone.
 
     Best-effort in the same sense as everything else in this module: it is
     called on the way out of a cycle while the reply is being written, so a
-    failure here must cost a log line and never a publish. `os.statvfs` is the
-    one call that can raise -- an unreadable mount point, a platform without it
-    -- and its three fields go to None together rather than being partially
-    filled, because a row with a size and no free space would read as "the disk
-    is fine" to anything scanning the series.
+    failure here must cost a log line and never a publish. The three `fs`
+    fields go to None together rather than being partially filled, because a
+    row with a size and no free space would read as "the disk is fine" to
+    anything scanning the series, and the catch is a bare `Exception` on
+    purpose: `os.statvfs` raises `AttributeError` on a platform that lacks it
+    and `ValueError` on a path with an embedded null, neither of which is an
+    `OSError`, and this promises never to break a publish.
+
+    **`bytesOnDisk` is None rather than 0 when the walk found no file it could
+    measure**, which is the same distinction and the one that was wrong first
+    time. `os.walk` swallows a permission error into an empty iteration, so an
+    unreadable tree and a wiped one both produce a total of 0 -- and a 0 in
+    this series is exactly the cliff a future cycle would read as "a pruner
+    appeared", which is the one wrong conclusion the series exists to prevent.
+    `retention_hours` already returns None for the same case; this now matches
+    it.
     """
     projects_dir = projects_dir or analytics.PROJECTS_DIR
     total = 0
+    seen = False
     for root, _dirs, files in os.walk(projects_dir):
         for name in files:
             try:
                 total += os.path.getsize(os.path.join(root, name))
             except OSError:
                 continue
+            seen = True
     used = free = size = None
     try:
         st = os.statvfs(projects_dir)
         size = st.f_blocks * st.f_frsize
         free = st.f_bavail * st.f_frsize
         used = size - st.f_bfree * st.f_frsize
-    except OSError as exc:
+    except Exception as exc:
         log(f"cost publish: could not stat {projects_dir} ({exc})")
     return {
         "at": round(now if now is not None else time.time(), 3),
         "retentionHours": retention_hours(projects_dir, now=now),
-        "transcriptBytes": total,
+        "bytesOnDisk": total if seen else None,
         "fsUsedBytes": used,
         "fsFreeBytes": free,
         "fsTotalBytes": size,
@@ -230,9 +261,15 @@ def merge_disk(stored_disk, fresh_reading):
     Keyed by `at` like `merge_quota`, for the same reason and with one
     difference worth stating: the quota series arrives as a file that can
     disagree with what the vault holds, while this one is a single row taken
-    here and now, so the merge is really an append with the key doing duty as
-    an idempotency guard. That matters when two concurrent cycles publish in
-    the same second -- rare, and the row they would write is the same row.
+    here and now, so the merge is in practice an append and the key only stops
+    a row being written twice under the same timestamp.
+
+    Do not read that as an idempotency guarantee across concurrent cycles.
+    `at` is rounded to the millisecond, so two cycles collide only if they
+    publish inside the same millisecond, and two readings a second apart are
+    genuinely different rows -- the byte counts differ. Last write wins on a
+    real collision, which is fine because the two rows would describe the same
+    disk at the same instant, and is not the same as being idempotent.
 
     A `None` reading is dropped rather than appended. `disk_reading` never
     returns one today; the guard is here because the caller is best-effort by
@@ -288,15 +325,18 @@ UNREADABLE = object()
 def read_stored(vault_path=VAULT_PATH):
     """The ledger already in the vault: a dict, None, or `UNREADABLE`.
 
-    The transcripts this module scans go back only a few hours, while the vault
-    ledger holds every cycle since 2026-08-03. So the vault document is the
-    durable record and the PVC is a window -- which is the opposite of what
-    this module assumed when it rebuilt the whole document every cycle.
+The transcripts this module scans reach back days, not the whole history:
+    122 hours as of 2026-08-24, against a vault ledger holding every cycle
+    since 2026-08-03. So the vault document is the durable record and the PVC
+    is a window -- which is the opposite of what this module assumed when it
+    rebuilt the whole document every cycle.
 
     Do not restate that as "the transcripts do not survive a pod restart".
-    They do; see the module docstring for the measurement. The short window has
-    some other cause, and the difference matters here because a restart is an
-    event you can wait out while a pruner is not.
+    They do, and nothing prunes them either; both are measured, in the module
+    docstring and in `retention_hours`. The window is short only because the
+    data on this volume starts on 08-19, and it grows a day per day. The merge
+    below is what makes that irrelevant -- it would be the right design at any
+    window size.
 
     `vault_tool get` prints `[not found: ...]` and exits 0 for a path that has
     never been written, so a missing document is a successful read of nothing.
@@ -510,12 +550,12 @@ def build_payload(projects_dir=None, history_path=None, vault_path=VAULT_PATH):
         return None
     added = len(merged) - len(stored_cycles)
     disk = disk_reading(projects_dir)
-    held = disk["retentionHours"]
-    free = disk["fsFreeBytes"]
+    held, on_disk, free = (disk["retentionHours"], disk["bytesOnDisk"],
+                           disk["fsFreeBytes"])
     log(f"cost publish: {len(stored_cycles)} stored + {len(fresh)} on disk "
         f"-> {len(merged)} cycles ({added} new), "
         f"disk holds {'?' if held is None else f'{held}h'}"
-        f" / {disk['transcriptBytes'] / 1e6:.0f}MB of transcript, "
+        f" / {'?' if on_disk is None else f'{on_disk / 1e6:.0f}MB'} on disk, "
         f"{'?' if free is None else f'{free / 1e9:.1f}GB'} free")
     return {
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
