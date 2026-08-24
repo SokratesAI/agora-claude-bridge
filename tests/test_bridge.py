@@ -2579,3 +2579,94 @@ def test_readiness_health_stays_green_when_couchdb_is_unreachable():
         handler.do_GET()
     assert sent["status"] == 200
     assert sent["payload"] == {"status": "ok", "draining": False}
+
+
+def test_run_turn_exports_the_conversation_id_to_the_cli(tmp_path):
+    """Nova reads its own cycle number off the conversation name, so the CLI
+    has to be told which conversation this turn is. Without it three
+    overlapping cycles all read the highest number that existed and all three
+    called themselves Cycle 380 (2026-08-24, reported by the owner)."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", conversation_id="conv-abc")
+    assert captured["env"]["AGORA_CONVERSATION_ID"] == "conv-abc"
+
+
+def test_run_turn_exports_the_conversation_id_on_the_concurrent_lane_too(tmp_path):
+    """The concurrent lane is the one that needs it -- it is the only lane
+    where two turns are alive at once."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "refresh_window_clear", lambda: True), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", allow_concurrent=True, conversation_id="conv-xyz")
+    assert captured["env"]["AGORA_CONVERSATION_ID"] == "conv-xyz"
+
+
+def test_run_turn_exports_an_empty_conversation_id_when_the_caller_gives_none(tmp_path):
+    """A caller that does not care must not put a None into the child's env."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", conversation_id=None)
+    assert captured["env"]["AGORA_CONVERSATION_ID"] == ""
+
+
+def test_generate_passes_the_conversation_id_down_to_the_cli(tmp_path):
+    """The plumbing between server.generate and the CLI is the half that was
+    missing; generate had the id all along and dropped it."""
+    captured = {}
+
+    def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "text", "thinking", "sess-new"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn), \
+         patch.object(server, "get_session_id", lambda _c: None), \
+         patch.object(server, "set_session_id", lambda _c, _s: None):
+        server.generate("conv-123", "system", "prompt")
+    assert captured["conversation_id"] == "conv-123"
+
+
+def test_generate_passes_the_conversation_id_on_the_stateless_path(tmp_path):
+    """Nova runs stateless, so this is the path that actually carries it."""
+    captured = {}
+
+    def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "text", "thinking", None
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-456", "system", "prompt", stateless=True)
+    assert captured["conversation_id"] == "conv-456"

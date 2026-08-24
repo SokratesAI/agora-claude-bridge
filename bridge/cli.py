@@ -492,7 +492,7 @@ def _provision_workspace(workspace):
 
 
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
-                  system=None, attachments=None, slot=""):
+                  system=None, attachments=None, slot="", conversation_id=""):
     workspace = _workspace_for(slot)
     if slot:
         # _workspace_for's invariant is "a concurrent turn always starts
@@ -519,8 +519,21 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # the shared checkout, and therefore the one path a concurrent turn
     # must not write to. `cd "$NOVA_WORKSPACE/agora-persona-runner"` is
     # correct in both lanes; the literal path is only correct in one.
+    # AGORA_CONVERSATION_ID is which conversation this turn is *for*, and it
+    # is the only thing inside the CLI that can tell one concurrent turn from
+    # another. Nova reads its own cycle number off the conversation name, and
+    # until this existed it had no way to ask for its own -- so
+    # `cycle_number.current_number` took the highest number that existed and
+    # called it "mine". That is true only while one cycle runs at a time. On
+    # 2026-08-24 three overlapping cycles each read the highest and all three
+    # wrote a journal entry headed "Cycle 380"; the owner reported it, having
+    # commented on one card and been answered from another, because comments
+    # are keyed by cycle number and the number stopped identifying a cycle.
+    # Empty string for a caller that passes nothing, so os.environ never gains
+    # a None and a turn that does not care is byte-identical to before.
     env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir,
-           "NOVA_WORKSPACE": workspace}
+           "NOVA_WORKSPACE": workspace,
+           "AGORA_CONVERSATION_ID": conversation_id or ""}
 
     # Only a turn that actually carries attachments switches to stdin. The
     # text path is what every Nova cycle and every ordinary chat turn runs,
@@ -1007,7 +1020,8 @@ def refresh_window_clear(margin=CONCURRENT_REFRESH_MARGIN_SECONDS, path=None, no
 
 
 def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
-             mcp=None, system=None, attachments=None, allow_concurrent=False):
+             mcp=None, system=None, attachments=None, allow_concurrent=False,
+             conversation_id=""):
     """One turn. Returns (text, thinking, new_session_id).
 
     attachments: optional [{filename, mimeType, data}] with `data` base64,
@@ -1031,6 +1045,11 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
     mcp: optional {"url", "token"} for an HTTP MCP server the caller wants
     this turn's model to have (see write_mcp_config). Omit it and the CLI
     is invoked with no MCP configuration at all, exactly as before.
+
+    conversation_id: which conversation this turn is for, exported to the
+    CLI as AGORA_CONVERSATION_ID. Omit it and the variable is exported
+    empty, which is what every caller that does not care wants -- the CLI
+    sees a variable it will not read.
 
     allow_concurrent: let this turn run alongside one already in flight
     instead of queueing behind the process-wide lock. Opt-in per call, for
@@ -1066,7 +1085,8 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
         # therefore gets its own paths rather than sharing.
         slot = f"{os.getpid()}-{threading.get_ident()}"
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
-                             system, attachments, slot=slot)
+                             system, attachments, slot=slot,
+                             conversation_id=conversation_id)
     with _invocation_lock:
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
-                             system, attachments)
+                             system, attachments, conversation_id=conversation_id)

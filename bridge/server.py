@@ -203,7 +203,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             message=prompt, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
-            allow_concurrent=allow_concurrent,
+            allow_concurrent=allow_concurrent, conversation_id=conversation_id,
         )
         return text, thinking
 
@@ -214,7 +214,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
         text, thinking, new_session_id = _run_turn_with_auth_retry(
             message=prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
-            allow_concurrent=allow_concurrent,
+            allow_concurrent=allow_concurrent, conversation_id=conversation_id,
         )
     except ClaudeCliError as e:
         if str(e) == SESSION_NOT_FOUND:
@@ -223,7 +223,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             text, thinking, new_session_id = _run_turn_with_auth_retry(
                 message=prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
                 activity=activity, mcp=mcp, system=system, attachments=attachments,
-                allow_concurrent=allow_concurrent,
+                allow_concurrent=allow_concurrent, conversation_id=conversation_id,
             )
         else:
             raise
