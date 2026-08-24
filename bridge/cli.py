@@ -708,7 +708,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
             #
             # This is the single most load-bearing line in the loop, and it
             # guards two failures that both put a subagent's words in front of
-            # The owner as if the persona had said them:
+            # the owner as if the persona had said them:
             #
             #  1. The reply is `pending[-1]` -- the last passage written. A
             #     subagent launched in the background finishes whenever it
