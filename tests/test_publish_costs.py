@@ -372,7 +372,7 @@ def test_a_publish_says_how_much_the_disk_is_holding(tmp_path, monkeypatch):
     clock would make it a test that agrees with the author most of the time.
     The three tests above own whether the number itself is right."""
     lines = []
-    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None: 2.0)
+    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None, now=None: 2.0)
     monkeypatch.setattr(publish_costs, "log", lines.append)
     monkeypatch.setattr(publish_costs.analytics, "scan",
                         lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
@@ -386,7 +386,7 @@ def test_a_disk_with_nothing_to_measure_logs_a_question_mark(tmp_path, monkeypat
     """Not `0.0h`, which would read as "the disk was wiped this instant" -- the
     exact false alarm the whole change exists to stop."""
     lines = []
-    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None: None)
+    monkeypatch.setattr(publish_costs, "retention_hours", lambda d=None, now=None: None)
     monkeypatch.setattr(publish_costs, "log", lines.append)
     monkeypatch.setattr(publish_costs.analytics, "scan",
                         lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
@@ -427,3 +427,114 @@ def test_merge_summary_agrees_with_analytics_summarize_on_what_is_not_a_cycle(tm
     assert published["other_sessions"] == 1
     assert published["subagent_sessions"] == 2
     assert published["subagent_weighted"] == 12000.0
+
+
+def test_disk_reading_measures_every_file_not_just_transcripts(tmp_path):
+    """`retention_hours` deliberately looks only at `.jsonl` because an ancient
+    lock file would misdate the window. Size is the opposite question: a cache
+    sitting next to the transcripts fills the same disk, so counting only
+    `.jsonl` here would under-report the thing the owner actually asked about."""
+    root = tmp_path / "projects" / "-data-workspace"
+    _transcript(root, "session.jsonl", 6400.0)          # 3 bytes, "{}\n"
+    (root / "cache.bin").write_bytes(b"x" * 500)
+
+    reading = publish_costs.disk_reading(str(tmp_path / "projects"), now=10000.0)
+    assert reading["transcriptBytes"] == 503
+    assert reading["retentionHours"] == 1.0
+    assert reading["at"] == 10000.0
+
+
+def test_disk_reading_carries_the_whole_filesystem_not_just_our_share(tmp_path):
+    """The node is what runs out, and this loop's own bytes are a minority of
+    it -- 221MB of transcript against 52GB used on 2026-08-24. A series with
+    only `transcriptBytes` in it could show that number flat while the box
+    filled up underneath it."""
+    root = tmp_path / "projects" / "-data-workspace"
+    _transcript(root, "session.jsonl", 6400.0)
+
+    reading = publish_costs.disk_reading(str(tmp_path / "projects"))
+    assert reading["fsTotalBytes"] > 0
+    assert reading["fsFreeBytes"] is not None
+    assert reading["fsUsedBytes"] is not None
+    assert reading["fsUsedBytes"] + reading["fsFreeBytes"] <= reading["fsTotalBytes"]
+
+
+def test_an_unstattable_disk_nulls_all_three_fields_together(tmp_path, monkeypatch):
+    """Together, not partially. A row carrying a size with no free space would
+    read as "plenty of room" to anything scanning the series for a trend, which
+    is the one wrong answer this row must never give."""
+    lines = []
+    monkeypatch.setattr(publish_costs, "log", lines.append)
+    monkeypatch.setattr(publish_costs.os, "statvfs",
+                        lambda p: (_ for _ in ()).throw(OSError("no such mount")))
+    root = tmp_path / "projects" / "-data-workspace"
+    _transcript(root, "session.jsonl", 6400.0)
+
+    reading = publish_costs.disk_reading(str(tmp_path / "projects"))
+    assert reading["fsTotalBytes"] is None
+    assert reading["fsFreeBytes"] is None
+    assert reading["fsUsedBytes"] is None
+    assert reading["transcriptBytes"] == 3          # still measured
+    assert any("could not stat" in line for line in lines)
+
+
+def test_merge_disk_appends_to_the_stored_series_oldest_first():
+    """The whole point of the change: the reading has to survive the pod that
+    took it. A publish that replaced the series instead of extending it would
+    leave exactly one row, which is the state that made the pruner question
+    unanswerable for four days."""
+    stored = [{"at": 100.0, "transcriptBytes": 1},
+              {"at": 300.0, "transcriptBytes": 3}]
+    merged = publish_costs.merge_disk(stored, {"at": 200.0, "transcriptBytes": 2})
+    assert [r["at"] for r in merged] == [100.0, 200.0, 300.0]
+
+
+def test_merge_disk_does_not_duplicate_a_reading_two_cycles_took_at_once():
+    """Cycles overlap now, so two publishes can land in the same second. Keyed
+    by `at` for the same reason `merge_quota` is."""
+    stored = [{"at": 100.0, "transcriptBytes": 1}]
+    merged = publish_costs.merge_disk(stored, {"at": 100.0, "transcriptBytes": 9})
+    assert len(merged) == 1
+    assert merged[0]["transcriptBytes"] == 9
+
+
+def test_merge_disk_drops_a_reading_with_no_time_on_it():
+    """A row with no `at` cannot be placed in a series and cannot be deduped;
+    silently keeping it would corrupt every later sort."""
+    assert publish_costs.merge_disk([{"at": 1.0}], None) == [{"at": 1.0}]
+    assert publish_costs.merge_disk([{"at": 1.0}], {"transcriptBytes": 5}) == [{"at": 1.0}]
+
+
+def test_a_publish_extends_the_stored_disk_series(tmp_path, monkeypatch):
+    """End to end through `build_payload`, because the wiring is where this
+    kind of change dies: the function can be perfect and never called."""
+    monkeypatch.setattr(publish_costs, "log", lambda *a: None)
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    stored = _stored("old1")
+    stored["disk"] = [{"at": 1.0, "transcriptBytes": 7}]
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: stored)
+
+    payload = publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+    assert [r["at"] for r in payload["disk"]][0] == 1.0
+    assert len(payload["disk"]) == 2
+    assert payload["disk"][-1]["transcriptBytes"] >= 0
+
+
+def test_a_publish_logs_the_free_space_next_to_the_window(tmp_path, monkeypatch):
+    """Both numbers in one line on purpose. Transcript bytes climbing while the
+    window stays flat means a pruner appeared; neither number says that alone,
+    and a cycle reading the pod log should not have to correlate two lines."""
+    lines = []
+    monkeypatch.setattr(publish_costs, "log", lines.append)
+    monkeypatch.setattr(publish_costs, "disk_reading", lambda d=None: {
+        "at": 5.0, "retentionHours": 2.0, "transcriptBytes": 221_000_000,
+        "fsUsedBytes": 52_000_000_000, "fsFreeBytes": 21_000_000_000,
+        "fsTotalBytes": 75_000_000_000})
+    monkeypatch.setattr(publish_costs.analytics, "scan",
+                        lambda d=None: [_scan_row("new", "2026-08-20T01:00:00Z", 1.0)])
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: _stored("old1"))
+
+    publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
+    assert any("disk holds 2.0h / 221MB of transcript, 21.0GB free" in line
+               for line in lines)
