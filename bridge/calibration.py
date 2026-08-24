@@ -1,6 +1,6 @@
 """What a cycle costs as a share of the subscription window, not as tokens.
 
-Edvard, 2026-08-09, on the cycle-rate arithmetic a previous cycle had put
+The owner, 2026-08-09, on the cycle-rate arithmetic a previous cycle had put
 in front of him: "I think you are a bit too confident with your
 calculations. You do not have 24 hours worth of data yet and a couple of
 cycles today did not even go through AND we experiments with fable 5 which

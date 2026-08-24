@@ -2,7 +2,7 @@
 
 `analytics.py` turns the CLI transcripts on the PVC into a per-cycle ledger,
 and `quota.py` appends a quota reading to `quota-history.jsonl` roughly once a
-minute. Between them they answer every question Edvard asked on 2026-08-08 --
+minute. Between them they answer every question the owner asked on 2026-08-08 --
 what a cycle costs, whether the cadence is sustainable, which lever is worth
 pulling. Both files have been complete and correct for days, and nobody has
 ever seen either of them, because of a fact that is easy to miss and settles

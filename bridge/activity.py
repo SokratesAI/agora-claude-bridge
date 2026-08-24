@@ -1,7 +1,7 @@
 """Narrates a live CLI session's tool calls back to agora-persona-runner,
 which turns each one into an inline Activity chip in the conversation.
 
-Edvard, on whether he wanted every tool call or only the ones that change
+The owner, on whether he wanted every tool call or only the ones that change
 something (2026-08-03): "All. I want to know whats going on. It takes away
 my feeling of control if everything is hidden."
 
@@ -231,7 +231,7 @@ class ActivityReporter:
         """A passage the persona wrote on its way to the answer.
 
         The reply used to be every text block the session produced, joined
-        together and handed over at the end -- so Edvard's phone got the
+        together and handed over at the end -- so the owner's phone got the
         whole internal monologue in one lump, after the fact, with the tool
         chips it belonged between already sitting above it. His words
         (2026-08-04): "how would you like to be presented a story? One does

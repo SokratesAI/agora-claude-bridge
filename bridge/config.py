@@ -16,7 +16,7 @@ BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
 CLAUDE_HOME = os.environ.get("CLAUDE_HOME", "/data/claude-home")
 SESSIONS_FILE = os.path.join(CLAUDE_HOME, "agora-sessions.json")
 
-# Per the interview with Edvard (2026-07-31): one persistent CLI session per
+# Per the interview with the owner (2026-07-31): one persistent CLI session per
 # Agora conversation, resumed via --resume across turns AND pod restarts.
 CLAUDE_WORKSPACE = os.environ.get("CLAUDE_WORKSPACE", "/data/workspace")
 

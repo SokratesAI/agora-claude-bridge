@@ -1,4 +1,4 @@
-"""Routing between Edvard's vault and Nova's own database.
+"""Routing between the owner's vault and Nova's own database.
 
 The runner's copy of this client (agora_runner/vault.py) has had these
 rules since 2026-08-11; this is the same rule in the bridge's copy, which
@@ -78,7 +78,7 @@ class TestDbFor:
             assert client.db_for(path) == "obsidian", path
 
     def test_single_file_targets_match_exactly_not_by_prefix(self, env):
-        """`journal-digest.md.bak` is Edvard's, not Nova's.
+        """`journal-digest.md.bak` is the owner's, not Nova's.
 
         The review finding on the runner's copy (#104). A tuple tested
         wholly with startswith answers a file merely *beginning* with a
@@ -195,7 +195,7 @@ class TestListingAcrossBothDatabases:
         assert docs[HIS_FILE][vault_tool._SRC_DB_KEY] == "obsidian"
 
     def test_assemble_prefers_the_source_database_over_the_predicted_one(self, env):
-        """A Nova file still sitting in Edvard's database mid-migration.
+        """A Nova file still sitting in the owner's database mid-migration.
 
         db_for says "nova"; it was really read from "obsidian", and that
         is where its chunks are. Deriving from the path here is how an
@@ -295,7 +295,7 @@ class TestDatabaseHealth:
             "projects/sokrates/projects/agora/nova/journal/138-cycle-121.md": "nova",
             "projects/sokrates/projects/agora/journal-digest.md": "nova",
             # The two regressions rather than examples. A `.bak` beside the
-            # digest is Edvard's file and must not follow it, and the Nova
+            # digest is the owner's file and must not follow it, and the Nova
             # folder he asked to keep is in *his* vault -- everything under
             # `agora/nova/` routes away, and this one does not live there.
             "projects/sokrates/projects/agora/journal-digest.md.bak": "obsidian",

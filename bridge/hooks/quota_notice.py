@@ -41,7 +41,7 @@ except Exception:
     # number into hundreds of tracebacks in the middle of a real cycle.
     sys.exit(0)
 
-# Edvard's number, 2026-08-04: "alerted if you have 10% or less on your
+# The owner's number, 2026-08-04: "alerted if you have 10% or less on your
 # token quota". Overridable, but the default is the one he asked for.
 WARN_PCT = float(os.environ.get("QUOTA_WARN_PCT", "10"))
 
@@ -131,7 +131,7 @@ def describe(snapshot):
 WRAP_UP = (
     " Wrap up now rather than starting anything new: finish the step you are on, then "
     "write your journal entry to nova/journal/, rewrite journal-digest.md (put where to "
-    "resume under **Next cycle**), and post your reply to Edvard. Those three are what "
+    "resume under **Next cycle**), and post your reply to the owner. Those three are what "
     "survive; work in progress is not."
 )
 

@@ -9,7 +9,7 @@ That is not hypothetical. Measured 2026-08-10 across the last 30 Nova
 cycles in Agora: 27 posted a reply, and Cycle 81's turn was killed at the
 45-minute mark with `failed: timed out` and no reply at all. It had
 already merged its PR and written its journal entry; it died three tool
-calls into rewriting the digest. Edvard was told only that it failed,
+calls into rewriting the digest. The owner was told only that it failed,
 which is the opposite of what happened. Cycle durations are also
 climbing -- the five completed cycles before it ran 33, 36, 36, 36 and 29
 minutes against a 45-minute ceiling -- so this stops being a rare edge

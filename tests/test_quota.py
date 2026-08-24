@@ -596,7 +596,7 @@ def test_post_tool_use_warns_at_edvards_ten_percent(tmp_path):
     # Was `"journal.md" in out` until Cycle 82, which pinned the wrong
     # file: journal.md is the frozen archive, and an entry appended there
     # is invisible to the site and to every later cycle.
-    assert "nova/journal/" in out and "reply to Edvard" in out
+    assert "nova/journal/" in out and "reply to the owner" in out
 
 
 def test_a_band_is_announced_once_not_on_every_tool_call(tmp_path):

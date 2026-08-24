@@ -21,7 +21,7 @@ from bridge.cli import (
 
 # How long to wait before retrying a turn that lost the OAuth refresh race
 # (cli.AUTH_EXPIRED) before picking it back up. Not tuned against a real
-# race caught live -- 7s sits inside the 5-10s Edvard asked for, long
+# race caught live -- 7s sits inside the 5-10s the owner asked for, long
 # enough that the winner's write to .credentials.json has almost certainly
 # landed (a token exchange is a single HTTP round trip), short enough that
 # a caller waiting on this reply doesn't notice much beyond normal latency.
@@ -157,7 +157,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
 
     restricted (2026-08-01, off by default): when true, blocks the full
     known tool roster (DISCOVERED_FULL_TOOL_ROSTER) for this call --
-    Edvard's call is that this service should be as capable as an
+    the owner's call is that this service should be as capable as an
     interactive Claude Code session by default, with restriction an
     explicit per-persona opt-in rather than a silent default.
 
@@ -186,7 +186,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     data}] the user sent with this message, `data` base64. Until this
     existed a claude-cli persona was the only one of the three providers
     that dropped them silently, which started mattering the moment Cycle
-    78 moved six of Edvard's personas onto this provider to stop them
+    78 moved six of the owner's personas onto this provider to stop them
     billing the metered API. See cli.write_stream_json_input.
 
     allow_concurrent (2026-08-10, off by default): let this turn run

@@ -2,7 +2,7 @@
 
 Cycle 20 read the CLI's own credentials file to see what auth we had and
 printed it. The full OAuth access *and* refresh tokens went into that
-session's tool output. They did not reach Edvard's conversation only
+session's tool output. They did not reach the owner's conversation only
 because the output half of the narration was still sitting in an unmerged
 PR -- the one this module ships with. Merging that PR without this one
 would turn a careless `print` into a published, permanently stored secret.
@@ -12,7 +12,7 @@ nameable, it has already happened once, and the material is verbatim
 machine output that nobody reviewed before it was sent. It is deliberately
 NOT a general "looks sensitive" heuristic -- every pattern below matches a
 credential format, not a topic, and a redaction is always visible as
-`[redacted: <what>]` rather than a silent deletion. Edvard's standing rule
+`[redacted: <what>]` rather than a silent deletion. The owner's standing rule
 is that nothing gets thrown away to make the UI tidier; the answer to "too
 much output" is an interface, not a filter. A live token is the exception,
 and it is the only one.

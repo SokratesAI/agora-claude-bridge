@@ -6,7 +6,7 @@ not answer. One return value for both, and `get` printed
 `[not found: <path>]` for either.
 
 The reader that makes this expensive is Nova itself. This CLI is how a
-cycle reads its own instructions, its journal and Edvard's capture files
+cycle reads its own instructions, its journal and the owner's capture files
 at the start of every run, and `[not found]` is a fact a cycle acts on --
 it has written a missing file into the permanent record before. The
 listing half of this was fixed in runner#117, and two comments in
