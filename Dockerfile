@@ -32,7 +32,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
 # identical, and every field cli.py reads (`id`/`name`/`input` on tool_use,
 # `tool_use_id`/`is_error` on tool_result, `rate_limit_info`, `session_id`)
 # was present under the same name.
-ARG CLAUDE_CODE_VERSION=2.1.226
+#
+# Re-run 2026-08-25 for 2.1.226 -> 2.1.245, same prompt through both binaries.
+# The *set* of message and content-block types is identical; 2.1.245 emits more
+# `system` events and orders `rate_limit_event` earlier, neither of which cli.py
+# keys on. Content-block field names are byte-identical on all four block types.
+# Top-level keys are a superset with one removal: `messaging_socket_path` is
+# gone, and it is read nowhere in this repo (grep: 0 hits). Every field the
+# comment above names is still present under the same name.
+#
+# One thing this bump does not change and should be fixed separately: the
+# package has declared `engines.node >= 22` since at least 2.1.226, and
+# NODE_MAJOR above is 20. npm warns and the binary works -- measured on both
+# versions -- but we are running it outside its supported range either way.
+ARG CLAUDE_CODE_VERSION=2.1.245
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # kubectl -- 2026-08-01 design call: this service should be as capable as
