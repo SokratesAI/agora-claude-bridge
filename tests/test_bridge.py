@@ -2685,3 +2685,37 @@ def test_generate_passes_the_conversation_id_on_the_stateless_path(tmp_path):
     with patch.object(server, "run_turn", side_effect=fake_run_turn):
         server.generate("conv-456", "system", "prompt", stateless=True)
     assert captured["conversation_id"] == "conv-456"
+
+
+def test_run_turn_raises_the_bash_and_task_result_caps(tmp_path):
+    """A tool result over the CLI's default 30_000 chars is replaced by a
+    ~2KB preview, and a subagent report over 32_000 loses its *beginning*
+    unrecoverably. Both defaults are far below what one vault file costs, so
+    the turn asks for the CLI's own ceiling instead."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello")
+    env = captured["env"]
+    assert env["BASH_MAX_OUTPUT_LENGTH"] == "150000"
+    assert env["TASK_MAX_OUTPUT_LENGTH"] == "160000"
+
+
+def test_result_caps_stay_inside_the_cli_ceiling(tmp_path):
+    """The CLI clamps either variable to its own upper limit and logs
+    "Capped from X to Y" (2.1.245). A value above the ceiling would not
+    break anything, it would silently mean the ceiling -- so a number here
+    that no longer matches what the CLI accepts is a number nobody is
+    reading. Pin both, so raising one is a deliberate edit."""
+    assert cli.BASH_MAX_OUTPUT_LENGTH == 150_000
+    assert cli.TASK_MAX_OUTPUT_LENGTH == 160_000
