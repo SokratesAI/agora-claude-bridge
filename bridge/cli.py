@@ -93,9 +93,11 @@ MCP_CONFIG_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-mcp.config.json")
 MCP_SERVER_NAME = "agora"
 
 # How much of a tool result reaches the model before the CLI cuts it, in
-# characters. Both are the CLI's own documented ceiling on 2.1.245, read out
-# of the binary rather than guessed: the validator clamps anything larger
-# and logs "Capped from X to Y", so asking for more is a no-op, not a risk.
+# characters. Both are the CLI's own ceiling on 2.1.245, measured rather than
+# read off documentation -- `claude doctor` with 999999 in each prints
+# "Capped from 999999 to 150000" and "... to 160000", and prints nothing at
+# all for the two values below. So the CLI reads both variables, these are
+# exactly its limits, and asking for more is a no-op rather than a risk.
 #
 #   BASH_MAX_OUTPUT_LENGTH  default  30_000, upper limit 150_000
 #   TASK_MAX_OUTPUT_LENGTH  default  32_000, upper limit 160_000
@@ -107,6 +109,12 @@ MCP_SERVER_NAME = "agora"
 # its *last* N characters and stamped "the earlier part of the report is not
 # retrievable" -- the beginning of the report, which is where a brief's first
 # heading sits, is gone for good.
+#
+# Set only when the environment does not already carry one, unlike the four
+# values beside them below: HOME and CLAUDE_CONFIG_DIR are things this bridge
+# has to control, while these two are a tuning knob, and clobbering a number
+# somebody put in the Deployment on purpose would make that number a lie with
+# nothing anywhere saying so.
 #
 # Left alone deliberately: MAX_MCP_OUTPUT_TOKENS (default 25_000 tokens) and
 # the per-tool `_meta["anthropic/maxResultSizeChars"]` an MCP server can
@@ -557,9 +565,9 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # a None and a turn that does not care is byte-identical to before.
     env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir,
            "NOVA_WORKSPACE": workspace,
-           "AGORA_CONVERSATION_ID": conversation_id or "",
-           "BASH_MAX_OUTPUT_LENGTH": str(BASH_MAX_OUTPUT_LENGTH),
-           "TASK_MAX_OUTPUT_LENGTH": str(TASK_MAX_OUTPUT_LENGTH)}
+           "AGORA_CONVERSATION_ID": conversation_id or ""}
+    env.setdefault("BASH_MAX_OUTPUT_LENGTH", str(BASH_MAX_OUTPUT_LENGTH))
+    env.setdefault("TASK_MAX_OUTPUT_LENGTH", str(TASK_MAX_OUTPUT_LENGTH))
 
     # Only a turn that actually carries attachments switches to stdin. The
     # text path is what every Nova cycle and every ordinary chat turn runs,

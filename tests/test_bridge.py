@@ -2719,3 +2719,28 @@ def test_result_caps_stay_inside_the_cli_ceiling(tmp_path):
     reading. Pin both, so raising one is a deliberate edit."""
     assert cli.BASH_MAX_OUTPUT_LENGTH == 150_000
     assert cli.TASK_MAX_OUTPUT_LENGTH == 160_000
+
+
+def test_a_result_cap_set_in_the_environment_wins(tmp_path):
+    """These two are a tuning knob, not something the bridge has to own the
+    way HOME and CLAUDE_CONFIG_DIR are. A number somebody put in the
+    Deployment has to survive, or it is a setting that reads as applied and
+    silently is not."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc(lines)
+
+    with patch.dict(os.environ, {"BASH_MAX_OUTPUT_LENGTH": "40000"}), \
+         patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello")
+    assert captured["env"]["BASH_MAX_OUTPUT_LENGTH"] == "40000"
+    # the one nobody overrode still gets the ceiling
+    assert captured["env"]["TASK_MAX_OUTPUT_LENGTH"] == "160000"
