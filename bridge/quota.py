@@ -467,6 +467,21 @@ DEADLINE_HOOK_SCRIPT = os.path.join(HOOKS_DIR, "deadline_notice.py")
 # rather than joining the two notices on theirs.
 METERED_GUARD_SCRIPT = os.path.join(HOOKS_DIR, "metered_guard.py")
 HOOK_SETTINGS_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-hooks.settings.json")
+# The CLI's own file-based memory tool is on by default and keyed on the
+# *working directory*: with nothing set it resolves to
+# ~/.claude/projects/<sanitized-cwd>/memory/. A concurrent turn's cwd is
+# /data/workspace-concurrent/<slot>-<thread ident>, a path minted once and
+# never seen again, so every cycle was handed a brand-new empty memory
+# directory and told in its system prompt to write to it. Measured on this
+# PVC 2026-08-27 (Cycle 505): 52 of the 56 project directories are
+# concurrent slots, and all 17 memory/ directories under them are empty.
+# `autoMemoryDirectory` is returned verbatim by the CLI's resolver -- it
+# does not append the project key -- so pinning it here is what makes the
+# memory one directory for the whole loop instead of one per cycle. It has
+# to ride this file rather than a checked-in .claude/settings.json: the CLI
+# ignores the key in projectSettings on purpose, and honours it from the
+# --settings file this function writes.
+AUTO_MEMORY_DIR = os.path.join(CLAUDE_HOME, "nova-memory")
 
 
 def write_hook_settings(path=None):
@@ -503,7 +518,7 @@ def write_hook_settings(path=None):
         # ignored under the same flag. That is why the guard is a hook
         # and not two lines of config.
         "PreToolUse": guard,
-    }}
+    }, "autoMemoryDirectory": AUTO_MEMORY_DIR}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
