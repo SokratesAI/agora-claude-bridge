@@ -9,6 +9,7 @@ on all 300 tool calls is as useless as one that never fires, just
 expensive instead of silent.
 """
 import datetime
+import os
 import io
 import json
 import time
@@ -656,6 +657,45 @@ def test_hook_settings_registers_both_events(tmp_path):
     assert set(hooks) == {"UserPromptSubmit", "PostToolUse", "PreToolUse"}
     assert hooks["PostToolUse"][0]["matcher"] == "*"
     assert quota.HOOK_SCRIPT in hooks["PostToolUse"][0]["hooks"][0]["command"]
+
+
+def test_hook_settings_pins_the_auto_memory_directory(tmp_path):
+    """Without this key the CLI keys its memory on the cwd, and a concurrent
+    turn's cwd is a slot path minted once and never reused -- so every cycle
+    got an empty memory directory of its own and nothing survived."""
+    path = quota.write_hook_settings(str(tmp_path / "s.json"))
+    settings = json.load(open(path))
+    assert settings["autoMemoryDirectory"] == quota.AUTO_MEMORY_DIR
+    # Not under .claude/projects/<cwd>/ -- that tree is exactly the per-cwd
+    # default this key exists to replace.
+    assert os.path.join(".claude", "projects") not in quota.AUTO_MEMORY_DIR
+
+
+def test_auto_memory_directory_does_not_move_with_the_workspace(tmp_path):
+    """The invariant, stated as the failure it prevents: two turns running
+    from two different concurrent workspaces must be handed the same memory
+    directory.
+
+    This reloads the module under each cwd rather than just chdir-ing. The
+    first draft did not, and it passed against a mutation that put the cwd
+    back into the path -- because the constant is computed at import, so one
+    process only ever sees one cwd. A test that cannot fail against the bug
+    it names is worth less than no test."""
+    import importlib
+
+    seen = []
+    try:
+        for name in ("ws-a", "ws-b"):
+            cwd = tmp_path / name
+            cwd.mkdir()
+            os.chdir(cwd)
+            reloaded = importlib.reload(quota)
+            path = reloaded.write_hook_settings(str(tmp_path / f"s.{name}.json"))
+            seen.append(json.load(open(path))["autoMemoryDirectory"])
+    finally:
+        os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        importlib.reload(quota)
+    assert seen[0] == seen[1]
 
 
 def test_hook_settings_failure_degrades_to_no_hook(tmp_path):
