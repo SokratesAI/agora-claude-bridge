@@ -2702,9 +2702,18 @@ def test_run_turn_raises_the_bash_and_task_result_caps(tmp_path):
         captured["env"] = kwargs["env"]
         return FakeProc(lines)
 
-    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+    with patch.dict(os.environ), \
+         patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        # Clearing these is the whole test, not housekeeping. `env` is built
+        # from os.environ, the CLI passes it to every Bash tool it spawns,
+        # and this suite is run *by* a cycle inside that CLI -- so once this
+        # ships, os.environ already carries both values and the assertions
+        # below pass with the wiring deleted. Found by the reviewer on #77,
+        # after I had merged it.
+        os.environ.pop("BASH_MAX_OUTPUT_LENGTH", None)
+        os.environ.pop("TASK_MAX_OUTPUT_LENGTH", None)
         cli.run_turn("hello")
     env = captured["env"]
     assert env["BASH_MAX_OUTPUT_LENGTH"] == "150000"
@@ -2740,7 +2749,57 @@ def test_a_result_cap_set_in_the_environment_wins(tmp_path):
          patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        os.environ.pop("TASK_MAX_OUTPUT_LENGTH", None)
         cli.run_turn("hello")
     assert captured["env"]["BASH_MAX_OUTPUT_LENGTH"] == "40000"
     # the one nobody overrode still gets the ceiling
     assert captured["env"]["TASK_MAX_OUTPUT_LENGTH"] == "160000"
+
+
+def test_a_blank_result_cap_is_not_an_override(tmp_path):
+    """`setdefault` reads "" as present; the CLI reads "" as unset and drops
+    to its own 30,000. So an empty value in the Deployment would put the cap
+    back at the default while every other artefact here says 150,000 --
+    a setting that reads as applied and silently is not."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc(lines)
+
+    with patch.dict(os.environ, {"BASH_MAX_OUTPUT_LENGTH": "",
+                                 "TASK_MAX_OUTPUT_LENGTH": "   "}), \
+         patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello")
+    assert captured["env"]["BASH_MAX_OUTPUT_LENGTH"] == "150000"
+    assert captured["env"]["TASK_MAX_OUTPUT_LENGTH"] == "160000"
+
+
+def test_a_cut_tool_result_says_it_was_cut():
+    """Before bridge#77 anything long enough to reach this slice had already
+    been replaced by the CLI's own self-describing "Output too large ...
+    saved to <path>" preview. Raising the Bash cap past 20,000 makes this
+    the first cut, so it has to name itself or the chip is quietly missing
+    most of the result."""
+    from bridge import activity
+    big = "x" * (activity.OUTPUT_CHARS_MAX + 500)
+    out = activity.result_text({"content": big})
+    assert out.startswith("x" * 100)
+    assert "the full result was 20,500 characters" in out
+    # and it still fits Agora's ceiling, or the far end slices the marker off
+    assert len(out) == activity.OUTPUT_CHARS_MAX
+
+    blocks = activity.result_text({"content": [{"type": "text", "text": big}]})
+    assert "the full result was 20,500 characters" in blocks
+
+
+def test_a_short_tool_result_is_untouched():
+    from bridge import activity
+    assert activity.result_text({"content": "hello"}) == "hello"
+    assert "not shown" not in activity.result_text({"content": "hello"})
