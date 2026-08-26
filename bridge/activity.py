@@ -123,7 +123,7 @@ def result_text(block):
     """
     content = block.get("content")
     if isinstance(content, str):
-        return content[:OUTPUT_CHARS_MAX]
+        return _clip(content)
     if not isinstance(content, list):
         return ""
     parts = []
@@ -134,7 +134,32 @@ def result_text(block):
             parts.append(str(item.get("text", "")))
         elif item.get("type"):
             parts.append(f"[{item['type']}]")
-    return "\n".join(parts)[:OUTPUT_CHARS_MAX]
+    return _clip("\n".join(parts))
+
+
+def _clip(text):
+    """Cut to OUTPUT_CHARS_MAX and say so when it happened.
+
+    A silent slice used to be nearly harmless here, because anything big
+    enough to hit it had already been replaced upstream by the CLI's own
+    "Output too large ... full output saved to <path>" preview, which is
+    self-describing. Raising BASH_MAX_OUTPUT_LENGTH to 150_000 (bridge#77)
+    moved that boundary past this one, so a large result now arrives whole
+    and this is the first place it is cut -- with nothing on the chip saying
+    it was. That is the one property this module exists to protect: "I want
+    to know whats going on in every corner of this system", and a result
+    that is quietly missing 130KB does not say what is going on.
+    """
+    if len(text) <= OUTPUT_CHARS_MAX:
+        return text
+    # The marker goes *inside* the budget, not after it. OUTPUT_CHARS_MAX is
+    # Agora's AuditStore.CONTENT_CHARS_MAX applied one hop early, and Agora
+    # slices on arrival -- so a marker appended past the ceiling is the first
+    # thing the far end throws away, which is the silent cut again wearing a
+    # fix. Its width depends only on len(text), so the total is exactly
+    # OUTPUT_CHARS_MAX and never a character more.
+    marker = f"\n[... cut here; the full result was {len(text):,} characters]"
+    return text[:OUTPUT_CHARS_MAX - len(marker)] + marker
 
 
 # The fields carrying text a human will read. `token` is deliberately not

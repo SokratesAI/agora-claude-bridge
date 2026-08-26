@@ -566,8 +566,22 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir,
            "NOVA_WORKSPACE": workspace,
            "AGORA_CONVERSATION_ID": conversation_id or ""}
-    env.setdefault("BASH_MAX_OUTPUT_LENGTH", str(BASH_MAX_OUTPUT_LENGTH))
-    env.setdefault("TASK_MAX_OUTPUT_LENGTH", str(TASK_MAX_OUTPUT_LENGTH))
+    # A blank value is *not* an override, and the difference is silent in
+    # both directions: `setdefault` treats "" as present and leaves it, while
+    # the CLI treats "" as unset and falls back to its own 30_000 -- so an
+    # empty string in the Deployment would put the cap back at the default
+    # while the constant, the comment above and the tests all read 150_000.
+    # Measured on 2.1.245 with `claude doctor`: "" prints nothing at all,
+    # i.e. unset; "abc" prints `Invalid value "abc" (using default: 30000)`.
+    for name, ceiling in (("BASH_MAX_OUTPUT_LENGTH", BASH_MAX_OUTPUT_LENGTH),
+                          ("TASK_MAX_OUTPUT_LENGTH", TASK_MAX_OUTPUT_LENGTH)):
+        if not env.get(name, "").strip():
+            env[name] = str(ceiling)
+    # Logged because this is the one value here somebody can change from
+    # outside the image. An override that took effect and an override that
+    # was ignored look identical from anywhere else.
+    log("tool result caps: BASH={} TASK={}".format(
+        env["BASH_MAX_OUTPUT_LENGTH"], env["TASK_MAX_OUTPUT_LENGTH"]))
 
     # Only a turn that actually carries attachments switches to stdin. The
     # text path is what every Nova cycle and every ordinary chat turn runs,
