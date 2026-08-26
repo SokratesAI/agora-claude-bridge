@@ -458,6 +458,14 @@ HOOK_SCRIPT = os.path.join(HOOKS_DIR, "quota_notice.py")
 # the same two events because it solves the same problem on a different
 # axis -- a cycle could see its quota but not its clock.
 DEADLINE_HOOK_SCRIPT = os.path.join(HOOKS_DIR, "deadline_notice.py")
+# The third hook is not a notice at all -- it is the owner's rule 9
+# (production never spends the metered Anthropic balance) moved out of
+# markdown and out of the runner's own code into the harness, per his
+# idea #104. It rides this settings file because this is the only
+# mechanism the bridge has for attaching anything to a CLI invocation,
+# but it is a PreToolUse *decision*, so it gets its own event below
+# rather than joining the two notices on theirs.
+METERED_GUARD_SCRIPT = os.path.join(HOOKS_DIR, "metered_guard.py")
 HOOK_SETTINGS_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-hooks.settings.json")
 
 
@@ -480,7 +488,22 @@ def write_hook_settings(path=None):
         {"type": "command", "command": f"{sys.executable} {script}", "timeout": 10}
         for script in (HOOK_SCRIPT, DEADLINE_HOOK_SCRIPT)
     ]}]
-    settings = {"hooks": {"UserPromptSubmit": entry, "PostToolUse": entry}}
+    guard = [{"matcher": "*", "hooks": [
+        {"type": "command",
+         "command": f"{sys.executable} {METERED_GUARD_SCRIPT}",
+         "timeout": 10},
+    ]}]
+    settings = {"hooks": {
+        "UserPromptSubmit": entry,
+        "PostToolUse": entry,
+        # Measured Cycle 500 on CLI 2.1.245: a PreToolUse hook's
+        # "deny" decision is honoured even under
+        # --dangerously-skip-permissions, and a permissions.deny rule
+        # carrying a parameter specifier on an MCP tool is silently
+        # ignored under the same flag. That is why the guard is a hook
+        # and not two lines of config.
+        "PreToolUse": guard,
+    }}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:

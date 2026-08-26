@@ -653,7 +653,7 @@ def test_hook_is_silent_on_unreadable_stdin(tmp_path):
 def test_hook_settings_registers_both_events(tmp_path):
     path = quota.write_hook_settings(str(tmp_path / "s.json"))
     hooks = json.load(open(path))["hooks"]
-    assert set(hooks) == {"UserPromptSubmit", "PostToolUse"}
+    assert set(hooks) == {"UserPromptSubmit", "PostToolUse", "PreToolUse"}
     assert hooks["PostToolUse"][0]["matcher"] == "*"
     assert quota.HOOK_SCRIPT in hooks["PostToolUse"][0]["hooks"][0]["command"]
 
