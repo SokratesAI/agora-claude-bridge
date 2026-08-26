@@ -36,6 +36,27 @@ _PATTERNS = (
     # ServiceAccount tokens both take this shape.
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
     ("aws key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    # Google API keys, in both of the two shapes this estate has seen: the
+    # classic `AIza` + 35 base64url characters (39 long), and the newer
+    # `AQ.` + 50 that Google AI Studio issues now. This is the one
+    # credential here that has been seen printed with no name beside it --
+    # `GEMINI_API_KEY` in the runner pod carries a trailing newline,
+    # `urllib` refuses a header value containing one, and the exception it
+    # raises quotes the whole header value back. A traceback has no `NAME=`
+    # in it, so the value pattern at the bottom of this table cannot see it,
+    # and every other pattern here is for a different vendor.
+    #
+    # The second alternative is the reason this comment is long. Cycle 503
+    # wrote the `AIza` half first, from the documented format and gitleaks'
+    # own `gcp-api-key` rule, then measured the live key in the runner pod
+    # rather than trusting either: it is 53 characters, starts `AQ.`, and
+    # the `AIza` pattern does not match it. A rule that covers the format
+    # in the documentation and not the key on the box is a filter that
+    # reports itself working while guarding nothing. Measured without
+    # printing the value -- length, prefix and character class only.
+    ("google api key", re.compile(
+        r"AIza[0-9A-Za-z_\-]{35}"
+        r"|AQ\.[0-9A-Za-z_\-]{40,}")),
     ("private key", re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
         re.DOTALL,

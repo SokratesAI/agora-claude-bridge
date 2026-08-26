@@ -42,6 +42,41 @@ def test_jwt_shaped_tokens_are_redacted():
     assert "[redacted: jwt]" in out
 
 
+def test_a_google_key_with_no_name_beside_it_is_redacted():
+    """The traceback case in the owner's idea #106, in both key formats.
+
+    `GEMINI_API_KEY` carries a trailing newline in the runner pod; `urllib`
+    refuses a header value containing one and quotes the whole value back in
+    the exception. A traceback has no `NAME=` in it, so the name-anchored
+    value pattern cannot see it and only a format pattern can.
+
+    Both shapes are here because only one of them is on this box. Cycle 503
+    wrote the documented `AIza` form first and then measured the live key:
+    53 characters, starting `AQ.`, which the documented form does not match.
+    """
+    classic = "AIza" + "Sy" + "D" + "0" * 34          # 39, the documented form
+    current = "AQ" + "." + "e" * 50                   # 53, what AI Studio issues now
+    for key in (classic, current):
+        out = redact("ValueError: Invalid header value b'%s\\n'" % key)
+        assert key not in out
+        assert "[redacted: google api key]" in out
+        assert out.startswith("ValueError: Invalid header value b'")
+
+
+def test_a_sentence_that_merely_starts_like_a_google_key_is_left_alone():
+    """`AQ.` is a short prefix, so the length floor is what keeps it honest."""
+    for text in ("The queue drained: AQ. Then the job exited.",
+                 # This is the one that actually bites the floor: seven
+                 # base64url characters run on from the dot, so a floor set
+                 # anywhere below 40 eats it. Cycle 503 shipped the sentence
+                 # above first, then mutated the floor to {2,} and watched
+                 # this test stay green -- a space follows that `AQ.`, so no
+                 # floor could ever have been tested by it.
+                 "rollback is covered in AQ.section 4 of the runbook",
+                 "AIzaSy is a prefix, not a credential."):
+        assert redact(text) == text
+
+
 def test_private_key_blocks_are_redacted_whole():
     key = ("-----BEGIN RSA PRIVATE KEY-----\n"
            "MIIEowIBAAKCAQEAx7Vn9lQ2\naGVsbG8gd29ybGQK\n"
