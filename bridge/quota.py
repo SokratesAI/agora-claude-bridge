@@ -470,24 +470,56 @@ HOOK_SETTINGS_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-hooks.settings
 # The CLI's own file-based memory tool is on by default and keyed on the
 # *working directory*: with nothing set it resolves to
 # ~/.claude/projects/<sanitized-cwd>/memory/. A concurrent turn's cwd is
-# /data/workspace-concurrent/<slot>-<thread ident>, a path minted once and
-# never seen again, so every cycle was handed a brand-new empty memory
-# directory and told in its system prompt to write to it. Measured on this
-# PVC 2026-08-27 (Cycle 505): 52 of the 56 project directories are
-# concurrent slots, and all 17 memory/ directories under them are empty.
-# `autoMemoryDirectory` is returned verbatim by the CLI's resolver -- it
-# does not append the project key -- so pinning it here is what makes the
-# memory one directory for the whole loop instead of one per cycle. It has
-# to ride this file rather than a checked-in .claude/settings.json: the CLI
-# ignores the key in projectSettings on purpose, and honours it from the
-# --settings file this function writes.
+# /data/workspace-concurrent/<slot>-<thread ident>, which is unstable across
+# cycles -- not single-use, as this comment claimed on the way in: slot paths
+# do recur, and the busiest project directory on the PVC carries 18 sessions.
+# Unstable is enough to break it. Measured 2026-08-27 (Cycle 505): 52 of the
+# 56 project directories are concurrent slots and all 17 memory/ directories
+# under them are empty.
+#
+# Calibration that belongs beside the number, because the number does not
+# prove the diagnosis: `.claude/projects/-data-workspace/memory` is a stable,
+# reused path and is *also* empty. Roughly five sessions have run under it,
+# so the sample refutes nothing either way -- but "the model does not write
+# memories unprompted" is a live alternative explanation that would make this
+# setting inert, and nothing here would tell the difference afterwards. The
+# prediction that grades it is in research/cli-memory-and-context-editing-2026-08.md.
+#
+# `autoMemoryDirectory` is returned verbatim by the CLI's resolver -- it does
+# not append the project key -- so pinning it is what makes the memory one
+# directory across cycles instead of one per cycle. Two things measured on
+# CLI 2.1.245 that decide the shape here:
+#
+#  - The CLI validates the value and *silently* falls back to the per-cwd
+#    default if it is empty, relative, or shorter than three characters --
+#    no warning anywhere. So this constant being absolute is load-bearing,
+#    and the tests assert the literal rather than comparing the code to
+#    itself.
+#  - It is honoured from the --settings file this function writes
+#    (flagSettings), which outranks a checked-in .claude/settings.json.
+#    An earlier version of this comment said the CLI *ignores* the key in
+#    projectSettings; that is what the CLI's own schema string says and it
+#    is false in the way we run it -- measured under
+#    --dangerously-skip-permissions, a projectSettings-only value moved the
+#    directory. flagSettings still wins, so the pin holds; the reason it has
+#    to live here is precedence, not a refusal.
 AUTO_MEMORY_DIR = os.path.join(CLAUDE_HOME, "nova-memory")
 
 
-def write_hook_settings(path=None):
+def write_hook_settings(path=None, memory_dir=None):
     """Generate the --settings file that attaches the bridge's hooks, and
     return its path (or "" if it could not be written, which the caller
     treats as "run without the hooks").
+
+    `memory_dir` pins the CLI's auto-memory directory, and it is a parameter
+    rather than an unconditional constant because **this file is written for
+    every turn of every conversation the bridge serves**, not only for Nova
+    cycles -- six of the owner's own personas run on this provider. The CLI
+    prepends MEMORY.md to the first user turn under an explicit "these
+    instructions OVERRIDE any default behavior" framing, so one shared
+    directory would make a note Nova wrote to itself a standing instruction
+    to his chat personas, and the reverse. Caller decides; cli.py passes it
+    only when the opening message is a cycle.
 
     Passed per invocation with --settings rather than merged into
     ~/.claude/settings.json on purpose: that file is persistent user
@@ -518,7 +550,9 @@ def write_hook_settings(path=None):
         # ignored under the same flag. That is why the guard is a hook
         # and not two lines of config.
         "PreToolUse": guard,
-    }, "autoMemoryDirectory": AUTO_MEMORY_DIR}
+    }}
+    if memory_dir:
+        settings["autoMemoryDirectory"] = memory_dir
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:

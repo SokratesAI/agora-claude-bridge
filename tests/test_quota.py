@@ -661,14 +661,56 @@ def test_hook_settings_registers_both_events(tmp_path):
 
 def test_hook_settings_pins_the_auto_memory_directory(tmp_path):
     """Without this key the CLI keys its memory on the cwd, and a concurrent
-    turn's cwd is a slot path minted once and never reused -- so every cycle
-    got an empty memory directory of its own and nothing survived."""
-    path = quota.write_hook_settings(str(tmp_path / "s.json"))
+    turn's cwd is unstable across cycles -- so nothing survived.
+
+    Asserted against the literal, not against the constant. Comparing the
+    settings value to `quota.AUTO_MEMORY_DIR` compares the code to itself and
+    passes under every mutation that keeps the value constant -- including
+    "", "nova-memory" and "/", each of which the CLI's own validator drops
+    *silently*, putting production back on the per-cwd default with no
+    warning anywhere. Measured on CLI 2.1.245."""
+    path = quota.write_hook_settings(str(tmp_path / "s.json"),
+                                     memory_dir=quota.AUTO_MEMORY_DIR)
     settings = json.load(open(path))
-    assert settings["autoMemoryDirectory"] == quota.AUTO_MEMORY_DIR
-    # Not under .claude/projects/<cwd>/ -- that tree is exactly the per-cwd
-    # default this key exists to replace.
-    assert os.path.join(".claude", "projects") not in quota.AUTO_MEMORY_DIR
+    assert settings["autoMemoryDirectory"] == "/data/claude-home/nova-memory"
+    # The three properties the CLI validator rejects on, stated separately so
+    # a failure says which one broke.
+    assert os.path.isabs(settings["autoMemoryDirectory"])
+    assert len(settings["autoMemoryDirectory"]) >= 3
+    assert os.path.join(".claude", "projects") not in settings["autoMemoryDirectory"]
+
+
+def test_hook_settings_omits_the_memory_key_for_a_non_cycle_turn(tmp_path):
+    """This file is written for every turn of every conversation the bridge
+    serves. The CLI prepends MEMORY.md to the first user turn under an
+    "instructions OVERRIDE any default behavior" framing, so a shared
+    directory would hand Nova's notes to itself to the owner's own personas.
+    A turn that is not a cycle gets no pin at all."""
+    path = quota.write_hook_settings(str(tmp_path / "s.json"))
+    assert "autoMemoryDirectory" not in json.load(open(path))
+
+
+def test_cli_passes_the_memory_pin_only_for_a_cycle():
+    """The wiring mutation, which is the first one to run on a change whose
+    whole content is "call X from Y": deleting the argument at the call site
+    leaves every test above green, because they all call the function
+    directly.
+
+    This reads the source rather than driving `_run_cli_once`, and that is a
+    real limit worth stating: it pins that the call site names `memory_dir`
+    and gates it on `is_cycle_opening`, not that the resulting file is right
+    for a real turn. It fails if the wire is cut, which is the failure this
+    change can actually have."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "bridge", "cli.py")).read()
+    call = src[src.index("hook_settings = write_hook_settings("):]
+    call = call[:call.index("\n    )") + 6]
+    assert "memory_dir=" in call
+    assert "is_cycle_opening(message)" in call
+    assert "quota.AUTO_MEMORY_DIR" in call
+    # A turn that is not a cycle must reach the None branch, not a second
+    # directory: two pins would be the cross-contamination again, renamed.
+    assert "else None" in call
 
 
 def test_auto_memory_directory_does_not_move_with_the_workspace(tmp_path):
@@ -690,12 +732,13 @@ def test_auto_memory_directory_does_not_move_with_the_workspace(tmp_path):
             cwd.mkdir()
             os.chdir(cwd)
             reloaded = importlib.reload(quota)
-            path = reloaded.write_hook_settings(str(tmp_path / f"s.{name}.json"))
+            path = reloaded.write_hook_settings(str(tmp_path / f"s.{name}.json"),
+                                                memory_dir=reloaded.AUTO_MEMORY_DIR)
             seen.append(json.load(open(path))["autoMemoryDirectory"])
     finally:
         os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         importlib.reload(quota)
-    assert seen[0] == seen[1]
+    assert seen[0] == seen[1] == "/data/claude-home/nova-memory"
 
 
 def test_hook_settings_failure_degrades_to_no_hook(tmp_path):

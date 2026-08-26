@@ -623,7 +623,15 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # between that truncate and the json.dump. Losing the quota and
     # deadline hooks is silent; the turn just stops being able to see its
     # own budget.
-    hook_settings = write_hook_settings(_slotted(quota.HOOK_SETTINGS_FILE, slot))
+    # The memory pin goes only to a cycle. `write_hook_settings` is called
+    # for every turn of every conversation this bridge serves, and the CLI
+    # injects MEMORY.md into the first user turn as an override instruction
+    # -- so handing one directory to all of them would cross Nova's notes to
+    # itself with the owner's own personas.
+    hook_settings = write_hook_settings(
+        _slotted(quota.HOOK_SETTINGS_FILE, slot),
+        memory_dir=quota.AUTO_MEMORY_DIR if is_cycle_opening(message) else None,
+    )
     if hook_settings:
         cmd.extend(["--settings", hook_settings])
     # Agora's own capability tools (vault_read, kubectl_read, create_pr,
