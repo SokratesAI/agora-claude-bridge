@@ -92,6 +92,38 @@ MCP_CONFIG_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-mcp.config.json")
 # the model as mcp__agora__<tool_name>.
 MCP_SERVER_NAME = "agora"
 
+# How much of a tool result reaches the model before the CLI cuts it, in
+# characters. Both are the CLI's own ceiling on 2.1.245, measured rather than
+# read off documentation -- `claude doctor` with 999999 in each prints
+# "Capped from 999999 to 150000" and "... to 160000", and prints nothing at
+# all for the two values below. So the CLI reads both variables, these are
+# exactly its limits, and asking for more is a no-op rather than a risk.
+#
+#   BASH_MAX_OUTPUT_LENGTH  default  30_000, upper limit 150_000
+#   TASK_MAX_OUTPUT_LENGTH  default  32_000, upper limit 160_000
+#
+# The two failures are not the same and only one of them loses data. Over
+# the Bash limit the CLI writes the whole result to a file under the session
+# directory and shows a ~2KB preview with the path, so the bytes survive and
+# a second call gets them. Over the Task limit a subagent's report is cut to
+# its *last* N characters and stamped "the earlier part of the report is not
+# retrievable" -- the beginning of the report, which is where a brief's first
+# heading sits, is gone for good.
+#
+# Set only when the environment does not already carry one, unlike the four
+# values beside them below: HOME and CLAUDE_CONFIG_DIR are things this bridge
+# has to control, while these two are a tuning knob, and clobbering a number
+# somebody put in the Deployment on purpose would make that number a lie with
+# nothing anywhere saying so.
+#
+# Left alone deliberately: MAX_MCP_OUTPUT_TOKENS (default 25_000 tokens) and
+# the per-tool `_meta["anthropic/maxResultSizeChars"]` an MCP server can
+# declare (default 100_000 chars for every tool). An MCP result passes both
+# gates, so raising one without the other moves nothing, and the runner --
+# not this repo -- is what would have to declare the `_meta`.
+BASH_MAX_OUTPUT_LENGTH = 150_000
+TASK_MAX_OUTPUT_LENGTH = 160_000
+
 # Where a turn carrying attachments writes its stream-json user message.
 # Same directory and same lifecycle as MCP_CONFIG_FILE above, deleted in
 # _run_cli_once's finally. A fixed path is safe because _invocation_lock
@@ -534,6 +566,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     env = {**os.environ, "HOME": CLAUDE_HOME, "CLAUDE_CONFIG_DIR": claude_dir,
            "NOVA_WORKSPACE": workspace,
            "AGORA_CONVERSATION_ID": conversation_id or ""}
+    env.setdefault("BASH_MAX_OUTPUT_LENGTH", str(BASH_MAX_OUTPUT_LENGTH))
+    env.setdefault("TASK_MAX_OUTPUT_LENGTH", str(TASK_MAX_OUTPUT_LENGTH))
 
     # Only a turn that actually carries attachments switches to stdin. The
     # text path is what every Nova cycle and every ordinary chat turn runs,
