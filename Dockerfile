@@ -6,7 +6,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # Pinned major version, not "latest", same reasoning as agora-persona-runner's
 # pinned kubectl/gh versions -- a rebuild months from now shouldn't silently
 # pick up a different major version.
-ARG NODE_MAJOR=20
+#
+# A pinned major goes end-of-life on a date, and nothing here reads that date:
+# this said 20 until 2026-08-27, four months after Node 20 stopped receiving
+# security patches on 2026-04-30. Dependabot does not read this line -- it
+# reads manifests and lockfiles -- so the pin has to be checked against
+# nodejs/Release's schedule by hand or by a check built for it (idea #151).
+# 24 is the active LTS and is supported to April 2028.
+ARG NODE_MAJOR=24
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -41,10 +48,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
 # gone, and it is read nowhere in this repo (grep: 0 hits). Every field the
 # comment above names is still present under the same name.
 #
-# One thing this bump does not change and should be fixed separately: the
-# package has declared `engines.node >= 22` since at least 2.1.226, and
-# NODE_MAJOR above is 20. npm warns and the binary works -- measured on both
-# versions -- but we are running it outside its supported range either way.
+# The `engines.node >= 22` mismatch this comment used to record is closed:
+# NODE_MAJOR above is 24, so the CLI now runs inside its declared range
+# rather than one major below it. Measured 2026-08-27 on a real v24.20.0
+# binary -- `npm install -g @anthropic-ai/claude-code@2.1.245` exits 0 with
+# no engine warning and `claude --version` prints `2.1.245 (Claude Code)`.
 ARG CLAUDE_CODE_VERSION=2.1.245
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
