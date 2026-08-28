@@ -65,7 +65,7 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # mirroring agora-persona-runner-read: cluster-wide, read-only, Secrets
 # excluded from every rule) -- this binary alone grants nothing beyond
 # whatever the pod's ServiceAccount is actually bound to.
-ARG KUBECTL_VERSION=v1.36.2
+ARG KUBECTL_VERSION=v1.35.8
 RUN curl -fsSLo /usr/local/bin/kubectl \
     "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
     && chmod +x /usr/local/bin/kubectl
