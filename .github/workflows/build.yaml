@@ -53,7 +53,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Secret scan
@@ -72,7 +72,7 @@ jobs:
             echo "::error::Secret scan failed. If the finding is a FABRICATED test fixture, append '# gitleaks:allow' to that line and push again — it is per-line, stays visible in review, and needs no config file. If it is a REAL credential: do not allowlist it, rotate it, and do not merge this branch (the scan reads history, so the leak survives deleting the line)."
             exit 1
           }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # pyyaml is test-only: tests/test_build_workflow.py parses this file
@@ -98,21 +98,21 @@ jobs:
   vault-drift:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Generate installation token scoped to the runner repo only
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.ORG_APP_ID }}
           private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
           owner: SokratesAI
           repositories: agora-persona-runner
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: SokratesAI/agora-persona-runner
           token: ${{ steps.app-token.outputs.token }}
           path: .runner
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # Run from the runner checkout so the tool imports as `tools.`, and
@@ -131,16 +131,16 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -148,7 +148,7 @@ jobs:
             type=sha,prefix=sha-
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -182,13 +182,13 @@ jobs:
       # source checked out and must not clobber it.
       - name: Generate installation token scoped to the config repo only
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.ORG_APP_ID }}
           private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
           owner: SokratesAI
           repositories: ${{ github.event.repository.name }}-config
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.CONFIG_REPO }}
           token: ${{ steps.app-token.outputs.token }}
