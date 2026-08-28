@@ -20,12 +20,14 @@ and it is the only one.
 Applied at the single point everything leaves for the runner
 (activity.py's sender), so a new call site cannot bypass it by forgetting.
 """
+
+import os
 import re
 
 # (label, pattern). The label is what the reader sees in place of the
 # secret, so it says what was removed without saying what it was.
 _PATTERNS = (
-    # Anthropic API keys and, the one that actually leaked, the OAuth
+    # Anthropic API keys and, the ones that actually leaked, the OAuth
     # access/refresh tokens the CLI stores (sk-ant-oat01-/sk-ant-ort01-).
     ("anthropic key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}")),
     # GitHub: PATs (classic + fine-grained), OAuth, user, server, refresh.
@@ -67,14 +69,17 @@ _PATTERNS = (
     # set is exactly the kind of thing he wants to be able to see.
     #
     # Two of those three shapes were missed until Cycle 170, and the drift
-    # probes in the runner's tools/sync_contract.py found both on their first
-    # run: JSON quotes the NAME too, so `"couchdb_password": "x"` put a `"`
-    # between the name and the colon and nothing matched; and `_PASS` is
-    # neither `PASSWD` nor `PASSWORD`, while `CDB_PASS` is the name this very
-    # system holds its CouchDB password under. `_PASS` carries the underscore
-    # on purpose -- a bare `pass:` is an ordinary English word, and "second
-    # pass: completed" is exactly the over-redaction the keep-everything rule
-    # forbids.
+    # probes in tools/sync_contract.py found both on their first run:
+    #
+    #   * JSON quotes the NAME too, so `"couchdb_password": "x"` put a `"`
+    #     between the name and the colon and nothing matched. The optional
+    #     quote stays inside group 2, so the replacement puts it back and the
+    #     document is still parseable.
+    #   * `_PASS` is not `PASSWD` or `PASSWORD`, and `CDB_PASS` is the name
+    #     this very system holds its CouchDB password under. It is spelled
+    #     `_PASS` rather than `PASS` on purpose: a bare `pass:` is an
+    #     ordinary English word, and "second pass: completed" is exactly the
+    #     over-redaction the owner's keep-everything rule forbids.
     ("value", re.compile(
         r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|_PASS|API[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)S?)"
         r"(\"?\s*[=:]\s*\"?)"
@@ -86,21 +91,86 @@ _PATTERNS = (
         # `[redacted:` is 10 characters none of which are excluded below, so
         # this pattern matched the marker as if it were the value and
         # produced `[redacted: value] anthropic key]`. Caught by
-        # test_tool_output_is_redacted_on_the_way_out, which had been green
-        # for weeks and went red on the widening.
+        # test_tool_output_is_redacted_on_the_way_out in the bridge, which
+        # had been green for weeks and went red on the widening.
         r"((?!\[redacted:)[^\s\"',}]{8,})"
     )),
 )
 
 
-def redact(text):
+# The names above cover a credential that has a *format*. Three of the ones
+# actually mounted here do not, and Cycle 560 measured that on the live pods
+# rather than reasoning about it: `redact()` returned the bare value of
+# AGORA_TOKEN (64 chars), COUCHDB_PASSWORD/CDB_PASS (16) and TINYFISH_API_KEY
+# (44, `sk-` but not `sk-ant-`) completely unaltered. Those are the token that
+# can act as any persona on Agora, the password to the CouchDB holding both
+# Nova's database and the owner's Obsidian vault, and a third-party API key.
+# No shape rule can ever catch them, because a random 16-character password
+# has no shape -- that is the whole point of it.
+#
+# So this pass matches by *value* instead. The process publishing the text is
+# the process holding the secret, so it can look the literal up rather than
+# guess at it, and a literal match cannot be defeated by a format nobody
+# documented. This is the same move as the sandbox's `credentials.mode: "mask"`
+# that idea #106 points at, done at the one boundary this loop actually
+# controls today: the CLI's own masking needs the sandbox proxy turned on to
+# substitute on egress, and turning that on would confine this loop's shell.
+#
+# Selected by name, using the same vocabulary as the `value` pattern above so
+# there is one list of what "a secret" is called and not two.
+_SECRET_NAME = re.compile(
+    r"(?i)^[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|_PASS|API[_-]?KEY"
+    r"|ACCESS[_-]?KEY|CREDENTIAL)S?$"
+)
+
+# A floor, and it is measured rather than chosen for comfort. The shortest
+# secret-named value on either pod is 16 characters (COUCHDB_PASSWORD); the
+# danger below this line is real and in the other direction -- an env var
+# named like a secret holding `true` or `none` would blank that word out of
+# every sentence this loop publishes, which is exactly the over-redaction the
+# owner's keep-everything rule forbids. 8 sits an octave clear of both.
+_MIN_SECRET_LEN = 8
+
+
+def _secret_literals(environ=None):
+    """`(name, value)` for every env var whose name says it holds a secret.
+
+    Longest value first, so a secret that contains another one is replaced
+    whole rather than leaving the tail of the shorter match behind.
+
+    The value is stripped, and that is the whole handling of surrounding
+    whitespace rather than an oversight. GEMINI_API_KEY on the runner pod
+    carries a trailing newline and it is the *unstripped* value `urllib` quotes
+    back in the exception this idea was filed over -- but the stripped form is a
+    substring of the raw one, so matching on it covers both. A first version
+    carried the raw value as well; the mutation that removed it survived every
+    test, which is the tell that it was a branch doing no work.
+    """
+    env = os.environ if environ is None else environ
+    out = []
+    for name, value in env.items():
+        if not isinstance(value, str) or not _SECRET_NAME.match(name or ""):
+            continue
+        literal = value.strip()
+        if len(literal) >= _MIN_SECRET_LEN and (name, literal) not in out:
+            out.append((name, literal))
+    out.sort(key=lambda pair: len(pair[1]), reverse=True)
+    return out
+
+
+def redact(text, environ=None):
     """`text` with any credential-shaped run replaced by a visible marker.
 
     Returns non-strings unchanged so callers don't have to type-check
-    before handing over whatever a tool returned.
+    before handing over whatever a tool returned. `environ` is for tests --
+    production reads the real environment, so nothing has to be configured
+    and a credential added to a pod is covered the moment it is mounted.
     """
     if not isinstance(text, str) or not text:
         return text
+    for name, literal in _secret_literals(environ):
+        if literal in text:
+            text = text.replace(literal, "[redacted: %s]" % (name,))
     for label, pattern in _PATTERNS:
         if label == "value":
             text = pattern.sub(rf"\1\2[redacted: {label}]", text)
