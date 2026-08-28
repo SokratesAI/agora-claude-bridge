@@ -48,12 +48,34 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
 # gone, and it is read nowhere in this repo (grep: 0 hits). Every field the
 # comment above names is still present under the same name.
 #
+# Re-run 2026-08-29 for 2.1.245 -> 2.1.251, and this time through BOTH input
+# paths rather than one. tools.changelog_watch read 215 entries across the
+# five releases in that gap and marked exactly one: 2.1.251 fixes
+# `--input-format stream-json` merging client-injected assistant tool calls
+# that carry no message id. That is a flag cli.py passes.
+#
+# write_stream_json_input sends a single `user` event and no
+# assistant blocks at all, so that specific bug was never reachable from here
+# -- but it is our parser, so the check was run over `--print <text>` and over
+# `--input-format stream-json` on stdin separately. Both: event/subtype/block
+# sequence identical, top-level key sets identical (no removal this time), and
+# `text`/`tool_use`/`tool_result` block key sets identical. Every field cli.py
+# reads was present -- `id`/`name`/`input`, `tool_use_id`/`is_error`,
+# `rate_limit_info`, `session_id`.
+#
+# That diff is only worth quoting because it was shown capable of failing:
+# dropping `session_id` and `tool_use.input` out of the 2.1.251 capture made
+# it report six differences. A clean diff from an instrument nobody mutated
+# is a positive result guaranteed in advance.
+#
 # The `engines.node >= 22` mismatch this comment used to record is closed:
 # NODE_MAJOR above is 24, so the CLI now runs inside its declared range
-# rather than one major below it. Measured 2026-08-27 on a real v24.20.0
-# binary -- `npm install -g @anthropic-ai/claude-code@2.1.245` exits 0 with
-# no engine warning and `claude --version` prints `2.1.245 (Claude Code)`.
-ARG CLAUDE_CODE_VERSION=2.1.245
+# rather than one major below it. Re-measured 2026-08-29 on a real v24.20.0
+# binary -- `npm install --prefix <tmp> @anthropic-ai/claude-code@2.1.251`
+# exits 0 with no engine warning and the installed `claude --version` prints
+# `2.1.251 (Claude Code)`. A prefix install, not the `-g` on the line below:
+# the running pod's global binary is what this cycle was speaking through.
+ARG CLAUDE_CODE_VERSION=2.1.251
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # kubectl -- 2026-08-01 design call: this service should be as capable as
