@@ -199,3 +199,67 @@ def test_the_reports_own_auth_token_is_not_redacted():
         reporter.report_result("Bash", "toolu_1", "ok", is_error=False)
         reporter.close()
     assert posted[0]["token"] == "act_0123456789abcdefghij"
+
+
+# --- Redaction by value, not by shape (idea #106, Cycle 560) -----------------
+# Measured on the live pods before this was written: redact() returned the bare
+# values of AGORA_TOKEN, COUCHDB_PASSWORD/CDB_PASS and TINYFISH_API_KEY
+# unaltered, because none of the three has a documented format to match on.
+# The code half of this module is byte-identical to the runner's copy by
+# contract (tools/sync_contract.py drives both), so these mirror its tests.
+
+_FAKE_ENV = {
+    "AGORA_TOKEN": "20" + "a" * 62,
+    "COUCHDB_PASSWORD": "Xk#notarealpw123",
+    "HOME": "/root",
+}
+
+
+def test_redact_catches_a_formatless_password_with_no_name_beside_it():
+    """The traceback case: a value alone, no `NAME=` for the value pattern to
+    anchor on, and no vendor prefix for a shape pattern to see."""
+    out = redact("urllib3.exceptions: rejected Xk#notarealpw123", _FAKE_ENV)
+    assert "Xk#notarealpw123" not in out
+    assert "[redacted: COUCHDB_PASSWORD]" in out
+
+
+def test_redact_matches_the_stripped_value_so_a_trailing_newline_cannot_hide_it():
+    """GEMINI_API_KEY on the runner pod carries a trailing newline. The text
+    here carries the value without it, because whatever printed it may have
+    trimmed the line -- matching the stripped form covers both."""
+    env = {"GEMINI_API_KEY": "AQ.notarealkey0123456789\n"}
+    out = redact("Invalid header value 'AQ.notarealkey0123456789'", env)
+    assert "AQ.notarealkey0123456789" not in out
+    assert "[redacted: GEMINI_API_KEY]" in out
+
+
+def test_redact_replaces_the_longer_secret_first():
+    """Shortest-first would blank the inner secret and leave the outer one's
+    tail behind, which reads as redacted and is not."""
+    env = {"A_TOKEN": "abcdefgh", "B_TOKEN": "abcdefgh-and-more-tail"}
+    out = redact("value abcdefgh-and-more-tail here", env)
+    assert "abcdefgh" not in out
+    assert "[redacted: B_TOKEN]" in out
+
+
+def test_redact_ignores_a_secret_named_var_too_short_to_be_one():
+    """Below the floor the danger is over-redaction: a var named like a secret
+    holding `true` would blank that word out of everything published."""
+    env = {"DEBUG_SECRET": "true"}
+    text = "the answer is true and it stays true"
+    assert redact(text, env) == text
+
+
+def test_redact_only_reads_env_vars_whose_name_says_they_hold_a_secret():
+    """Redacting every long env value would eat HOME and the workspace path
+    out of ordinary tool output."""
+    env = {"NOVA_WORKSPACE": "/data/workspace-concurrent/7-129550988400320"}
+    text = "cd /data/workspace-concurrent/7-129550988400320 && pytest"
+    assert redact(text, env) == text
+
+
+def test_redact_still_runs_the_shape_patterns_when_the_env_holds_nothing():
+    """The value pass is additive. A copy that returned early on an empty
+    environment would pass every test above and ship the old hole."""
+    out = redact("crash: sk-ant-notarealkeyvalue000000", {})
+    assert "[redacted: anthropic key]" in out
