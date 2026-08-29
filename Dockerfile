@@ -108,6 +108,33 @@ RUN (type -p wget >/dev/null || apt-get update && apt-get install -y --no-instal
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# openssh-client -- so `tools.nas_health` can see the NAS from THIS pod.
+#
+# The NAS is the one thing Edvard calls highest priority, and its apps are the
+# part of it nothing checks unprompted. `tools.preflight` runs on this pod
+# every cycle and its `nas_health` check can only judge whether the box is up:
+# it opens a TCP connection to port 22 and reads the SSH banner. The half it
+# cannot do is Sonarr and Radarr, because `allow-nas-ssh-egress` opens port 22
+# and nothing else, so those apps are reachable only by running `curl` ON the
+# NAS over an SSH hop -- and this image has no `ssh` binary at all. The runner
+# pod has one, which is why `tools.nas status` answers there; what it does not
+# have is anything scheduled, so nobody runs it.
+#
+# This is one of the two changes that close that. The other is mounting the
+# existing `nas-ssh-key` secret (already sealed, already in the `agents`
+# namespace for the runner) at /etc/nas-ssh on this deployment, in
+# agora-claude-bridge-config. Neither is any use without the other, and
+# nas_health prints `CANNOT SEE FROM THIS POD` rather than failing while
+# either is missing.
+#
+# Its own layer near the bottom, same reasoning as tini below: the npm,
+# kubectl and gh layers above stay cached for a one-package install. Do not
+# fold it into one of those apt lines -- a future tidy-up of an unrelated
+# package list is exactly how this would disappear again, and the symptom is
+# a check going quiet rather than a build going red.
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # xxhash -- LiveSync's real chunk-id algorithm (bridge/vault_tool.py falls
 # back to sha256 if this is ever missing, same as agora_runner/vault.py).
 RUN pip install --no-cache-dir xxhash

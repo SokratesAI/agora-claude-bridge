@@ -51,3 +51,22 @@ def test_claude_cli_version_arg_is_a_concrete_version():
         "the install line should use ${CLAUDE_CODE_VERSION} rather than "
         "repeating the version, so the two cannot disagree"
     )
+
+
+def test_openssh_client_is_installed():
+    """`tools.nas_health` reaches Sonarr and Radarr over an SSH hop, or not at all.
+
+    The NetworkPolicy on this pod opens port 22 to the NAS and nothing else, so
+    the apps' own ports are unreachable from here and the only way to ask them
+    anything is to run `curl` on the NAS itself. That needs an `ssh` binary in
+    this image. Without it the check still reports the box as up and prints
+    `CANNOT SEE FROM THIS POD` for the services -- it degrades quietly, which
+    is why a build-time assertion is worth more here than a runtime one.
+
+    Guarding the package rather than the exact apt line, because the thing that
+    would take it away is a future tidy-up of an unrelated package list.
+    """
+    assert "openssh-client" in _dockerfile(), (
+        "openssh-client is not installed; tools.nas_health can no longer judge "
+        "Sonarr and Radarr from this pod, and it will say so instead of failing"
+    )
