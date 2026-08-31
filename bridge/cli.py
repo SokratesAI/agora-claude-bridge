@@ -524,7 +524,8 @@ def _provision_workspace(workspace):
 
 
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
-                  system=None, attachments=None, slot="", conversation_id=""):
+                  system=None, attachments=None, slot="", conversation_id="",
+                  persona_id=""):
     workspace = _workspace_for(slot)
     if slot:
         # _workspace_for's invariant is "a concurrent turn always starts
@@ -623,14 +624,21 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # between that truncate and the json.dump. Losing the quota and
     # deadline hooks is silent; the turn just stops being able to see its
     # own budget.
-    # The memory pin goes only to a cycle. `write_hook_settings` is called
-    # for every turn of every conversation this bridge serves, and the CLI
-    # injects MEMORY.md into the first user turn as an override instruction
-    # -- so handing one directory to all of them would cross Nova's notes to
-    # itself with the owner's own personas.
+    # The memory pin is per identity, never shared. `write_hook_settings` is
+    # called for every turn of every conversation this bridge serves, and the
+    # CLI injects MEMORY.md into the first user turn as an override
+    # instruction -- so one directory for all of them would make a note Nova
+    # wrote to itself a standing instruction to the owner's chat personas,
+    # and the reverse. A Nova cycle gets Nova's directory; any other turn
+    # gets its own persona's, keyed on the id the caller sent, and no
+    # directory at all when the caller sent none (quota.persona_memory_dir).
+    # Until idea #165 the second branch was `None`, so a chat persona had no
+    # memory across conversations at all -- the CLI's default is keyed on the
+    # working directory, which is a fresh concurrent slot every turn.
     hook_settings = write_hook_settings(
         _slotted(quota.HOOK_SETTINGS_FILE, slot),
-        memory_dir=quota.AUTO_MEMORY_DIR if is_cycle_opening(message) else None,
+        memory_dir=(quota.AUTO_MEMORY_DIR if is_cycle_opening(message)
+                    else quota.persona_memory_dir(persona_id)),
     )
     if hook_settings:
         cmd.extend(["--settings", hook_settings])
@@ -1077,7 +1085,7 @@ def refresh_window_clear(margin=CONCURRENT_REFRESH_MARGIN_SECONDS, path=None, no
 
 def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
              mcp=None, system=None, attachments=None, allow_concurrent=False,
-             conversation_id=""):
+             conversation_id="", persona_id=""):
     """One turn. Returns (text, thinking, new_session_id).
 
     attachments: optional [{filename, mimeType, data}] with `data` base64,
@@ -1101,6 +1109,11 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
     mcp: optional {"url", "token"} for an HTTP MCP server the caller wants
     this turn's model to have (see write_mcp_config). Omit it and the CLI
     is invoked with no MCP configuration at all, exactly as before.
+
+    persona_id: which persona is speaking, used only to pin that persona's
+    own auto-memory directory (quota.persona_memory_dir). Omit it and the
+    turn runs with no memory pin at all, which is what every caller did
+    before idea #165.
 
     conversation_id: which conversation this turn is for, exported to the
     CLI as AGORA_CONVERSATION_ID. Omit it and the variable is exported
@@ -1142,7 +1155,8 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
         slot = f"{os.getpid()}-{threading.get_ident()}"
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
                              system, attachments, slot=slot,
-                             conversation_id=conversation_id)
+                             conversation_id=conversation_id, persona_id=persona_id)
     with _invocation_lock:
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
-                             system, attachments, conversation_id=conversation_id)
+                             system, attachments, conversation_id=conversation_id,
+                             persona_id=persona_id)

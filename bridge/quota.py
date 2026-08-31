@@ -38,6 +38,7 @@ tells the session when it is time to wrap up.
 import datetime
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -504,6 +505,31 @@ HOOK_SETTINGS_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-hooks.settings
 #    directory. flagSettings still wins, so the pin holds; the reason it has
 #    to live here is precedence, not a refusal.
 AUTO_MEMORY_DIR = os.path.join(CLAUDE_HOME, "nova-memory")
+# Where a chat persona's own memories go. Nova's directory above is a
+# constant because there is exactly one Nova; a persona's is derived from
+# its Agora id, because the whole point of the split is that a note one
+# persona wrote to itself must never reach another one as a standing
+# instruction (see write_hook_settings). Idea #165, whose measurement was
+# that all three of Agora's memory stores are empty: persona sharedMemory
+# 0 bytes on all 18 personas, conversation notes 0 of 594, and this
+# directory pinned only for a Nova cycle, so no chat turn ever had one.
+PERSONA_MEMORY_ROOT = os.path.join(CLAUDE_HOME, "persona-memory")
+# The id arrives over HTTP from the runner, so it is untrusted text that is
+# about to become a filesystem path. A uuid matches this; `..`, an absolute
+# path and an empty string do not, and anything that does not match gets no
+# memory directory rather than a sanitised one -- a persona with no memory
+# is the behaviour every caller had before this existed, and quietly
+# rewriting an id would hand two personas one directory.
+PERSONA_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{2,63}\Z")
+
+
+def persona_memory_dir(persona_id):
+    """Absolute auto-memory directory for one persona, or "" if the caller
+    sent no usable id -- which is what a caller that predates this field
+    sends, and what a malformed one gets."""
+    if not persona_id or not PERSONA_ID_RE.match(str(persona_id)):
+        return ""
+    return os.path.join(PERSONA_MEMORY_ROOT, str(persona_id))
 
 
 def write_hook_settings(path=None, memory_dir=None):

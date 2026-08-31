@@ -690,7 +690,7 @@ def test_hook_settings_omits_the_memory_key_for_a_non_cycle_turn(tmp_path):
     assert "autoMemoryDirectory" not in json.load(open(path))
 
 
-def test_cli_passes_the_memory_pin_only_for_a_cycle():
+def test_cli_passes_the_memory_pin_per_identity():
     """The wiring mutation, which is the first one to run on a change whose
     whole content is "call X from Y": deleting the argument at the call site
     leaves every test above green, because they all call the function
@@ -708,9 +708,12 @@ def test_cli_passes_the_memory_pin_only_for_a_cycle():
     assert "memory_dir=" in call
     assert "is_cycle_opening(message)" in call
     assert "quota.AUTO_MEMORY_DIR" in call
-    # A turn that is not a cycle must reach the None branch, not a second
-    # directory: two pins would be the cross-contamination again, renamed.
-    assert "else None" in call
+    # A turn that is not a cycle reaches the persona's own directory, and
+    # `persona_id` is what makes it that persona's rather than a second
+    # shared one -- a pin computed from anything else would be the
+    # cross-contamination this whole split exists to prevent, renamed.
+    assert "quota.persona_memory_dir(persona_id)" in call
+    assert "else None" not in call
 
 
 def test_auto_memory_directory_does_not_move_with_the_workspace(tmp_path):
@@ -968,3 +971,49 @@ def test_a_publish_that_raises_still_leaves_the_closing_reading_written(tmp_path
         _drive_for_real(watcher, 1, LIVE_USAGE_PAYLOAD)
 
     assert [r.get("boundary") for r in _rows(history)] == ["start", "end"]
+
+
+def test_persona_memory_dir_is_one_directory_per_persona():
+    """Idea #165: a chat persona had no memory across conversations because
+    only a Nova cycle was ever handed a pinned directory. Two personas must
+    get two directories, and both must sit under the persistent claude home
+    rather than under a concurrent workspace."""
+    a = quota.persona_memory_dir("08ffac94-7c4a-4506-897f-968c592358cb")
+    b = quota.persona_memory_dir("11111111-2222-3333-4444-555555555555")
+    assert a and b and a != b
+    assert a.startswith(quota.CLAUDE_HOME + os.sep)
+    assert a != quota.AUTO_MEMORY_DIR and b != quota.AUTO_MEMORY_DIR
+    assert os.path.join(".claude", "projects") not in a
+
+
+def test_persona_memory_dir_refuses_anything_that_is_not_a_plain_id():
+    """The id arrives over HTTP and becomes a directory name. Anything that
+    could escape the root, or that is empty, gets no memory directory at all
+    -- never a sanitised one, because rewriting an id would hand two
+    personas one directory."""
+    for bad in ("", None, "..", "../../etc", "a/b", "/etc/passwd", "ab",
+                "x" * 65, "with space", ".hidden"):
+        assert quota.persona_memory_dir(bad) == "", bad
+    escaped = quota.persona_memory_dir("../../../etc/shadow")
+    assert escaped == ""
+
+
+def test_a_persona_pin_is_written_into_the_settings_file(tmp_path):
+    """End of the wire on this side: the directory persona_memory_dir
+    returns is what lands in the --settings file the CLI reads."""
+    d = quota.persona_memory_dir("08ffac94-7c4a-4506-897f-968c592358cb")
+    path = quota.write_hook_settings(str(tmp_path / "s.json"), memory_dir=d)
+    assert json.load(open(path))["autoMemoryDirectory"] == d
+
+
+def test_server_forwards_persona_id_from_the_request_to_the_turn():
+    """The wiring mutation on the HTTP side: the field can be read off the
+    payload and then dropped before it reaches run_turn, which every test
+    above would still pass."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "bridge", "server.py")).read()
+    assert 'payload.get("persona_id")' in src
+    # generate() has three call sites into the CLI -- stateless, normal, and
+    # the SESSION_NOT_FOUND retry -- and a persona that loses its memory
+    # only on the retry path is the kind of bug nobody reproduces.
+    assert src.count("persona_id=persona_id,") == 4
