@@ -644,6 +644,16 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         # the only thing distinguishing a subagent's work from the persona's,
         # and the loop below depends on it.
         "--forward-subagent-text",
+
+        # The persona's own prose, token by token, as `stream_event` events
+        # alongside the whole-message `assistant` ones (which still arrive
+        # unchanged -- measured on 2.1.251, this pod). Without it the owner
+        # watches tool chips scroll past and reads every word the persona
+        # wrote only after the passage is finished, which for a long one is
+        # the "it looks like it does nothing for a long time" complaint that
+        # --forward-subagent-text fixed for subagents and not for the
+        # persona itself.
+        "--include-partial-messages",
     ])
     # Lets the session see its own remaining quota and its own remaining
     # wall-clock while it runs, so it can wrap up deliberately instead of
@@ -812,12 +822,33 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # and the one before it is released as narration the moment anything else
     # shows up. Whatever is still sitting here when the stream ends is the
     # last thing written, which is the reply.
+    # Each entry is (passage, stream_id) -- the id every partial step of that
+    # passage was posted under, so releasing it sends the final, authoritative
+    # text into the slot the growing one already occupies, and retracting it
+    # takes the whole stream back off the page.
     pending = []
+
+    # The ids of the persona's own text blocks, in the order the CLI opened
+    # them, waiting to be paired with the finished `assistant` block that
+    # closes each one. A list rather than a dict keyed by content-block index:
+    # the index restarts at 0 on every message, so two passages in one turn
+    # would collide on it, while the order they are emitted in never lies.
+    stream_ids = []
+
+    # The block currently being written: its id (empty until the first delta,
+    # so a text block that produces no text never claims one and never
+    # desynchronises the pairing), the text so far, and how much of it has
+    # already gone out.
+    partial_id = ""
+    partial_text = ""
+    partial_sent = 0
+    stream_seq = 0
 
     def release_narrative():
         """Send the held passage, now that we know it wasn't the last."""
         if pending:
-            reporter.report_text(pending.pop())
+            passage, stream_id = pending.pop()
+            reporter.report_text(passage, stream_id)
 
     try:
         for line in proc.stdout:
@@ -885,7 +916,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                         chunk = block.get("text", "")
                         if chunk:
                             release_narrative()
-                            pending.append(chunk)
+                            pending.append(
+                                (chunk, stream_ids.pop(0) if stream_ids else ""))
                             text_parts.append(chunk)
                     elif block.get("type") == "tool_use":
                         release_narrative()
@@ -894,6 +926,48 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                         if tool_use_id:
                             tool_names[tool_use_id] = name
                         reporter.report(name, block.get("input"), tool_use_id)
+            elif t == "stream_event":
+                # The persona's prose as it is written. A subagent's partials
+                # are dropped rather than streamed: its finished text is
+                # already forwarded whole and attributed, and an unattributed
+                # passage growing in the drawer would read as the persona's
+                # own voice.
+                if subagent:
+                    continue
+                inner = event.get("event", {})
+                kind = inner.get("type", "")
+                if kind == "content_block_start":
+                    # Only text. A `thinking` block opens the same way and
+                    # carries no plaintext in -p mode anyway.
+                    partial_id = ""
+                    partial_text = ""
+                    partial_sent = 0
+                    if inner.get("content_block", {}).get("type") != "text":
+                        continue
+                    stream_seq += 1
+                    partial_id = f"text-{stream_seq}"
+                    stream_ids.append(partial_id)
+                elif kind == "content_block_delta" and partial_id:
+                    delta = inner.get("delta", {})
+                    if delta.get("type") != "text_delta":
+                        continue
+                    partial_text += delta.get("text", "")
+                    # Flush at paragraph breaks, not per token: a step is an
+                    # HTTP post and an append to the conversation, so one per
+                    # token would be thousands of both for one turn. A long
+                    # passage becomes a handful of steps this way, and the
+                    # owner still watches it arrive a paragraph at a time.
+                    boundary = partial_text.rfind("\n\n")
+                    if boundary >= 0 and boundary + 2 > partial_sent:
+                        partial_sent = boundary + 2
+                        reporter.report_text(partial_text, partial_id)
+                elif kind == "content_block_stop":
+                    # The finished text arrives on the `assistant` event and
+                    # is what gets released or retracted; nothing more is
+                    # owed to this id here.
+                    partial_id = ""
+                    partial_text = ""
+                    partial_sent = 0
             elif t == "user":
                 # What each tool RETURNED. The owner has asked for this three
                 # times -- "I need to see the command with all metadata and
@@ -1062,7 +1136,12 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # the alternative is an empty reply, and an empty reply raises below and
     # fails the whole turn.
     if reporter.enabled and pending:
-        text = pending[-1].strip()
+        passage, stream_id = pending[-1]
+        text = passage.strip()
+        # This passage was streamed into the drawer while it was being
+        # written, and it is about to be sent as the reply. Take the stream
+        # back off the page so it is read once, not twice.
+        reporter.retract_text(stream_id)
     else:
         text = "\n".join(text_parts).strip()
     thinking = "\n\n".join(thinking_parts).strip()
