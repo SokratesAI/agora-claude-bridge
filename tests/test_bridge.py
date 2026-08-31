@@ -502,6 +502,120 @@ def test_generate_asks_the_cli_for_restricted_mode_too(tmp_path):
     assert captured["disallowed_tools"] == server.DISCOVERED_FULL_TOOL_ROSTER
 
 
+def test_restricted_turn_still_allows_the_runner_mcp_tools(tmp_path):
+    """My reviewer's finding on #89, measured live against a stub MCP server
+    on 2.1.251. Dropping --dangerously-skip-permissions puts the turn on the
+    default permission mode; in `-p` there is no prompt, so anything not
+    auto-allowed is hard-denied -- and after the denylist takes every built-in
+    the ONLY tools a restricted persona has left are this server's. Without
+    this grant a restricted turn has no working tools at all and still returns
+    200, with the model apologising about a permission nobody can grant."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", disallowed_tools=cli.DISCOVERED_FULL_TOOL_ROSTER,
+                     restricted=True, mcp={"url": "http://runner/mcp", "token": "t"})
+    assert "--allowedTools" in captured["cmd"]
+    allowed = captured["cmd"][captured["cmd"].index("--allowedTools") + 1]
+    assert allowed == f"mcp__{cli.MCP_SERVER_NAME}"
+
+
+def test_restricted_turn_without_mcp_grants_nothing(tmp_path):
+    """The grant is scoped to the config that created the need for it -- a
+    restricted turn with no MCP server has nothing to allow, and a blanket
+    --allowedTools would be a permission written for a server that is absent."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", disallowed_tools=cli.DISCOVERED_FULL_TOOL_ROSTER, restricted=True)
+    assert "--allowedTools" not in captured["cmd"]
+
+
+def test_an_unrestricted_turn_with_mcp_grants_nothing(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", mcp={"url": "http://runner/mcp", "token": "t"})
+    assert "--allowedTools" not in captured["cmd"]
+
+
+def test_the_concurrent_lane_carries_restricted_too(tmp_path):
+    """My reviewer's second finding: every restricted test drove the locked
+    branch, and deleting `restricted=restricted` from the allow_concurrent lane
+    left the whole suite green -- while the one production caller that sets
+    restricted=True (nova_replies.py) is also the caller that asked for
+    allow_concurrent, so the untested branch is the one in use."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "refresh_window_clear", return_value=True), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", disallowed_tools=cli.DISCOVERED_FULL_TOOL_ROSTER,
+                     restricted=True, allow_concurrent=True)
+    assert "--restricted" in captured["cmd"]
+    assert "--dangerously-skip-permissions" not in captured["cmd"]
+
+
+def test_the_session_not_found_retry_carries_restricted_too():
+    """My reviewer's second finding, other half: generate has three run_turn
+    call sites and the SESSION_NOT_FOUND retry was the one left unguarded. A
+    stored session going missing is routine after a pod roll, so the retry is
+    the path a restricted persona lands on the morning after every deploy."""
+    seen = []
+
+    def fake_run_turn(**kwargs):
+        seen.append(kwargs.get("restricted"))
+        if len(seen) == 1:
+            raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
+        return "ok", "", "sess-2"
+
+    with patch.object(server, "get_session_id", return_value="gone"), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "clear_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", restricted=True)
+    assert seen == [True, True]
+
+
 def test_generate_stateless_asks_the_cli_for_restricted_mode_too(tmp_path):
     """The stateless path is a separate run_turn call site and my first cut
     of this change wired only the other one. A mutation that dropped the
