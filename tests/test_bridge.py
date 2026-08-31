@@ -410,6 +410,142 @@ def test_discovered_full_tool_roster_covers_the_tool_found_live():
     assert "Bash" in cli.DISCOVERED_FULL_TOOL_ROSTER
 
 
+def test_run_turn_passes_the_cli_restricted_flag_when_asked(tmp_path):
+    """Idea #168. The hand-kept denylist is not the whole guard any more: a
+    restricted call also passes the CLI's own --restricted (2.1.248), which
+    removes the command- and code-running tools upstream, so a tool added in
+    a CLI version this repo has never read about cannot run a shell."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", disallowed_tools="Bash", restricted=True)
+    assert "--restricted" in captured["cmd"]
+
+
+def test_run_turn_does_not_pass_restricted_by_default(tmp_path):
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello")
+    assert "--restricted" not in captured["cmd"]
+    assert "--dangerously-skip-permissions" in captured["cmd"]
+
+
+def test_restricted_turn_drops_dangerously_skip_permissions(tmp_path):
+    """Measured on 2.1.251 in this pod: `claude -p --restricted
+    --dangerously-skip-permissions` exits before the turn starts with
+    "bypassPermissions not supported in restricted mode". Passing both would
+    make every restricted persona fail rather than be sandboxed, and the
+    failure is at process start, so nothing downstream would see a tool call
+    to blame it on."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("hello", restricted=True)
+    assert "--dangerously-skip-permissions" not in captured["cmd"]
+
+
+def test_discovered_roster_names_the_tools_2_1_251_added():
+    """Measured 2026-08-31 off a real `system.init` event on 2.1.251, the
+    version this pod runs. The roster was observed on 2.1.197 and its own
+    comment said to re-check it when the CLI moved; it had not been
+    re-checked, and these two were reaching a restricted persona."""
+    assert "ListAgents" in cli.DISCOVERED_FULL_TOOL_ROSTER
+    assert "RemoteTrigger" in cli.DISCOVERED_FULL_TOOL_ROSTER
+
+
+def test_generate_asks_the_cli_for_restricted_mode_too(tmp_path):
+    """The denylist and the flag have to travel together: server.generate is
+    the only producer of the denylist, so a restricted persona that got the
+    list without the flag would be exactly the pre-#168 behaviour."""
+    captured = {}
+
+    def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "ok", "", "sess-1"
+
+    with patch.object(server, "get_session_id", return_value=None), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", restricted=True)
+    assert captured["restricted"] is True
+    assert captured["disallowed_tools"] == server.DISCOVERED_FULL_TOOL_ROSTER
+
+
+def test_generate_stateless_asks_the_cli_for_restricted_mode_too(tmp_path):
+    """The stateless path is a separate run_turn call site and my first cut
+    of this change wired only the other one. A mutation that dropped the
+    flag here survived the whole suite: the runner's journal-card reply is
+    the caller that sets restricted=True, so this is the path that matters."""
+    captured = {}
+
+    def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "ok", "", "sess-1"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", restricted=True, stateless=True)
+    assert captured["restricted"] is True
+    assert captured["disallowed_tools"] == server.DISCOVERED_FULL_TOOL_ROSTER
+
+
+def test_generate_stateless_does_not_ask_for_restricted_by_default(tmp_path):
+    captured = {}
+
+    def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "ok", "", "sess-1"
+
+    with patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi", stateless=True)
+    assert captured["restricted"] is False
+
+
+def test_generate_does_not_ask_for_restricted_mode_by_default(tmp_path):
+    captured = {}
+
+    def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "ok", "", "sess-1"
+
+    with patch.object(server, "get_session_id", return_value=None), \
+         patch.object(server, "set_session_id"), \
+         patch.object(server, "run_turn", side_effect=fake_run_turn):
+        server.generate("conv-1", "system", "hi")
+    assert captured["restricted"] is False
+    assert captured["disallowed_tools"] is None
+
+
 def test_run_turn_raises_claude_cli_error_when_no_text_produced(tmp_path):
     lines = _stream_json_lines({"type": "result", "session_id": "sess-1", "subtype": "success"})
     with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
@@ -549,7 +685,7 @@ def test_generate_sends_system_prompt_out_of_band_not_in_the_message():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -576,7 +712,7 @@ def test_generate_resends_the_system_prompt_on_a_resumed_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -597,7 +733,7 @@ def test_generate_retries_fresh_on_session_not_found():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         calls.append((message, session_id, system))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -620,7 +756,7 @@ def test_generate_retries_fresh_on_session_not_found():
 def test_generate_propagates_other_cli_errors_without_retry():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -634,7 +770,7 @@ def test_generate_is_unrestricted_by_default():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -651,7 +787,7 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -668,7 +804,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -690,7 +826,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -707,7 +843,7 @@ def test_generate_stateless_can_combine_with_restricted():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -1302,7 +1438,7 @@ def test_generate_passes_attachments_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1321,7 +1457,7 @@ def test_generate_stateless_also_passes_attachments_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1375,7 +1511,7 @@ def test_generate_passes_allow_concurrent_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["allow_concurrent"] = allow_concurrent
         return "reply", "", "sess-1"
 
@@ -1394,7 +1530,7 @@ def test_generate_stateless_also_passes_allow_concurrent_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         captured["allow_concurrent"] = allow_concurrent
         return "reply", "", "sess-1"
 
@@ -1411,7 +1547,7 @@ def test_generate_keeps_allow_concurrent_on_the_session_not_found_retry():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         seen.append(allow_concurrent)
         if session_id is not None:
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -1499,7 +1635,7 @@ def test_generate_composes_auth_retry_with_the_session_not_found_retry():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id="", persona_id=""):
+                      conversation_id="", persona_id="", restricted=False):
         calls.append(session_id)
         if len(calls) == 1:
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -2851,7 +2987,8 @@ def test_generate_passes_persona_id_to_run_turn_on_every_path():
 
         def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None,
                           activity=None, mcp=None, system=None, attachments=None,
-                          allow_concurrent=False, conversation_id="", persona_id=""):
+                          allow_concurrent=False, conversation_id="", persona_id="",
+                          restricted=False):
             seen.append(persona_id)
             if session_id == "gone" and len(seen) == 1:
                 raise cli.ClaudeCliError(server.SESSION_NOT_FOUND)

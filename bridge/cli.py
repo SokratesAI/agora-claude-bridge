@@ -68,17 +68,34 @@ AUTH_EXPIRED = "\x00AUTH_EXPIRED"
 # Code session, same as this very session building it -- restriction should
 # be an explicit per-call opt-in, not a silent, incomplete default. Pass
 # disallowed_tools to run_turn/_run_cli_once to restrict a specific call;
-# omit it (the default) for full, unrestricted access.
+# omit it (the default) for full, unrestricted access. Pass restricted=True
+# with it for the CLI's own --restricted as well -- see the note on
+# DISCOVERED_FULL_TOOL_ROSTER for why a hand-kept list needs the flag beside
+# it, and the cmd construction below for why the two cannot be combined with
+# --dangerously-skip-permissions.
 #
-# Kept here as a reference for anyone who DOES want to restrict a call --
-# this is the complete roster observed live on CLI version 2.1.197, not a
-# guess. Verify against a fresh `system.init` event if the CLI version
-# changes; new tools can be added between versions.
+# 2026-08-31: the paragraph above warned that this list goes stale between
+# CLI versions, and it had. Measured on 2.1.251 from a real `system.init`
+# event in this pod -- `claude -p ... --output-format stream-json --verbose`,
+# both with and without --restricted, because the two report different
+# rosters -- the CLI had grown `ListAgents` and `RemoteTrigger` since 2.1.197
+# and neither was named here. So `restricted=True` was handing a persona two
+# tools it was meant not to have, which is v1's incomplete-denylist failure
+# happening again by drift rather than by design.
+#
+# The list is still hand-maintained and will drift again. What changed is
+# that it is no longer the only thing standing there: a restricted call now
+# also passes the CLI's own `--restricted` (2.1.248), which removes the
+# command- and code-running tools and WebFetch upstream, so a tool added in
+# 2.1.260 that this list has never heard of is still blocked from running a
+# shell. Keep both -- this one says "no built-in tools at all", the flag says
+# "and nothing that runs code, whatever it is called".
 DISCOVERED_FULL_TOOL_ROSTER = (
     "Task,CronCreate,CronDelete,CronList,DesignSync,EnterWorktree,ExitWorktree,"
-    "Monitor,NotebookEdit,PushNotification,ReportFindings,ScheduleWakeup,SendMessage,"
-    "Skill,TaskCreate,TaskGet,TaskList,TaskOutput,TaskStop,TaskUpdate,ToolSearch,"
-    "Workflow,Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+    "ListAgents,Monitor,NotebookEdit,PushNotification,RemoteTrigger,ReportFindings,"
+    "ScheduleWakeup,SendMessage,Skill,TaskCreate,TaskGet,TaskList,TaskOutput,"
+    "TaskStop,TaskUpdate,ToolSearch,Workflow,Bash,Read,Write,Edit,Glob,Grep,"
+    "WebFetch,WebSearch"
 )
 
 
@@ -525,7 +542,7 @@ def _provision_workspace(workspace):
 
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
                   system=None, attachments=None, slot="", conversation_id="",
-                  persona_id=""):
+                  persona_id="", restricted=False):
     workspace = _workspace_for(slot)
     if slot:
         # _workspace_for's invariant is "a concurrent turn always starts
@@ -599,7 +616,19 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     cmd.extend([
         "--output-format", "stream-json",
         "--verbose",
-        "--dangerously-skip-permissions",
+    ])
+    # --restricted and --dangerously-skip-permissions cannot both be passed:
+    # the CLI exits with "bypassPermissions not supported in restricted mode"
+    # before the turn starts (measured on 2.1.251, this pod). A restricted turn
+    # therefore runs on the default permission mode instead -- which is not a
+    # downgrade, because --restricted has already taken the tools that would
+    # have needed bypassing. Measured the same way: a restricted `-p` turn
+    # asked to Read a file uses Read and returns its contents with no prompt
+    # and no hang, so `-p` does not stall on the tools that survive.
+    if not restricted:
+        cmd.append("--dangerously-skip-permissions")
+    cmd.extend([
+
         # Everything a subagent does, on the parent's stream. Without this the
         # CLI reports a Task call and then nothing until it returns, which for
         # a delegated read is several minutes of apparent silence -- the owner's
@@ -661,6 +690,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     mcp_config = write_mcp_config(mcp, _slotted(MCP_CONFIG_FILE, slot))
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
+    if restricted:
+        cmd.append("--restricted")
     if disallowed_tools:
         cmd.extend(["--disallowedTools", disallowed_tools])
     # The persona's constitution belongs in the operator channel, not in the
@@ -1085,7 +1116,7 @@ def refresh_window_clear(margin=CONCURRENT_REFRESH_MARGIN_SECONDS, path=None, no
 
 def run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
              mcp=None, system=None, attachments=None, allow_concurrent=False,
-             conversation_id="", persona_id=""):
+             conversation_id="", persona_id="", restricted=False):
     """One turn. Returns (text, thinking, new_session_id).
 
     attachments: optional [{filename, mimeType, data}] with `data` base64,
@@ -1155,8 +1186,9 @@ def run_turn(message, session_id=None, model=None, disallowed_tools=None, activi
         slot = f"{os.getpid()}-{threading.get_ident()}"
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
                              system, attachments, slot=slot,
-                             conversation_id=conversation_id, persona_id=persona_id)
+                             conversation_id=conversation_id, persona_id=persona_id,
+                             restricted=restricted)
     with _invocation_lock:
         return _run_cli_once(message, session_id, model, disallowed_tools, activity, mcp,
                              system, attachments, conversation_id=conversation_id,
-                             persona_id=persona_id)
+                             persona_id=persona_id, restricted=restricted)
