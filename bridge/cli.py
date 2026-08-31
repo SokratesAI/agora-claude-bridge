@@ -622,9 +622,11 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # before the turn starts (measured on 2.1.251, this pod). A restricted turn
     # therefore runs on the default permission mode instead -- which is not a
     # downgrade, because --restricted has already taken the tools that would
-    # have needed bypassing. Measured the same way: a restricted `-p` turn
-    # asked to Read a file uses Read and returns its contents with no prompt
-    # and no hang, so `-p` does not stall on the tools that survive.
+    # have needed bypassing. Measured the same way: nothing stalls -- a
+    # restricted `-p` turn asked to Read a file uses Read and answers, and one
+    # asked to Write gets an immediate permission_denied rather than a hang.
+    # Read the second half of that: on the default permission mode `-p` denies
+    # instead of prompting, which is why the MCP grant below is not optional.
     if not restricted:
         cmd.append("--dangerously-skip-permissions")
     cmd.extend([
@@ -692,6 +694,25 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
     if restricted:
         cmd.append("--restricted")
+        if mcp_config:
+            # Without this a restricted persona has no working tools at all,
+            # which is not what restricted means and is worse than the hole
+            # --restricted was added to close. Measured in this pod on 2.1.251
+            # against a stub MCP server: dropping --dangerously-skip-permissions
+            # puts the turn on permissionMode "default", and in `-p` there is no
+            # prompt and no --permission-prompt-tool, so anything not auto-allowed
+            # is hard-denied. The denylist takes every built-in, so the only tools
+            # left are this server's -- and an MCP tool is exactly the class that
+            # needs approval. The turn returns 200 with the model apologising
+            # about a permission nobody can grant it, and nothing logs a failure.
+            #
+            # A server-wide grant rather than a tool list on purpose: the runner
+            # decides which capability tools a persona gets and hands them over
+            # in the mcp config, so naming them again here would be a second copy
+            # of that decision, drifting from the first. --permission-mode
+            # bypassPermissions is not the alternative -- restricted mode refuses
+            # it, which is the whole reason the bypass came off above.
+            cmd.extend(["--allowedTools", f"mcp__{MCP_SERVER_NAME}"])
     if disallowed_tools:
         cmd.extend(["--disallowedTools", disallowed_tools])
     # The persona's constitution belongs in the operator channel, not in the
