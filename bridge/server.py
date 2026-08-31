@@ -162,6 +162,14 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     interactive Claude Code session by default, with restriction an
     explicit per-persona opt-in rather than a silent default.
 
+    2026-08-31 (idea #168): it also passes the CLI's own `--restricted`
+    (2.1.248), and drops `--dangerously-skip-permissions` for that call
+    because the CLI refuses the two together. The denylist alone was the
+    incomplete guard v1 shipped, one drift later: measured on 2.1.251, the
+    CLI had grown two tools the roster had never heard of. The flag is
+    maintained upstream, so a tool added in a version this repo has not
+    read about still cannot run a shell.
+
     stateless (2026-08-01, off by default): when true, never reads or
     writes this conversation's stored session_id -- every call gets the
     full system+prompt and starts a fresh CLI session with no --resume.
@@ -211,6 +219,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
         text, thinking, _ = _run_turn_with_auth_retry(
             message=prompt, session_id=None, model=model,
             disallowed_tools=DISCOVERED_FULL_TOOL_ROSTER if restricted else None,
+            restricted=restricted,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
             allow_concurrent=allow_concurrent, conversation_id=conversation_id,
             persona_id=persona_id,
@@ -223,6 +232,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     try:
         text, thinking, new_session_id = _run_turn_with_auth_retry(
             message=prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
+            restricted=restricted,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
             allow_concurrent=allow_concurrent, conversation_id=conversation_id,
             persona_id=persona_id,
@@ -233,6 +243,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             clear_session_id(conversation_id)
             text, thinking, new_session_id = _run_turn_with_auth_retry(
                 message=prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
+                restricted=restricted,
                 activity=activity, mcp=mcp, system=system, attachments=attachments,
                 allow_concurrent=allow_concurrent, conversation_id=conversation_id,
                 persona_id=persona_id,
