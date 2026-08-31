@@ -522,9 +522,11 @@ def test_restricted_turn_still_allows_the_runner_mcp_tools(tmp_path):
 
     with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "MCP_CONFIG_FILE", str(tmp_path / "mcp.json")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
         cli.run_turn("hello", disallowed_tools=cli.DISCOVERED_FULL_TOOL_ROSTER,
                      restricted=True, mcp={"url": "http://runner/mcp", "token": "t"})
+    assert "--mcp-config" in captured["cmd"], "the fixture must actually write an mcp config"
     assert "--allowedTools" in captured["cmd"]
     allowed = captured["cmd"][captured["cmd"].index("--allowedTools") + 1]
     assert allowed == f"mcp__{cli.MCP_SERVER_NAME}"
@@ -564,8 +566,10 @@ def test_an_unrestricted_turn_with_mcp_grants_nothing(tmp_path):
 
     with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli, "MCP_CONFIG_FILE", str(tmp_path / "mcp.json")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
         cli.run_turn("hello", mcp={"url": "http://runner/mcp", "token": "t"})
+    assert "--mcp-config" in captured["cmd"], "the fixture must actually write an mcp config"
     assert "--allowedTools" not in captured["cmd"]
 
 
