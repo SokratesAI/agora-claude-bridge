@@ -252,7 +252,7 @@ class ActivityReporter:
                 payload["toolUseId"] = tool_use_id
             self._queue.put(payload)
 
-    def report_text(self, text):
+    def report_text(self, text, stream_id=""):
         """A passage the persona wrote on its way to the answer.
 
         The reply used to be every text block the session produced, joined
@@ -272,7 +272,48 @@ class ActivityReporter:
         """
         passage = (text or "").strip()
         if self.enabled and passage:
-            self._queue.put({"capability": NARRATION_TEXT, "detail": passage})
+            payload = {"capability": NARRATION_TEXT, "detail": passage}
+            # Every step of one passage travels under the same id, and each
+            # carries the whole passage so far rather than a delta. Agora's
+            # client folds them into the first one's slot, so the drawer shows
+            # one entry growing instead of the same text N times, and a step
+            # lost between two polls is repaired by the next one instead of
+            # leaving a hole (agora/public/app.js mergeTextStreams).
+            if stream_id:
+                payload["toolUseId"] = stream_id
+            self._queue.put(payload)
+
+    def retract_text(self, stream_id):
+        """Withdraw every step posted under this passage's id.
+
+        The bridge cannot know while a passage is being written whether it is
+        narration or the reply -- the reply is whichever passage is still
+        pending when the turn ends. So it streams every passage and retracts
+        the one that turned out to be the reply, which is about to be sent as
+        the reply itself. Without this the owner reads his answer twice: once
+        growing in the drawer, once in the bubble.
+
+        No text: a retraction says only which id is withdrawn.
+
+        Posted directly rather than queued, and that is not a style choice.
+        This is chosen after the reply is picked, which happens after close()
+        has already stopped the worker and set `_thread` to None -- a queued
+        item at that point is put onto a queue nobody will ever drain again,
+        so the retraction would be silently dropped and the owner would read
+        the passage twice while every log line said it had been withdrawn.
+        Ordering costs nothing here: the client scans every step for the
+        retracting one wherever it lands, and this is one bounded post at the
+        very end of a turn rather than one per chip.
+        """
+        if not (self.enabled and stream_id):
+            return
+        _post(self._url, _scrubbed({
+            "token": self._token,
+            "capability": NARRATION_TEXT,
+            "detail": "",
+            "toolUseId": stream_id,
+            "retracted": True,
+        }))
 
     def report_subagent_text(self, description, text):
         """A passage a SUBAGENT wrote, on its way to its own answer.

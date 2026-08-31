@@ -363,7 +363,8 @@ def run_narrated_until_timeout(tmp_path, lines):
     """
     narrated = []
     with patch.object(cli.ActivityReporter, "report_text",
-                      side_effect=lambda text: narrated.append(text), autospec=False), \
+                      side_effect=lambda text, stream_id="": narrated.append(text),
+                      autospec=False), \
          patch.object(cli.ActivityReporter, "start", autospec=False), \
          patch.object(cli.ActivityReporter, "close", autospec=False), \
          patch.object(cli.ActivityReporter, "report", autospec=False), \

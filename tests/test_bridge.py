@@ -1990,6 +1990,219 @@ def test_run_turn_returns_every_passage_when_nothing_is_narrated(tmp_path):
     assert posted == []
 
 
+# ---------------------------------------------------------------------------
+# Streaming a passage as it is written (issue #4). --include-partial-messages
+# puts the persona's own prose on the stream token by token as `stream_event`
+# events, alongside the whole-message `assistant` ones. Every step of one
+# passage travels under one id carrying the whole passage so far; Agora's
+# client folds them into one growing entry, and drops every step under an id
+# a `retracted` step withdraws (agora/public/app.js mergeTextStreams).
+# ---------------------------------------------------------------------------
+
+def _delta(text, index=0):
+    return {"type": "stream_event", "event": {
+        "type": "content_block_delta", "index": index,
+        "delta": {"type": "text_delta", "text": text}}}
+
+
+def _block_start(index=0, kind="text"):
+    return {"type": "stream_event", "event": {
+        "type": "content_block_start", "index": index,
+        "content_block": {"type": kind, "text": ""}}}
+
+
+def _block_stop(index=0):
+    return {"type": "stream_event", "event": {
+        "type": "content_block_stop", "index": index}}
+
+
+def _run_lines(tmp_path, posted, lines, **kwargs):
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(cli.subprocess, "Popen", return_value=FakeProc(_stream_json_lines(*lines))):
+        return cli.run_turn("hello", **kwargs)
+
+
+def _streamed_narration_lines():
+    """One narration passage streamed in three deltas, then a closing reply
+    passage streamed in two -- the ordinary shape of a turn."""
+    return [
+        _block_start(),
+        _delta("First I look"),
+        _delta(" at the pods.\n\n"),
+        _delta("Then I read the logs."),
+        {"type": "assistant", "message": {"content": [
+            {"type": "text",
+             "text": "First I look at the pods.\n\nThen I read the logs."}]}},
+        _block_stop(),
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_a", "name": "Bash",
+             "input": {"command": "kubectl get pods"}}]}},
+        _block_start(),
+        _delta("They are all up.\n\n"),
+        _delta("Nothing to do."),
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "They are all up.\n\nNothing to do."}]}},
+        _block_stop(),
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    ]
+
+
+def test_the_cli_is_asked_for_partial_messages(tmp_path):
+    """Without the flag the CLI emits nothing until a whole passage is
+    finished, which for a long one is the silence issue #4 is about."""
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return FakeProc(_stream_json_lines(
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "done"}]}},
+            {"type": "result", "session_id": "s", "subtype": "success"}))
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", fake_popen):
+        cli.run_turn("hello")
+    assert "--include-partial-messages" in seen["cmd"]
+
+
+def test_a_passage_is_streamed_at_every_paragraph_break(tmp_path):
+    """Not per token: a step is an HTTP post and an append to the
+    conversation, so one per token would be thousands of both for one turn."""
+    posted = []
+    _run_lines(tmp_path, posted, _streamed_narration_lines(),
+               activity={"url": "http://runner/x", "token": "tok"})
+    streamed = [p for p in posted if p["capability"] == "assistant_text"]
+    # One flush at the paragraph break inside the first passage, one at the
+    # break inside the second, the final whole first passage when it is
+    # released as narration, and the retraction of the second.
+    assert streamed[0]["detail"] == "First I look at the pods."
+    assert streamed[0]["toolUseId"]
+    # Three deltas, one paragraph break: one step, not three.
+    assert len([p for p in streamed
+                if p.get("toolUseId") == streamed[0]["toolUseId"]
+                and not p.get("retracted")]) == 2
+
+
+def test_every_step_of_one_passage_shares_one_id_and_carries_the_whole_text(tmp_path):
+    """The client folds them into the first one's slot, so the drawer shows
+    one entry growing rather than the same text N times -- and a step lost
+    between two polls is repaired by the next one instead of leaving a hole,
+    which only works if each carries the whole passage rather than a delta."""
+    posted = []
+    _run_lines(tmp_path, posted, _streamed_narration_lines(),
+               activity={"url": "http://runner/x", "token": "tok"})
+    first = [p for p in posted if p["capability"] == "assistant_text"
+             and p.get("toolUseId") == "text-1"]
+    assert [p["detail"] for p in first] == [
+        "First I look at the pods.",
+        "First I look at the pods.\n\nThen I read the logs.",
+    ]
+
+
+def test_two_passages_in_one_turn_do_not_share_a_stream_id(tmp_path):
+    """The CLI restarts its content-block index at 0 on every message, so an
+    id built from that index would merge two unrelated passages into one."""
+    posted = []
+    _run_lines(tmp_path, posted, _streamed_narration_lines(),
+               activity={"url": "http://runner/x", "token": "tok"})
+    ids = {p.get("toolUseId") for p in posted
+           if p["capability"] == "assistant_text"}
+    assert ids == {"text-1", "text-2"}
+
+
+def test_the_passage_that_became_the_reply_is_retracted(tmp_path):
+    """It is about to be sent as the reply. Without the retraction the owner
+    reads his answer twice: once growing in the drawer, once in the bubble."""
+    posted = []
+    text, _, _ = _run_lines(tmp_path, posted, _streamed_narration_lines(),
+                            activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "They are all up.\n\nNothing to do."
+    retractions = [p for p in posted if p.get("retracted")]
+    assert len(retractions) == 1
+    assert retractions[0]["toolUseId"] == "text-2"
+    assert retractions[0]["capability"] == "assistant_text"
+
+
+def test_the_narration_passage_is_not_retracted(tmp_path):
+    """Retracting a passage that stays in the drawer would erase it."""
+    posted = []
+    _run_lines(tmp_path, posted, _streamed_narration_lines(),
+               activity={"url": "http://runner/x", "token": "tok"})
+    assert all(p.get("toolUseId") != "text-1"
+               for p in posted if p.get("retracted"))
+
+
+def test_the_retraction_survives_the_reporter_being_closed(tmp_path):
+    """The reply is picked after the turn's finally block has already stopped
+    the worker thread, so a queued retraction would be put onto a queue
+    nobody drains again -- silently dropped, with the duplication back."""
+    posted = []
+    reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+    reporter.start()
+    reporter.close()
+    with patch.object(activity, "_post",
+                      lambda url, payload: posted.append(payload) or True):
+        reporter.retract_text("text-9")
+    assert posted == [{"token": "tok", "capability": "assistant_text",
+                       "detail": "", "toolUseId": "text-9", "retracted": True}]
+
+
+def test_a_subagents_partials_are_not_streamed(tmp_path):
+    """A subagent's finished text is forwarded whole and attributed on its
+    first line; an unattributed passage growing in the drawer would read as
+    the persona's own voice."""
+    posted = []
+    lines = [
+        dict(_block_start(), parent_tool_use_id="toolu_agent"),
+        dict(_delta("child thinking out loud.\n\n"), parent_tool_use_id="toolu_agent"),
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "the persona's answer"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    ]
+    text, _, _ = _run_lines(tmp_path, posted, lines,
+                            activity={"url": "http://runner/x", "token": "tok"})
+    assert text == "the persona's answer"
+    assert all("child thinking" not in str(p.get("detail", "")) for p in posted)
+
+
+def test_a_thinking_block_never_claims_a_stream_id(tmp_path):
+    """A `thinking` content block opens exactly like a text one. Giving it an
+    id would shift every later passage onto the wrong stream."""
+    posted = []
+    lines = [
+        _block_start(kind="thinking"),
+        _delta("reasoning"),
+        _block_stop(),
+        _block_start(),
+        _delta("First I look at the pods.\n\n"),
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "First I look at the pods.\n\ndone"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_a", "name": "Bash",
+             "input": {"command": "ls"}}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    ]
+    _run_lines(tmp_path, posted, lines,
+               activity={"url": "http://runner/x", "token": "tok"})
+    streamed = [p for p in posted if p["capability"] == "assistant_text"]
+    assert streamed[0]["toolUseId"] == "text-1"
+    assert all("reasoning" not in p["detail"] for p in streamed)
+
+
+def test_a_passage_the_cli_never_streamed_still_narrates(tmp_path):
+    """An older CLI, or a message whose partials were lost. No stream id, and
+    Agora leaves a passage without one exactly as it always rendered."""
+    posted = []
+    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    narration = [p for p in posted if p["capability"] == "assistant_text"]
+    assert narration[0]["detail"] == "First I look at the pods."
+    assert "toolUseId" not in narration[0]
+    assert not any(p.get("retracted") for p in posted)
+
+
 def test_run_turn_keeps_a_lone_passage_intact(tmp_path):
     """One text block and no tools: nothing precedes it, so nothing is
     narrated and the reply is exactly what it always was."""
