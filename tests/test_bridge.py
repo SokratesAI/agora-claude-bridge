@@ -549,7 +549,7 @@ def test_generate_sends_system_prompt_out_of_band_not_in_the_message():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -576,7 +576,7 @@ def test_generate_resends_the_system_prompt_on_a_resumed_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -597,7 +597,7 @@ def test_generate_retries_fresh_on_session_not_found():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         calls.append((message, session_id, system))
         if session_id == "sess-gone":
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -620,7 +620,7 @@ def test_generate_retries_fresh_on_session_not_found():
 def test_generate_propagates_other_cli_errors_without_retry():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         raise server.ClaudeCliError("a real bug")
 
     with patch.object(server, "get_session_id", return_value="sess-1"), \
@@ -634,7 +634,7 @@ def test_generate_is_unrestricted_by_default():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -651,7 +651,7 @@ def test_generate_restricted_true_passes_the_full_tool_roster():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -668,7 +668,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["message"] = message
         captured["session_id"] = session_id
         captured["system"] = system
@@ -690,7 +690,7 @@ def test_generate_stateless_always_sends_full_system_and_no_resume():
 def test_generate_stateless_ignores_a_stored_session_for_the_same_conversation():
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         return "reply", "", "sess-x"
 
     with patch.object(server, "get_session_id", return_value="sess-existing") as mock_get, \
@@ -707,7 +707,7 @@ def test_generate_stateless_can_combine_with_restricted():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["disallowed_tools"] = disallowed_tools
         return "reply", "", "sess-1"
 
@@ -772,7 +772,7 @@ def test_do_post_passes_restricted_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -788,7 +788,7 @@ def test_do_post_restricted_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -806,7 +806,7 @@ def test_do_post_passes_stateless_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -822,7 +822,7 @@ def test_do_post_stateless_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -1205,7 +1205,7 @@ def test_do_post_passes_activity_through_to_generate():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1222,7 +1222,7 @@ def test_do_post_activity_defaults_to_none_when_omitted():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1238,7 +1238,7 @@ def _capture_generate_attachments(payload):
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["attachments"] = attachments
         captured["prompt"] = prompt
         return "answer", ""
@@ -1302,7 +1302,7 @@ def test_generate_passes_attachments_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1321,7 +1321,7 @@ def test_generate_stateless_also_passes_attachments_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["attachments"] = attachments
         return "reply", "", "sess-1"
 
@@ -1345,7 +1345,7 @@ def _capture_generate_allow_concurrent(payload):
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
         captured["allow_concurrent"] = allow_concurrent
         return "answer", ""
 
@@ -1375,7 +1375,7 @@ def test_generate_passes_allow_concurrent_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["allow_concurrent"] = allow_concurrent
         return "reply", "", "sess-1"
 
@@ -1394,7 +1394,7 @@ def test_generate_stateless_also_passes_allow_concurrent_to_run_turn():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         captured["allow_concurrent"] = allow_concurrent
         return "reply", "", "sess-1"
 
@@ -1411,7 +1411,7 @@ def test_generate_keeps_allow_concurrent_on_the_session_not_found_retry():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         seen.append(allow_concurrent)
         if session_id is not None:
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -1499,7 +1499,7 @@ def test_generate_composes_auth_retry_with_the_session_not_found_retry():
 
     def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None, activity=None,
                       mcp=None, system=None, attachments=None, allow_concurrent=False,
-                      conversation_id=""):
+                      conversation_id="", persona_id=""):
         calls.append(session_id)
         if len(calls) == 1:
             raise server.ClaudeCliError(server.SESSION_NOT_FOUND)
@@ -2803,3 +2803,64 @@ def test_a_short_tool_result_is_untouched():
     from bridge import activity
     assert activity.result_text({"content": "hello"}) == "hello"
     assert "not shown" not in activity.result_text({"content": "hello"})
+
+
+# --- idea #165: a chat persona's own memory directory ----------------------
+
+
+def _capture_generate_persona_id(payload):
+    handler, sent = _make_handler(payload)
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False,
+                      persona_id=""):
+        captured["persona_id"] = persona_id
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    return sent, captured
+
+
+def test_do_post_passes_persona_id_through_to_generate():
+    """Without this the field is read off the payload and dropped, and every
+    persona shares the CLI's per-working-directory default -- which on a
+    concurrent slot is a fresh empty directory every turn."""
+    sent, captured = _capture_generate_persona_id(
+        {"conversation_id": "c1", "prompt": "hi", "persona_id": "p-123"})
+    assert sent["status"] == 200
+    assert captured["persona_id"] == "p-123"
+
+
+def test_do_post_persona_id_is_empty_when_a_caller_omits_it():
+    """A caller that predates this field gets exactly what it had before."""
+    sent, captured = _capture_generate_persona_id(
+        {"conversation_id": "c1", "prompt": "hi"})
+    assert sent["status"] == 200
+    assert captured["persona_id"] == ""
+
+
+def test_generate_passes_persona_id_to_run_turn_on_every_path():
+    """generate() reaches the CLI from three places -- stateless, normal, and
+    the SESSION_NOT_FOUND retry. A persona that keeps its memory on two of
+    them and silently loses it on the third is the bug nobody reproduces."""
+    for kwargs, session in (({"stateless": True}, None), ({}, None), ({}, "gone")):
+        seen = []
+
+        def fake_run_turn(message, session_id=None, model=None, disallowed_tools=None,
+                          activity=None, mcp=None, system=None, attachments=None,
+                          allow_concurrent=False, conversation_id="", persona_id=""):
+            seen.append(persona_id)
+            if session_id == "gone" and len(seen) == 1:
+                raise cli.ClaudeCliError(server.SESSION_NOT_FOUND)
+            return "reply", "", "sess-1"
+
+        with patch.object(server, "get_session_id", return_value=session), \
+             patch.object(server, "set_session_id"), \
+             patch.object(server, "clear_session_id"), \
+             patch.object(server, "run_turn", side_effect=fake_run_turn):
+            server.generate("conv-1", "system", "hi", persona_id="p-9", **kwargs)
+
+        assert seen and all(p == "p-9" for p in seen), (kwargs, seen)
