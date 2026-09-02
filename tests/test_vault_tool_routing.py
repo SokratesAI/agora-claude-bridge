@@ -69,12 +69,32 @@ class TestDbFor:
     def test_digest_routes_to_nova(self, env):
         assert vault_tool.VaultClient().db_for(DIGEST) == "nova"
 
-    def test_edvards_files_stay_in_his_vault(self, env):
+    def test_his_nova_folder_routes_to_nova(self, env):
+        """Inverted on 2026-09-02, at his ask, rather than deleted.
+
+        This test asserted the opposite -- that everything under
+        `projects/sokrates/projects/nova/` stayed in `obsidian` -- for the
+        whole time that was the rule. Keeping it pointed the other way is
+        what makes a revert of `NOVA_DB_FOLDERS` fail here instead of
+        passing silently.
+        """
         client = vault_tool.VaultClient()
         for path in (HIS_FILE,
                      "projects/sokrates/projects/nova/ideas.md",
                      "projects/sokrates/projects/nova/notes.md",
-                     "projects/sokrates/projects/agora/architecture.md"):
+                     "projects/sokrates/projects/nova/roadmap.md"):
+            assert client.db_for(path) == "nova", path
+
+    def test_the_rest_of_his_vault_stays_in_his_vault(self, env):
+        """The folder rule is a prefix, and it is only that one prefix.
+
+        Without this, widening `NOVA_DB_FOLDERS` to his whole vault would
+        pass every other test in this class.
+        """
+        client = vault_tool.VaultClient()
+        for path in ("projects/sokrates/projects/agora/architecture.md",
+                     "projects/sokrates/projects/nova-old/issues.md",
+                     "projects/sokrates/projects/notes.md"):
             assert client.db_for(path) == "obsidian", path
 
     def test_single_file_targets_match_exactly_not_by_prefix(self, env):
@@ -140,13 +160,21 @@ class TestChunksFollowTheirDocument:
         assert all(db == "nova" for _, db, _ in calls), calls
         assert any(m == "PUT" and p.startswith("h:") for m, _, p in calls), calls
 
-    def test_writing_his_file_never_touches_nova(self, env):
+    def test_writing_his_file_now_lands_in_nova(self, env):
+        """Also inverted on 2026-09-02 rather than deleted.
+
+        The chunk writes have to follow the document, not just the doc
+        itself: a write that put the body in one database and the chunks
+        in the other would leave the file unreadable from either.
+        """
         client, calls = _recording_client({
-            ("GET", "obsidian", HIS_FILE): (404, {}),
-            ("POST", "obsidian", "_all_docs"): (200, {"rows": []}),
+            ("GET", "nova", HIS_FILE): (404, {}),
+            ("POST", "nova", "_all_docs"): (200, {"rows": []}),
         })
         client.write(HIS_FILE, "hello")
-        assert all(db == "obsidian" for _, db, _ in calls), calls
+        assert calls, "no CouchDB calls made"
+        assert all(db == "nova" for _, db, _ in calls), calls
+        assert any(m == "PUT" and p.startswith("h:") for m, _, p in calls), calls
 
     def test_deleting_a_nova_file_deletes_it_from_nova(self, env):
         """Asserting only the database left this test passing under the
@@ -294,13 +322,14 @@ class TestDatabaseHealth:
         assert routes == {
             "projects/sokrates/projects/agora/nova/journal/138-cycle-121.md": "nova",
             "projects/sokrates/projects/agora/journal-digest.md": "nova",
-            # The two regressions rather than examples. A `.bak` beside the
-            # digest is the owner's file and must not follow it, and the Nova
-            # folder he asked to keep is in *his* vault -- everything under
-            # `agora/nova/` routes away, and this one does not live there.
+            # The one regression rather than an example: a `.bak` beside
+            # the digest is the owner's file and must not follow it into
+            # Nova's database.
             "projects/sokrates/projects/agora/journal-digest.md.bak": "obsidian",
-            "projects/sokrates/projects/nova/nova.md": "obsidian",
-            "projects/sokrates/projects/nova/issues.md": "obsidian",
+            # His own nova folder, which routed to `obsidian` until he
+            # asked for it on 2026-09-02.
+            "projects/sokrates/projects/nova/nova.md": "nova",
+            "projects/sokrates/projects/nova/issues.md": "nova",
         }
 
     def test_probes_cover_both_databases(self, env):

@@ -139,11 +139,13 @@ NOVA_DB_FILES = (
 NOVA_DB_TARGETS = NOVA_DB_FOLDERS + NOVA_DB_FILES
 
 # Paths whose routing this process reports on demand. Five distinct
-# behaviours of `db_for`, two of which are regressions rather than
-# examples: a `.bak` beside the digest must NOT follow it into Nova's
-# database, and the Nova folder the owner asked to keep in his own vault must
-# stay there. The other three are the folder rule, the exact-file rule and
-# a file of his that must never move.
+# behaviours of `db_for`, one of which is a regression rather than an
+# example: a `.bak` beside the digest must NOT follow it into Nova's
+# database. The rest are the two folder rules and the exact-file rule.
+# `projects/sokrates/projects/nova/` was the fifth case -- a folder of his
+# that had to stay in `obsidian` -- and it now probes the opposite,
+# because he asked for that folder on 2026-09-02; see the note on
+# `NOVA_DB_FOLDERS`.
 #
 # **This tuple is a deliberate copy of agora-persona-runner's
 # HEALTH_PROBE_PATHS, and copying it is the point.** The routing rule
@@ -167,12 +169,12 @@ HEALTH_PROBE_PATHS = (
     "projects/sokrates/projects/nova/nova.md",
     # Was `agora/issues.md` until 2026-08-12, when the three files the owner
     # writes by hand moved into the Nova folder in his own vault at his
-    # ask -- *"they can be moved into the Nova folder in my Vault and not
-    # be underneath the agora project folder"*. The rule it probes is
-    # unchanged; the path had to move with the file, or this tuple points
-    # at a document nobody can open. The runner's copy moved in the same
-    # cycle: these two tuples must stay identical or the drift check above
-    # is comparing two different questions.
+    # ask; that folder then moved into Nova's database on 2026-09-02, also
+    # at his ask, so this path now probes Nova's store rather than his. The
+    # path stays real either way, or this tuple points at a document nobody
+    # can open. The runner's copy carries the same note: these two tuples
+    # must stay identical or the drift check above is comparing two
+    # different questions.
     "projects/sokrates/projects/nova/issues.md",
 )
 
