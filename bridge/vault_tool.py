@@ -105,11 +105,25 @@ LOCAL_TZ = "Europe/Oslo"
 # between the writer and the reader serves a file out of the wrong store.
 # Keep them identical, or fix them both in the same cycle.
 #
-# `issues.md` and `ideas.md` deliberately stay in `obsidian`. The owner offered
-# them ("Take all of 'my' files aswell with you if you want"), but they are
-# the two files Obsidian LiveSync may still write, and a second writer that
-# cannot see this rule would silently re-create them in the vault Nova had
-# stopped reading.
+# `projects/sokrates/projects/nova/` moved into Nova's database on 2026-09-02,
+# at the owner's ask: *"Move the goals, issues, ideas, notes, projects and
+# roadmap.md markdown files out of my obsidian vault and into yours. I often
+# get a conflict error when i open obsidian since there has been changes in
+# those files. I never open them either, so better to move them so that you
+# control them."* That reverses the paragraph this replaces, which kept them
+# in `obsidian` because "Obsidian LiveSync may still write them and a second
+# writer that cannot see this rule would silently re-create them in the vault
+# Nova had stopped reading". The risk was real and is now the point: he does
+# not open those files in Obsidian, and LiveSync writing them is what was
+# giving him conflicts. He types into them through the Nova app, which reads
+# and writes through this rule, so the app is unaffected -- but an edit made
+# in Obsidian after this lands is invisible to Nova, permanently.
+#
+# **All ten documents were copied into Nova's database first**, verified
+# byte-identical on read-back, before this constant changed (Cycle 789). Do
+# that again before adding any folder here: flipping the rule ahead of the
+# copy answers every read from a database that has never held the file, and
+# the boards go blank with nothing reporting it.
 #
 # Folders match by prefix; single files must match EXACTLY. Testing
 # everything with startswith routed `journal-digest.md.bak` -- and any other
@@ -117,6 +131,7 @@ LOCAL_TZ = "Europe/Oslo"
 # file the owner owns being answered by the wrong store.
 NOVA_DB_FOLDERS = (
     "projects/sokrates/projects/agora/nova/",
+    "projects/sokrates/projects/nova/",
 )
 NOVA_DB_FILES = (
     "projects/sokrates/projects/agora/journal-digest.md",
