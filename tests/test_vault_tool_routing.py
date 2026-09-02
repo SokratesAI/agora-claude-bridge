@@ -17,7 +17,11 @@ from bridge import vault_tool
 
 NOVA_FILE = "projects/sokrates/projects/agora/nova/resources/issues.md"
 DIGEST = "projects/sokrates/projects/agora/journal-digest.md"
-HIS_FILE = "projects/sokrates/projects/nova/issues.md"
+# His capture files moved into Nova's database on 2026-09-02 at his ask;
+# what still answers from his vault is anything outside both routed
+# folders, so that is what HIS_FILE now names.
+HIS_FILE = "projects/sokrates/projects/agora/resources/architecture.md"
+HIS_MOVED_CAPTURE_FILE = "projects/sokrates/projects/nova/issues.md"
 
 
 @pytest.fixture
@@ -72,10 +76,21 @@ class TestDbFor:
     def test_edvards_files_stay_in_his_vault(self, env):
         client = vault_tool.VaultClient()
         for path in (HIS_FILE,
-                     "projects/sokrates/projects/nova/ideas.md",
-                     "projects/sokrates/projects/nova/notes.md",
-                     "projects/sokrates/projects/agora/architecture.md"):
+                     "projects/sokrates/projects/agora/architecture.md",
+                     "projects/sokrates/projects/nova-old/x.md",
+                     "projects/sokrates/projects/nova"):
             assert client.db_for(path) == "obsidian", path
+
+    def test_his_own_nova_folder_moved_into_novas_database(self, env):
+        """He asked for this on 2026-09-02 -- *"I never open them either, so
+        better to move them so that you control them"* -- so this asserts the
+        opposite of what the test above asserted about these paths before
+        that date."""
+        client = vault_tool.VaultClient()
+        for name in ("issues.md", "ideas.md", "notes.md", "goals.md",
+                     "projects.md", "roadmap.md"):
+            path = "projects/sokrates/projects/nova/" + name
+            assert client.db_for(path) == "nova", path
 
     def test_single_file_targets_match_exactly_not_by_prefix(self, env):
         """`journal-digest.md.bak` is the owner's, not Nova's.
@@ -147,6 +162,17 @@ class TestChunksFollowTheirDocument:
         })
         client.write(HIS_FILE, "hello")
         assert all(db == "obsidian" for _, db, _ in calls), calls
+
+    def test_writing_a_moved_capture_file_never_touches_obsidian(self, env):
+        """The write side of the 2026-09-02 move. A doc written to `nova`
+        whose chunks land in `obsidian` reads back empty, not as an error."""
+        client, calls = _recording_client({
+            ("GET", "nova", HIS_MOVED_CAPTURE_FILE): (404, {}),
+            ("POST", "nova", "_all_docs"): (200, {"rows": []}),
+        })
+        client.write(HIS_MOVED_CAPTURE_FILE, "hello")
+        assert all(db == "nova" for _, db, _ in calls), calls
+        assert any(m == "PUT" and p.startswith("h:") for m, _, p in calls), calls
 
     def test_deleting_a_nova_file_deletes_it_from_nova(self, env):
         """Asserting only the database left this test passing under the
@@ -299,8 +325,8 @@ class TestDatabaseHealth:
             # folder he asked to keep is in *his* vault -- everything under
             # `agora/nova/` routes away, and this one does not live there.
             "projects/sokrates/projects/agora/journal-digest.md.bak": "obsidian",
-            "projects/sokrates/projects/nova/nova.md": "obsidian",
-            "projects/sokrates/projects/nova/issues.md": "obsidian",
+            "projects/sokrates/projects/nova/nova.md": "nova",
+            "projects/sokrates/projects/nova/issues.md": "nova",
         }
 
     def test_probes_cover_both_databases(self, env):
