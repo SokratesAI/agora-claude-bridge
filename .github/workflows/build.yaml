@@ -180,6 +180,65 @@ jobs:
       # The config repo is checked out into `.config` rather than the workspace
       # root, because unlike the old job this one already has this repo's own
       # source checked out and must not clobber it.
+      # Nothing between `docker build` and the digest commit below had ever
+      # STARTED this container, and on 2026-09-02 that cost ten hours. #660
+      # added `import yaml` to a runtime module while the Dockerfile had no
+      # pip install step; 5,794 tests passed (the CI runner installs pyyaml
+      # for a test that parses this very file), the image built, the digest
+      # landed in -config, and every replacement pod died on startup with
+      # ModuleNotFoundError. Single replica, strategy Recreate, no fallback
+      # pod: the heartbeat simply stopped, 19:01Z to 05:02Z, and Nova is the
+      # thing that watches this system, so nothing reported it.
+      #
+      # tests/test_shipped_imports_are_installable.py (#664) closes that one
+      # class statically, by comparing what the image imports against what it
+      # installs. This step is the other half and it is deliberately not a
+      # smarter version of the same idea: it runs the artefact, so it also
+      # covers what static analysis structurally cannot -- a COPY that misses
+      # a file, a wheel that installs but will not import here, a pinned
+      # download that 404s, a permission the `runner` user does not have.
+      #
+      # It pulls by digest rather than reusing a local build, so what is
+      # tested is the exact bytes the manifest is about to name. No env is
+      # supplied on purpose: every setting in agora_runner/config.py has a
+      # default and poll_once swallows its own errors, so an unconfigured
+      # runner comes up and polls into the void exactly like a configured one
+      # -- which makes "did the process stay up" a question about the image
+      # and not about secrets this job does not have.
+      #
+      # Both entrypoints are checked because one image serves two Deployments.
+      # This copy and agora-persona-runner's are compared whole by
+      # tools/sync_contract.py, which is why the step discovers what to start
+      # instead of naming it: the two images ship different entrypoints.
+      #
+      # A failure here leaves the image pushed to GHCR but unreferenced, which
+      # is harmless -- only the digest commit below deploys anything.
+      - name: Smoke-test the pushed image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull -q "$IMAGE"
+          entrypoints=$(docker run --rm --entrypoint sh "$IMAGE" -c 'ls /app/run*.py 2>/dev/null' || true)
+          if [ -z "$entrypoints" ]; then
+            echo "::error::the image ships no /app/run*.py, so this step would start nothing and pass. Either the COPY changed or the entrypoints were renamed."
+            exit 1
+          fi
+          for ep in $entrypoints; do
+            echo "--- starting $ep ---"
+            cid=$(docker run -d --entrypoint python "$IMAGE" "$ep")
+            sleep 20
+            if [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != "true" ]; then
+              code=$(docker inspect -f '{{.State.ExitCode}}' "$cid")
+              echo "::error::$ep exited with code $code inside the built image. This digest is NOT being deployed. Logs follow."
+              docker logs "$cid" 2>&1 || true
+              docker rm -f "$cid" >/dev/null 2>&1 || true
+              exit 1
+            fi
+            docker logs "$cid" 2>&1 | head -30
+            docker rm -f "$cid" >/dev/null 2>&1 || true
+          done
+
       - name: Generate installation token scoped to the config repo only
         id: app-token
         uses: actions/create-github-app-token@v3
