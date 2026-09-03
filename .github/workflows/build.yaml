@@ -146,6 +146,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-
+      # The container driver, because the docker driver cannot export a
+      # cache at all -- `cache-to` below is refused outright without this.
+      - uses: docker/setup-buildx-action@v3
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -154,6 +157,32 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Restore this repo's own layers instead of rebuilding all of them,
+          # so an image whose contents did not change keeps its digest, and
+          # the "no manifest change, skipping commit" branch further down can
+          # actually be taken.
+          #
+          # Measured Cycle 844 on agora-persona-runner, whose copy of this job
+          # is the same job: 79 of its last 150 merges to main changed no file
+          # the image ships and all 150 still produced a distinct digest --
+          # two consecutive pushes shared their base layers and differed on
+          # every layer the Dockerfile adds, because `apt-get`, the pinned
+          # downloads and `COPY` were rebuilt from scratch and bake fresh
+          # mtimes into the layer tar. This repo has the same pipeline and the
+          # same Dockerfile shape, so it has the same behaviour; the numbers
+          # above are the runner's, not this repo's, and are quoted rather
+          # than restated as if they had been measured here.
+          #
+          # A cold or evicted cache degrades to exactly today's behaviour: a
+          # new digest and a roll, which is the safe direction.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The container driver would otherwise attach a provenance
+          # attestation, which turns the pushed object into an index whose
+          # digest embeds this build's own timestamps -- non-reproducible for
+          # the same reason the layers were, and a different manifest shape
+          # than the one every digest in -config today names.
+          provenance: false
 
       # Commits the new image digest to this service's paired config repo, which
       # ArgoCD's SCM Provider generator auto-deploys — no platform-config PR, no
