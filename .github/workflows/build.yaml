@@ -180,6 +180,17 @@ jobs:
       # The config repo is checked out into `.config` rather than the workspace
       # root, because unlike the old job this one already has this repo's own
       # source checked out and must not clobber it.
+      # Nothing in this pipeline had ever started the image it ships. See
+      # .github/smoke-test.sh for the outage that made this necessary; the
+      # step is one line calling a script because tools/sync_contract.py
+      # compares this job as parsed YAML against agora-persona-runner's copy.
+      #
+      # It sits between the push and the digest commit deliberately. The tag
+      # reaching GHCR is harmless; what deploys is the line committed below,
+      # so failing here leaves the running pods on the last good digest.
+      - name: Smoke-test the pushed image before anything deploys it
+        run: bash .github/smoke-test.sh "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+
       - name: Generate installation token scoped to the config repo only
         id: app-token
         uses: actions/create-github-app-token@v3
