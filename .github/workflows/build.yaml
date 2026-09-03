@@ -287,10 +287,25 @@ jobs:
           repository: ${{ env.CONFIG_REPO }}
           token: ${{ steps.app-token.outputs.token }}
           path: .config
+      # Was a blind `sed -i "s|image: .*|...|"` until Cycle 852. It matched a
+      # line rather than an image, so it rewrote every `image:` line in the
+      # manifest to this repo's image whatever that line actually named -- the
+      # first sidecar or initContainer any config repo grew would have been
+      # silently retagged to this service and deployed, with every check green.
+      # The script parses the manifest as YAML to decide which scalars are
+      # ours and rewrites only those lines, so the hundreds of lines of
+      # hand-written comment in these manifests survive untouched (which is
+      # also why it is not `yq -i`, which re-emits the whole file). On the five
+      # real manifests in this org today it produces byte-identical output to
+      # the sed, so nothing live changes behaviour. It exits non-zero if it
+      # matched nothing, and a failure here is safe: the digest never reaches
+      # -config, so ArgoCD keeps deploying the last image that did.
       - name: Update image digest in manifest.yaml
-        working-directory: .config
         run: |
-          sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}|" manifest.yaml
+          python3 -c "import yaml" 2>/dev/null || python3 -m pip install --quiet pyyaml
+          python3 .github/update-image-digest.py .config/manifest.yaml \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          cd .config
           git config user.name "sokratesai-repo-committer[bot]"
           git config user.email "sokratesai-repo-committer[bot]@users.noreply.github.com"
           git add manifest.yaml
