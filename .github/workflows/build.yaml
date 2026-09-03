@@ -302,7 +302,7 @@ jobs:
       # -config, so ArgoCD keeps deploying the last image that did.
       - name: Update image digest in manifest.yaml
         run: |
-          pip install --quiet pyyaml
+          python3 -c "import yaml" 2>/dev/null || python3 -m pip install --quiet pyyaml
           python3 .github/update-image-digest.py .config/manifest.yaml \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
           cd .config
