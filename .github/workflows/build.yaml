@@ -226,7 +226,13 @@ jobs:
           fi
           for ep in $entrypoints; do
             echo "--- starting $ep ---"
-            cid=$(docker run -d --entrypoint python "$IMAGE" "$ep")
+            # --tmpfs /data because both Deployments mount a volume there and
+            # the image's non-root user cannot create it: the bridge's
+            # bootstrap_credentials() does makedirs("/data/claude-home") on its
+            # first line and died with EACCES the first time this step ran on
+            # main. A writable empty /data is the deployment contract, so
+            # supplying one tests the image rather than papering over it.
+            cid=$(docker run -d --tmpfs /data:rw,mode=1777 --entrypoint python "$IMAGE" "$ep")
             sleep 20
             if [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != "true" ]; then
               code=$(docker inspect -f '{{.State.ExitCode}}' "$cid")
