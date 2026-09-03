@@ -156,3 +156,69 @@ def test_the_smoke_test_fails_the_job_rather_than_warning():
         "for a container that dies a millisecond later, so the step must fail "
         "the job on its own judgement"
     )
+
+
+def test_the_build_is_skipped_when_the_image_cannot_have_changed():
+    """`build-push` waits on the gate, and reads its answer.
+
+    A layer cache cannot deliver this on its own and Cycle 853 measured why:
+    on run 33781833369 BuildKit reported CACHED on all nine of our layers and
+    the pushed manifest still carried a new digest, because
+    `docker/metadata-action` stamps the build time and the commit SHA into the
+    image config and the manifest digest covers that blob. So the decision has
+    to be made before the build rather than inferred from its output.
+    """
+    doc = _workflow()
+    gate = doc["jobs"]["image-changed"]
+    build = doc["jobs"]["build-push"]
+
+    assert "image-changed" in build["needs"], (
+        "build-push does not wait for the gate, so the gate cannot stop it"
+    )
+    assert "needs.image-changed.outputs.changed == 'true'" in build["if"], (
+        "build-push runs whatever the gate answered"
+    )
+    assert gate["outputs"]["changed"], "the gate publishes no answer to read"
+
+
+def test_the_gate_asks_the_dockerfile_rather_than_a_list_of_its_own():
+    """The watched paths are derived, not written down in the workflow.
+
+    A path list in the YAML is a second copy of the Dockerfile's COPY lines,
+    and the failure mode of the copy going stale is a real change that never
+    deploys with every check green.
+    """
+    steps = _workflow()["jobs"]["image-changed"]["steps"]
+    run = "\n".join(s.get("run", "") for s in steps)
+    assert ".github/image-paths.py" in run
+    assert (WORKFLOW.parent.parent / "image-paths.py").exists()
+
+
+def test_the_gate_never_shortens_the_history_it_has_to_look_back_through():
+    """`github.event.before` is an ordinary commit; a shallow clone hides it.
+
+    A hidden `before` is not a wrong answer -- the script builds when it
+    cannot see one -- but it is a filter that silently never fires, which
+    reads as working.
+    """
+    checkout = [
+        s for s in _workflow()["jobs"]["image-changed"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert checkout, "the gate does not check anything out"
+    assert checkout[0].get("with", {}).get("fetch-depth") == 0
+
+
+def test_the_other_two_jobs_still_run_on_every_merge():
+    """The gate is on build-push, never on the workflow trigger.
+
+    `test` and `vault-drift` have to keep running on a tools-only merge --
+    that is most of what a tools-only merge changes.
+    """
+    doc = _workflow()
+    for job in ("test", "vault-drift"):
+        assert "if" not in doc["jobs"][job], job
+        assert "image-changed" not in doc["jobs"][job].get("needs", []), job
+    assert "paths" not in doc[True]["push"], (
+        "a paths filter on the trigger would take test and vault-drift with it"
+    )
