@@ -123,9 +123,56 @@ jobs:
       - run: python -m tools.sync_contract . ..
         working-directory: .runner
 
-  build-push:
+  # `build-push` below is skipped when the diff this push carries cannot have
+  # changed the image. It is a separate job rather than an `if:` on each of
+  # build-push's steps so the skip is visible as a skipped job on the run
+  # page, and because `needs:` is the only thing that can stop the job's
+  # checkout and GHCR login from running at all.
+  #
+  # It is NOT a `paths:` filter on the workflow trigger: `test` and
+  # `vault-drift` must keep running on every merge, and a trigger filter
+  # would take all three out together.
+  image-changed:
     if: github.ref == 'refs/heads/main'
-    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.gate.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `github.event.before` is an ordinary commit on main, so the depth
+          # needed is "far enough back to see it" -- which nothing here knows.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - id: gate
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          # Every unknown answers "build". A force-push, a first push to a new
+          # ref, or a `before` this checkout cannot see all land here, and the
+          # cost of being wrong in this direction is one wasted build --
+          # against a change that silently never deploys in the other.
+          if [ -z "${BEFORE:-}" ] \
+            || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "::notice::cannot see the previous commit (${BEFORE:-unset}); building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$BEFORE" "$AFTER" | tee /tmp/changed.txt
+          echo "--- watched paths ---"
+          python3 .github/image-paths.py --list
+          verdict=$(python3 .github/image-paths.py --changed-files /tmp/changed.txt) || exit 1
+          echo "::notice::image-affecting change in this push: $verdict"
+          echo "changed=$verdict" >> "$GITHUB_OUTPUT"
+
+  build-push:
+    if: github.ref == 'refs/heads/main' && needs.image-changed.outputs.changed == 'true'
+    needs: [test, image-changed]
     runs-on: ubuntu-latest
     permissions:
       contents: read
