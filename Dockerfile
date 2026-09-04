@@ -75,7 +75,38 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
 # exits 0 with no engine warning and the installed `claude --version` prints
 # `2.1.251 (Claude Code)`. A prefix install, not the `-g` on the line below:
 # the running pod's global binary is what this cycle was speaking through.
-ARG CLAUDE_CODE_VERSION=2.1.251
+#
+# Re-run 2026-09-04 for 2.1.251 -> 2.1.261, same prompt through both input
+# paths again. tools.changelog_watch read 280 entries across the six releases
+# in that gap and marked exactly one: 2.1.257 makes `--input-format
+# stream-json` fail fast on non-JSONL input instead of growing memory without
+# bound. That is unreachable from here -- write_stream_json_input's only
+# writer is `fh.write(json.dumps(event) + "\n")`, one valid JSON object per
+# line, so this bridge cannot emit the input that fix is about.
+#
+# The diff: the set of event types, subtypes and content-block types is
+# identical on both paths. Top-level keys are a strict superset with no
+# removal -- 2.1.261 adds `first_content_frame_ms` to the `result` event, and
+# nothing here reads it. Block key sets are identical on every block type.
+# Every field cli.py reads was present under the same name on both paths:
+# `id`/`name`/`input`, `tool_use_id`/`is_error`, `rate_limit_info`,
+# `session_id`.
+#
+# One difference is deliberately NOT a finding, and the control is why. On the
+# stdin path 2.1.261 emitted a leading assistant `text` block before the
+# `tool_use` and 2.1.251 did not, which reads as a contract change. It is the
+# model: three runs of the same prompt on 2.1.261 gave 7, 6 and 7 events, so
+# the block count varies inside one version, and 2.1.251's own `--print`
+# capture emits that leading text block too. A sequence compared once is not
+# an instrument.
+#
+# Mutation-checked the same way as the 2.1.251 entry: dropping `session_id`
+# and `tool_use.input` out of the 2.1.261 capture made the diff report six
+# differences, so a clean diff here was not guaranteed in advance.
+#
+# npm install --prefix on a real v24.20.0 node exits 0 with no engine warning
+# and the installed `claude --version` prints `2.1.261 (Claude Code)`.
+ARG CLAUDE_CODE_VERSION=2.1.261
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # kubectl -- 2026-08-01 design call: this service should be as capable as
