@@ -977,13 +977,38 @@ def test_persona_memory_dir_is_one_directory_per_persona():
     """Idea #165: a chat persona had no memory across conversations because
     only a Nova cycle was ever handed a pinned directory. Two personas must
     get two directories, and both must sit under the persistent claude home
-    rather than under a concurrent workspace."""
-    a = quota.persona_memory_dir("08ffac94-7c4a-4506-897f-968c592358cb")
+    rather than under a concurrent workspace.
+
+    Neither sample id is Nova's -- that one is the deliberate exception and
+    has its own test below."""
+    a = quota.persona_memory_dir("99999999-8888-7777-6666-555555555555")
     b = quota.persona_memory_dir("11111111-2222-3333-4444-555555555555")
+    assert quota.NOVA_PERSONA_ID not in (a, b)
     assert a and b and a != b
     assert a.startswith(quota.CLAUDE_HOME + os.sep)
     assert a != quota.AUTO_MEMORY_DIR and b != quota.AUTO_MEMORY_DIR
     assert os.path.join(".claude", "projects") not in a
+
+
+def test_novas_own_id_resolves_to_the_cycle_memory_directory():
+    """Idea #186: one brain across every surface. A live Nova chat turn
+    carries Nova's persona id and no cycle marker, so before this it either
+    got no directory at all (the runner sent no id) or a second one under
+    persona-memory. Either way what the owner told Nova in a chat was
+    invisible to every cycle. Nova's id must resolve to the very directory
+    `is_cycle_opening` pins."""
+    assert quota.persona_memory_dir(quota.NOVA_PERSONA_ID) == quota.AUTO_MEMORY_DIR
+    # And it is genuinely a special case, not every id landing there.
+    assert quota.persona_memory_dir(
+        "11111111-2222-3333-4444-555555555555") != quota.AUTO_MEMORY_DIR
+
+
+def test_novas_id_is_still_validated_before_it_is_trusted():
+    """The exception is on the identity, never on the validation. If the
+    configured id were ever set to something unusable, an unusable id must
+    still get no directory rather than silently opening Nova's brain to it."""
+    with patch.object(quota, "NOVA_PERSONA_ID", "../../../etc"):
+        assert quota.persona_memory_dir("../../../etc") == ""
 
 
 def test_persona_memory_dir_refuses_anything_that_is_not_a_plain_id():
