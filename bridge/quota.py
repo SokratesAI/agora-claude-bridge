@@ -521,14 +521,37 @@ PERSONA_MEMORY_ROOT = os.path.join(CLAUDE_HOME, "persona-memory")
 # is the behaviour every caller had before this existed, and quietly
 # rewriting an id would hand two personas one directory.
 PERSONA_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{2,63}\Z")
+# Nova's own Agora persona id. Nova is the one persona that already has a
+# memory directory -- AUTO_MEMORY_DIR above, pinned for every cycle -- so
+# deriving a second one from its id would split its brain in two on the
+# phrasing of the triggering message: a heartbeat matches
+# `is_cycle_opening` and gets `nova-memory`, the owner replying in a live
+# Nova conversation does not and would get `persona-memory/<nova id>`.
+# That is idea #186's actual gap ("talking to Nova anywhere should feel
+# like talking to the same person"), and the runner's own
+# `_bridge_persona_id` names this constant as the configuration it was
+# waiting on -- until it existed the runner sent no id at all for Nova, so
+# a live Nova chat turn had no pinned directory and fell back to the CLI's
+# per-working-directory default, which on a concurrent slot is a fresh
+# empty directory every turn.
+NOVA_PERSONA_ID = os.environ.get(
+    "NOVA_PERSONA_ID", "08ffac94-7c4a-4506-897f-968c592358cb"
+)
 
 
 def persona_memory_dir(persona_id):
     """Absolute auto-memory directory for one persona, or "" if the caller
     sent no usable id -- which is what a caller that predates this field
-    sends, and what a malformed one gets."""
+    sends, and what a malformed one gets.
+
+    Nova's id resolves to AUTO_MEMORY_DIR, the same directory a cycle gets,
+    so a live chat turn and a heartbeat turn write one brain. The id is
+    validated first: an unusable id gets nothing, whoever it claims to be.
+    """
     if not persona_id or not PERSONA_ID_RE.match(str(persona_id)):
         return ""
+    if str(persona_id) == NOVA_PERSONA_ID:
+        return AUTO_MEMORY_DIR
     return os.path.join(PERSONA_MEMORY_ROOT, str(persona_id))
 
 
