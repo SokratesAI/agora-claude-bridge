@@ -307,13 +307,26 @@ class ActivityReporter:
         """
         if not (self.enabled and stream_id):
             return
-        _post(self._url, _scrubbed({
+        ok = _post(self._url, _scrubbed({
             "token": self._token,
             "capability": NARRATION_TEXT,
             "detail": "",
             "toolUseId": stream_id,
             "retracted": True,
         }))
+        # Every other post in this class is a chip: losing one drops a line
+        # from the drawer and the owner never knows what he did not see. This
+        # one is the opposite -- losing it leaves the whole reply sitting in
+        # the drawer while the same text arrives on his phone, which is the
+        # duplication this feature exists to remove, and `_post` swallows its
+        # own errors and returns a bool nothing was reading. So the one post
+        # whose failure is visible to him was the one that failed silently.
+        # Not retried: this runs after close(), the turn is over, and a retry
+        # loop here would delay the reply itself for a page that is already
+        # wrong.
+        if not ok:
+            log(f"retraction failed for stream {stream_id!r} -- the reply is "
+                f"still in the drawer and will be read twice")
 
     def report_subagent_text(self, description, text):
         """A passage a SUBAGENT wrote, on its way to its own answer.

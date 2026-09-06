@@ -2016,10 +2016,18 @@ def _block_stop(index=0):
         "type": "content_block_stop", "index": index}}
 
 
-def _run_lines(tmp_path, posted, lines, **kwargs):
+def _run_lines(tmp_path, posted, lines, post_result=None, **kwargs):
+    """`post_result` decides what the runner answered for a given payload --
+    default is "everything landed". It takes the payload rather than a flat
+    False so a test can drop exactly one post and leave the rest working,
+    which is the only shape that isolates a single failure."""
+    def fake_post(url, payload):
+        posted.append(payload)
+        return True if post_result is None else bool(post_result(payload))
+
     with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
-         patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
+         patch.object(activity, "_post", fake_post), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(_stream_json_lines(*lines))):
         return cli.run_turn("hello", **kwargs)
 
@@ -2124,6 +2132,31 @@ def test_the_passage_that_became_the_reply_is_retracted(tmp_path):
     assert len(retractions) == 1
     assert retractions[0]["toolUseId"] == "text-2"
     assert retractions[0]["capability"] == "assistant_text"
+
+
+def test_a_failed_retraction_says_so(tmp_path):
+    """The one post in this class whose loss the owner sees, and it was the
+    one that reported nothing. A dropped chip costs a line in the drawer; a
+    dropped retraction leaves the whole reply on the page while the same text
+    arrives on his phone."""
+    posted, logged = [], []
+    with patch.object(activity, "log", lambda m: logged.append(m)):
+        _run_lines(tmp_path, posted, _streamed_narration_lines(),
+                   activity={"url": "http://runner/x", "token": "tok"},
+                   post_result=lambda payload: not payload.get("retracted"))
+    assert [p for p in posted if p.get("retracted")], "the retraction was still sent"
+    assert any("retraction failed" in m and "text-2" in m for m in logged), logged
+
+
+def test_a_retraction_that_lands_logs_nothing(tmp_path):
+    """The precondition for the test above: on the ordinary path the same
+    turn produces no log line at all, so the assertion there is not passing
+    on some unrelated message."""
+    posted, logged = [], []
+    with patch.object(activity, "log", lambda m: logged.append(m)):
+        _run_lines(tmp_path, posted, _streamed_narration_lines(),
+                   activity={"url": "http://runner/x", "token": "tok"})
+    assert not any("retraction failed" in m for m in logged), logged
 
 
 def test_the_narration_passage_is_not_retracted(tmp_path):
