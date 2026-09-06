@@ -947,30 +947,45 @@ class VaultClient:
 
         Without one CouchDB answers a Mango query from the special
         `_all_docs` index, which means reading every document body in the
-        database and matching in the query server. Measured 2026-09-06,
-        with no index on either database: `_find` over `nova` (46,136
-        docs, 230MB) did not answer inside 270 seconds, and the same query
-        over `obsidian` (15,711 docs) took 61.5s to return zero rows. That
-        is `recent`, the first command step 1 of every cycle runs, and it
-        had been timing out. It is also what pinned CouchDB at 84-99% of
-        its 200m CPU limit for the whole of it.
+        database and matching in the query server. Measured 2026-09-06
+        with no index on either database, asking CouchDB directly rather
+        than through this client: the query over `obsidian` (15,711 docs)
+        took 61.5s to return zero rows and the one over `nova` (46,136
+        docs, 230MB) did not answer inside 270s. Both are past the 60s
+        `_req` gives every call, so `recent` -- the first command step 1
+        of every cycle runs -- was dying on an uncaught socket timeout
+        rather than answering slowly. It also pinned CouchDB at 84-99% of
+        its 200m CPU limit while it ran. With the index: 0.02s and 0.49s.
 
         Creating the index is idempotent -- CouchDB answers `exists` for
         an identical definition -- so this runs on the `recent` path
         rather than being a one-off somebody has to remember after a
-        database is rebuilt. It costs one round trip against a command
-        that was costing minutes.
+        database is rebuilt. The POST returns as soon as the design
+        document is written and the build runs behind it (2.5s against
+        `nova`, measured the same day), so this does not inherit the
+        build's cost. What it does inherit is `_req`'s 60s timeout, and
+        `_req` only converts an `HTTPError` into a status -- a socket
+        timeout or a refused connection is raised.
 
-        A failure here is deliberately not fatal. The query still answers
-        without the index, only slowly, so refusing would turn a slow
-        answer into no answer -- and `recent`'s whole contract is that a
-        short answer is worse than a slow one.
+        So a failure here is caught in both shapes, and neither is fatal.
+        The query still answers without the index, only slowly, so
+        refusing would turn a slow answer into no answer -- and `recent`'s
+        whole contract is that a short answer is worse than a slow one.
+        A failure to reach CouchDB at all will surface one line later on
+        the `_find`, where it is a real finding rather than a failed
+        optimisation.
         """
-        status, data = _req(
-            "POST", self.base, db, self.auth, "_index",
-            {"index": {"fields": ["mtime"]},
-             "name": MTIME_INDEX_NAME, "ddoc": MTIME_INDEX_DDOC, "type": "json"},
-        )
+        try:
+            status, data = _req(
+                "POST", self.base, db, self.auth, "_index",
+                {"index": {"fields": ["mtime"]},
+                 "name": MTIME_INDEX_NAME, "ddoc": MTIME_INDEX_DDOC, "type": "json"},
+            )
+        except OSError as e:
+            print(f"vault_tool: could not ensure the mtime index on {db!r} "
+                  f"({type(e).__name__}: {e}) -- recent will fall back to a "
+                  f"full scan", file=sys.stderr)
+            return False
         if status != 200:
             print(f"vault_tool: could not ensure the mtime index on {db!r} "
                   f"({status}): {data} -- recent will fall back to a full scan",

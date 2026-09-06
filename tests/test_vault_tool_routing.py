@@ -325,6 +325,26 @@ class TestListingAcrossBothDatabases:
         err = capsys.readouterr().err
         assert "mtime index" in err and "403" in err
 
+    def test_recent_still_answers_when_the_index_create_raises(self, env, capsys):
+        """`_req` turns an HTTPError into a status and lets everything else
+        out, so a socket timeout or a refused connection on the index
+        create is an exception rather than a code. The 403 test above does
+        not cover that, and it is the likelier shape: CouchDB was pinned at
+        its CPU limit by the very scan this index removes."""
+        client = vault_tool.VaultClient()
+
+        def fake_req(method, base, db, auth, path, body=None, timeout=60):
+            if path == "_index":
+                raise TimeoutError("timed out")
+            return (200, {"docs": [{"_id": NOVA_FILE, "mtime": 7}]})
+
+        vault_tool._req = fake_req
+        rows, _ = client.recent(24)
+
+        assert [p for _, p, _ in rows] == [NOVA_FILE, NOVA_FILE]
+        err = capsys.readouterr().err
+        assert "mtime index" in err and "TimeoutError" in err
+
     def test_recent_failure_on_one_database_is_fatal(self, env):
         client, _ = _recording_client({
             ("POST", "obsidian", "_find"): (200, {"docs": []}),
