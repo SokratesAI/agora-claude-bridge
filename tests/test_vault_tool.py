@@ -205,9 +205,16 @@ def test_delete_returns_absent_when_missing(env):
 
 
 def _fake_find(docs, captured=None):
-    """Stand in for the module-level _req, answering the _find POST."""
+    """Stand in for the module-level _req, answering the _find POST.
+
+    `recent` ensures its mtime index first, so that POST is answered here
+    too -- and deliberately not captured, so every `captured[0]` below
+    still means the selector. The assertion stays: an unexpected call is
+    still a failure, there are now two expected ones."""
     def fake_req(method, base, db, auth, path, body=None):
-        assert (method, path) == ("POST", "_find")
+        assert (method, path) in (("POST", "_find"), ("POST", "_index"))
+        if path == "_index":
+            return 200, {"result": "created"}
         if captured is not None:
             captured.append(body)
         return 200, {"docs": docs}
@@ -509,12 +516,17 @@ def test_recent_asks_couch_for_the_deleted_field(env):
     captured = []
 
     def capture(method, base, db, auth, path, body=None):
-        captured.append(body)
+        # `recent` ensures its mtime index first; only the query carries a
+        # projection, so capturing both would make captured[0] the index
+        # definition and this assertion vacuous.
+        if path == "_find":
+            captured.append(body)
         return 200, {"docs": []}
 
     client = vault_tool.VaultClient()
     with patch.object(vault_tool, "_req", capture):
         client.recent(hours=6)
+    assert captured, "recent made no _find call at all"
     assert "deleted" in captured[0]["fields"]
 
 

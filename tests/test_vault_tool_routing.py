@@ -273,6 +273,58 @@ class TestListingAcrossBothDatabases:
         _, truncated = client.recent(24, limit=5)
         assert truncated
 
+    def test_recent_creates_the_mtime_index_in_every_database_it_asks(self, env):
+        """Without this index `_find` reads every document body in the
+        database. Measured 2026-09-06 with no index anywhere: the query
+        over `nova` did not answer in 270s and the one over `obsidian`
+        took 61.5s to return nothing."""
+        bodies = []
+        client = vault_tool.VaultClient()
+
+        def fake_req(method, base, db, auth, path, body=None, timeout=60):
+            bodies.append((method, db, path, body))
+            if path == "_index":
+                return (200, {"result": "created"})
+            return (200, {"docs": []})
+
+        vault_tool._req = fake_req
+        client.recent(24)
+
+        indexed = [(db, body) for method, db, path, body in bodies
+                   if method == "POST" and path == "_index"]
+        assert [db for db, _ in indexed] == ["obsidian", "nova"]
+        for _, body in indexed:
+            assert body["index"] == {"fields": ["mtime"]}
+            assert body["ddoc"] == vault_tool.MTIME_INDEX_DDOC
+            assert body["name"] == vault_tool.MTIME_INDEX_NAME
+
+        # Per database, the index has to be in place before the query that
+        # needs it -- creating it afterwards is a full scan plus a wasted
+        # round trip.
+        order = [(db, path) for method, db, path, _ in bodies
+                 if path in ("_index", "_find")]
+        assert order == [("obsidian", "_index"), ("obsidian", "_find"),
+                         ("nova", "_index"), ("nova", "_find")]
+
+    def test_recent_still_answers_when_the_index_cannot_be_created(self, env, capsys):
+        """A slow answer beats no answer: the query works without the
+        index, so a refusal here would turn a delay into a gap -- and
+        `recent`'s whole contract is that a short answer reads as
+        'nothing changed'."""
+        client = vault_tool.VaultClient()
+
+        def fake_req(method, base, db, auth, path, body=None, timeout=60):
+            if path == "_index":
+                return (403, {"error": "forbidden"})
+            return (200, {"docs": [{"_id": NOVA_FILE, "mtime": 7}]})
+
+        vault_tool._req = fake_req
+        rows, _ = client.recent(24)
+
+        assert [p for _, p, _ in rows] == [NOVA_FILE, NOVA_FILE]
+        err = capsys.readouterr().err
+        assert "mtime index" in err and "403" in err
+
     def test_recent_failure_on_one_database_is_fatal(self, env):
         client, _ = _recording_client({
             ("POST", "obsidian", "_find"): (200, {"docs": []}),

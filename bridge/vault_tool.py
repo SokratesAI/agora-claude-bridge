@@ -87,6 +87,11 @@ _ID_MAX = "\U0010FFFF"
 # (2026-08-05). If that happens here, `recent` should stay readable.
 BACKUP_PREFIX = "agora/backups/"
 DEFAULT_RECENT_LIMIT = 2000
+# The Mango index `recent` needs. Named rather than inlined so the test and
+# the deletion command name the same thing: dropping it is
+# `DELETE /<db>/_index/_design/mtime-index/json/mtime`.
+MTIME_INDEX_DDOC = "mtime-index"
+MTIME_INDEX_NAME = "mtime"
 # Times shown to a human are Oslo time, not UTC -- the owner lives there and
 # asked for it directly (evolve/identity.md rule 7).
 LOCAL_TZ = "Europe/Oslo"
@@ -913,6 +918,7 @@ class VaultClient:
         # here is read as "nothing changed", which is a conclusion, not a
         # gap.
         for db in self.dbs_for_prefix(prefix):
+            self._ensure_mtime_index(db)
             status, data = _req(
                 "POST", self.base, db, self.auth, "_find",
                 {"selector": {"mtime": {"$gt": since_ms}},
@@ -935,6 +941,42 @@ class VaultClient:
                     continue
                 out.append((doc.get("mtime", 0), path, bool(doc.get("deleted"))))
         return sorted(out, reverse=True), truncated
+
+    def _ensure_mtime_index(self, db):
+        """Make sure `_find` on `mtime` has an index to use, in `db`.
+
+        Without one CouchDB answers a Mango query from the special
+        `_all_docs` index, which means reading every document body in the
+        database and matching in the query server. Measured 2026-09-06,
+        with no index on either database: `_find` over `nova` (46,136
+        docs, 230MB) did not answer inside 270 seconds, and the same query
+        over `obsidian` (15,711 docs) took 61.5s to return zero rows. That
+        is `recent`, the first command step 1 of every cycle runs, and it
+        had been timing out. It is also what pinned CouchDB at 84-99% of
+        its 200m CPU limit for the whole of it.
+
+        Creating the index is idempotent -- CouchDB answers `exists` for
+        an identical definition -- so this runs on the `recent` path
+        rather than being a one-off somebody has to remember after a
+        database is rebuilt. It costs one round trip against a command
+        that was costing minutes.
+
+        A failure here is deliberately not fatal. The query still answers
+        without the index, only slowly, so refusing would turn a slow
+        answer into no answer -- and `recent`'s whole contract is that a
+        short answer is worse than a slow one.
+        """
+        status, data = _req(
+            "POST", self.base, db, self.auth, "_index",
+            {"index": {"fields": ["mtime"]},
+             "name": MTIME_INDEX_NAME, "ddoc": MTIME_INDEX_DDOC, "type": "json"},
+        )
+        if status != 200:
+            print(f"vault_tool: could not ensure the mtime index on {db!r} "
+                  f"({status}): {data} -- recent will fall back to a full scan",
+                  file=sys.stderr)
+            return False
+        return True
 
     def _chunk_id_for(self, content_bytes):
         try:
