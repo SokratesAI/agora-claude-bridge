@@ -49,6 +49,16 @@ env:
   IMAGE_NAME: sokratesai/${{ github.event.repository.name }}
   CONFIG_REPO: SokratesAI/${{ github.event.repository.name }}-config
 
+# Least privilege for the GITHUB_TOKEN, workflow-wide. Without a block here the
+# token is minted with the repository's default permissions, which is write on
+# contents -- handed to every job in this file, including the ones that only
+# check out the repo and run tests. A job-level `permissions:` REPLACES this
+# one rather than merging with it, so `build-push` keeps exactly the
+# `packages: write` it declares for itself below. CodeQL flags the absence as
+# actions/missing-workflow-permissions.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
