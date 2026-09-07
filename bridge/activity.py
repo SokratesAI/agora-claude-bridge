@@ -16,6 +16,7 @@ Best-effort throughout: a report that fails must never disturb the turn it
 is describing. The CLI is mid-session doing real work someone is waiting
 on, and a chip is worth strictly less than that.
 """
+import ipaddress
 import json
 import queue
 import threading
@@ -52,7 +53,38 @@ CALLBACK_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
 def callback_allowed(url):
-    """True if `url` is a plain in-cluster HTTP callback we may POST to."""
+    """True if `url` is a plain in-cluster HTTP callback we may POST to.
+
+    **A pod address is in-cluster too**, and that is not a widening of the
+    rule so much as the rest of it. `agora-persona-runner#869` moved the
+    callback from the Service name to the runner's own pod IP on purpose:
+    the per-turn grant token lives in one process's memory, so a Service
+    address is a token handed to whichever replica answers, which was
+    returning `401 unknown or expired` and taking the whole MCP surface
+    down with it.
+
+    That landed the same afternoon as this allowlist (bridge#105), and the
+    two were written without knowledge of each other. The result was worse
+    than either bug: every callback refused, so a turn narrated nothing --
+    no tool chips, no mid-turn passages, just a spinner and then the whole
+    answer at once. His report, 2026-09-07: *"i only saw the spinner spin
+    in the chat and never any tool calls and then suddenly all your text
+    appears in one block."*
+
+    The security intent is unchanged and is what the docstring above
+    states: this may address the cluster and nothing else. A private
+    address is not routable off it, so the SSRF this guards against --
+    being pointed at something on the internet, or at cloud metadata --
+    is still refused.
+
+    Link-local is excluded explicitly, and that exclusion is the whole
+    reason this is not a one-line `is_private`: Python counts
+    169.254.0.0/16 as private, so `is_private` alone allows
+    `169.254.169.254/latest/meta-data` -- the cloud metadata endpoint,
+    which is the one address an SSRF guard exists to refuse. Caught by the
+    table in the tests, which is there because this docstring claimed the
+    opposite first.
+    """
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
@@ -65,7 +97,17 @@ def callback_allowed(url):
     host = parts.hostname or ""
     if host in CALLBACK_LOCAL_HOSTS:
         return True
-    return host.endswith(CALLBACK_HOST_SUFFIX)
+    if host.endswith(CALLBACK_HOST_SUFFIX):
+        return True
+    # A literal address: allowed only if it is private. Anything that does
+    # not parse as an address at all falls through to False rather than
+    # being treated as a name -- a name that is not `.svc.cluster.local`
+    # has already been refused above.
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_private and not addr.is_link_local
 
 # How long close() waits for chips queued at the very end of a session.
 # Short on purpose: the caller has a finished reply in hand and returning

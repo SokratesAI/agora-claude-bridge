@@ -23,6 +23,17 @@ ALLOWED = [
     "https://agora.agents.svc.cluster.local:8080/tool-activity",
     "http://localhost:8082/tool-activity",
     "http://127.0.0.1:8082/tool-activity",
+    # A pod address. `agora-persona-runner#869` moved the callback off the
+    # Service name and onto the runner's own pod IP, because the grant
+    # token lives in one process's memory and a Service address hands it
+    # to whichever replica answers. That landed the same afternoon as this
+    # allowlist and neither knew about the other, so every callback was
+    # refused and a turn narrated nothing at all -- his report: "i only
+    # saw the spinner spin and never any tool calls".
+    "http://10.42.0.142:8082/tool-activity",
+    "http://192.168.1.10:8082/tool-activity",
+    "http://172.16.5.4:8082/tool-activity",
+    "http://[fd00::1]:8082/tool-activity",
 ]
 
 REFUSED = [
@@ -31,7 +42,17 @@ REFUSED = [
     "https://evil.example.com/collect",
     # The cloud metadata service, which is the reason this class of bug is
     # rated critical rather than medium.
+    #
+    # It is also why the private-address rule above is not a one-line
+    # `is_private`: Python counts 169.254.0.0/16 as private, so
+    # `is_private` alone lets this row through. The first version of that
+    # change did exactly that, and this row is what caught it.
     "http://169.254.169.254/latest/meta-data/",
+    "http://169.254.169.254/",
+    # Public addresses written as literals, which the private-address rule
+    # has to refuse or it is not a rule.
+    "http://8.8.8.8/x",
+    "http://93.184.216.34/collect",
     # A `user@` prefix: `netloc` reads as the allowed suffix and the host
     # this actually resolves is the one after the `@`.
     "http://agora-persona-runner.agents.svc.cluster.local@evil.example.com/x",
