@@ -370,7 +370,7 @@ def run_narrated_until_timeout(tmp_path, lines):
          patch.object(cli.ActivityReporter, "report", autospec=False), \
          patch.object(cli.ActivityReporter, "report_result", autospec=False):
         text, _, _ = run_until_timeout(
-            tmp_path, lines, activity={"url": "http://agora.invalid", "token": "t"})
+            tmp_path, lines, activity={"url": "http://agora.agents.svc.cluster.local", "token": "t"})
     return text, narrated
 
 

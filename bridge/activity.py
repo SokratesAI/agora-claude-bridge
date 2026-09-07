@@ -20,12 +20,52 @@ import json
 import queue
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from bridge.log import log
 from bridge.redact import redact
 
 POST_TIMEOUT_SECONDS = 5
+
+# Where a callback URL is allowed to point. CodeQL called this a full SSRF
+# and it was right about the shape: `url` arrives in the /generate request
+# body, and nothing between there and urlopen() looked at it, so a caller
+# that can reach this pod's server could make the bridge POST to any host it
+# named. What made that reachable rather than theoretical is that the server
+# is an ordinary in-cluster HTTP listener -- /generate is the one endpoint
+# any pod in `agents` can call.
+#
+# The legitimate value is never interesting: the runner sends its own
+# Service address (RUNNER_SELF_URL) or the site's, and both are
+# `<name>.agents.svc.cluster.local`. So this is an allowlist of the shape
+# the real caller has always used, not a blocklist of what an attacker
+# might try -- a deny list on a URL is a parser competition and this side
+# loses it.
+#
+# A rejected URL disables the reporter rather than raising. A chip is worth
+# strictly less than the turn it describes (see the module docstring), and
+# an older runner that somehow sends something else should lose its
+# narration, not its session.
+CALLBACK_HOST_SUFFIX = ".svc.cluster.local"
+CALLBACK_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def callback_allowed(url):
+    """True if `url` is a plain in-cluster HTTP callback we may POST to."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    # `hostname` is lowercased and strips the brackets off an IPv6 literal;
+    # `netloc` would keep a `user@` prefix, which is exactly how a URL is
+    # written to make the real host look like something else.
+    host = parts.hostname or ""
+    if host in CALLBACK_LOCAL_HOSTS:
+        return True
+    return host.endswith(CALLBACK_HOST_SUFFIX)
 
 # How long close() waits for chips queued at the very end of a session.
 # Short on purpose: the caller has a finished reply in hand and returning
@@ -185,6 +225,8 @@ def _scrubbed(payload):
 
 def _post(url, payload):
     """True if the runner accepted the report. Never raises."""
+    if not callback_allowed(url):
+        return False
     try:
         req = urllib.request.Request(
             url,
@@ -214,7 +256,11 @@ class ActivityReporter:
 
     def __init__(self, activity):
         block = activity if isinstance(activity, dict) else {}
-        self._url = str(block.get("url") or "")
+        url = str(block.get("url") or "")
+        if url and not callback_allowed(url):
+            log(f"activity: refusing callback URL outside the cluster: {url}")
+            url = ""
+        self._url = url
         self._token = str(block.get("token") or "")
         self._queue = queue.Queue()
         self._thread = None

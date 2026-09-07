@@ -525,7 +525,7 @@ def test_restricted_turn_still_allows_the_runner_mcp_tools(tmp_path):
          patch.object(cli, "MCP_CONFIG_FILE", str(tmp_path / "mcp.json")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
         cli.run_turn("hello", disallowed_tools=cli.DISCOVERED_FULL_TOOL_ROSTER,
-                     restricted=True, mcp={"url": "http://runner/mcp", "token": "t"})
+                     restricted=True, mcp={"url": "http://runner.agents.svc.cluster.local/mcp", "token": "t"})
     assert "--mcp-config" in captured["cmd"], "the fixture must actually write an mcp config"
     assert "--allowedTools" in captured["cmd"]
     allowed = captured["cmd"][captured["cmd"].index("--allowedTools") + 1]
@@ -568,7 +568,7 @@ def test_an_unrestricted_turn_with_mcp_grants_nothing(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(cli, "MCP_CONFIG_FILE", str(tmp_path / "mcp.json")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
-        cli.run_turn("hello", mcp={"url": "http://runner/mcp", "token": "t"})
+        cli.run_turn("hello", mcp={"url": "http://runner.agents.svc.cluster.local/mcp", "token": "t"})
     assert "--mcp-config" in captured["cmd"], "the fixture must actually write an mcp config"
     assert "--allowedTools" not in captured["cmd"]
 
@@ -1285,13 +1285,13 @@ def test_reporter_is_disabled_without_an_activity_block():
 def test_reporter_posts_each_tool_call_with_its_token():
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append((url, payload)) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/tool-activity", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/tool-activity", "token": "tok"})
         reporter.start()
         reporter.report("Bash", {"command": "pytest"})
         reporter.report("Read", {"file_path": "/tmp/f"})
         reporter.close()
 
-    assert [p[0] for p in posted] == ["http://runner/tool-activity"] * 2
+    assert [p[0] for p in posted] == ["http://runner.agents.svc.cluster.local/tool-activity"] * 2
     assert [p[1] for p in posted] == [
         {"token": "tok", "capability": "Bash", "detail": "pytest"},
         {"token": "tok", "capability": "Read", "detail": "/tmp/f"},
@@ -1303,7 +1303,7 @@ def test_reporter_preserves_tool_call_order():
     the end -- a thread per report would race and shuffle them."""
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload["detail"]) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         for i in range(50):
             reporter.report("Bash", {"command": f"step-{i}"})
@@ -1314,7 +1314,7 @@ def test_reporter_preserves_tool_call_order():
 def test_reporter_survives_a_runner_that_is_down():
     """The turn being narrated matters more than the narration."""
     with patch.object(activity, "_post", side_effect=RuntimeError("connection refused")):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report("Bash", {"command": "ls"})
         reporter.close()  # must not raise
@@ -1322,7 +1322,7 @@ def test_reporter_survives_a_runner_that_is_down():
 
 def test_post_returns_false_instead_of_raising_on_a_dead_runner():
     with patch.object(activity.urllib.request, "urlopen", side_effect=OSError("no route")):
-        assert activity._post("http://runner/x", {"token": "t"}) is False
+        assert activity._post("http://runner.agents.svc.cluster.local/x", {"token": "t"}) is False
 
 
 def test_reporter_keeps_narrating_after_one_post_fails():
@@ -1339,7 +1339,7 @@ def test_reporter_keeps_narrating_after_one_post_fails():
         return True
 
     with patch.object(activity, "_post", flaky_post):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report("Bash", {"command": "first"})
         reporter.report("Bash", {"command": "second"})
@@ -1370,7 +1370,7 @@ def test_run_turn_reports_each_tool_use_block(tmp_path):
          patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
         text, _, _ = cli.run_turn(
-            "hello", activity={"url": "http://runner/tool-activity", "token": "tok"})
+            "hello", activity={"url": "http://runner.agents.svc.cluster.local/tool-activity", "token": "tok"})
 
     assert text == "done"
     assert [(p["capability"], p["detail"]) for p in posted] == [
@@ -1426,7 +1426,7 @@ def test_tool_use_is_reported_while_the_session_is_still_running(tmp_path):
          patch.object(activity, "_post", fake_post), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lazy_stream())):
         text, _, _ = cli.run_turn(
-            "hello", activity={"url": "http://runner/x", "token": "tok"})
+            "hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
 
     assert text == "finished"
     assert posted == ["slow-thing"]
@@ -1445,7 +1445,7 @@ def test_a_broken_activity_endpoint_does_not_break_the_turn(tmp_path):
          patch.object(activity.urllib.request, "urlopen", side_effect=OSError("refused")), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
         text, _, session_id = cli.run_turn(
-            "hello", activity={"url": "http://runner/x", "token": "tok"})
+            "hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
 
     assert text == "the answer"
     assert session_id == "sess-1"
@@ -1454,7 +1454,7 @@ def test_a_broken_activity_endpoint_does_not_break_the_turn(tmp_path):
 def test_do_post_passes_activity_through_to_generate():
     handler, sent = _make_handler({
         "conversation_id": "c1", "prompt": "hi", "system": "sys",
-        "activity": {"url": "http://runner/tool-activity", "token": "tok"},
+        "activity": {"url": "http://runner.agents.svc.cluster.local/tool-activity", "token": "tok"},
     })
     captured = {}
 
@@ -1467,7 +1467,7 @@ def test_do_post_passes_activity_through_to_generate():
          patch.object(server, "generate", fake_generate):
         handler.do_POST()
     assert sent["status"] == 200
-    assert captured["activity"] == {"url": "http://runner/tool-activity", "token": "tok"}
+    assert captured["activity"] == {"url": "http://runner.agents.svc.cluster.local/tool-activity", "token": "tok"}
 
 
 def test_do_post_activity_defaults_to_none_when_omitted():
@@ -1813,7 +1813,7 @@ def test_result_text_is_empty_for_a_result_with_no_content():
 def test_report_result_carries_the_output_and_its_correlation_id():
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report_result("Bash", "toolu_1", "hello\n", is_error=False)
         reporter.close()
@@ -1826,7 +1826,7 @@ def test_report_result_carries_the_output_and_its_correlation_id():
 def test_report_result_marks_a_failed_tool_call():
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report_result("Bash", "toolu_9", "command not found", is_error=True)
         reporter.close()
@@ -1838,7 +1838,7 @@ def test_report_result_without_a_correlation_id_is_dropped():
     a second, orphaned chip with no label."""
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report_result("Bash", "", "output", is_error=False)
         reporter.close()
@@ -1865,7 +1865,7 @@ def test_run_turn_pairs_each_tool_result_with_the_call_that_made_it(tmp_path):
          patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
         text, _, _ = cli.run_turn(
-            "hello", activity={"url": "http://runner/x", "token": "tok"})
+            "hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
 
     assert text == "done"
     assert posted == [
@@ -1892,7 +1892,7 @@ def test_run_turn_ignores_a_tool_result_it_never_saw_the_call_for(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
-        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
 
     assert text == "ok"
     assert posted == []
@@ -1916,7 +1916,7 @@ def test_run_turn_reports_a_failed_tool_call_as_an_error(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
-        cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+        cli.run_turn("hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
 
     assert posted[1]["isError"] is True
     assert posted[1]["output"] == "nope: command not found"
@@ -1958,7 +1958,7 @@ def _run_story(tmp_path, posted, **kwargs):
 
 def test_run_turn_streams_each_passage_in_the_order_it_was_written(tmp_path):
     posted = []
-    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    _run_story(tmp_path, posted, activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert [p["capability"] for p in posted] == ["assistant_text", "Bash", "Bash"]
     assert posted[0]["detail"] == "First I look at the pods."
 
@@ -1967,7 +1967,7 @@ def test_run_turn_returns_only_the_closing_passage_as_the_reply(tmp_path):
     """The rest is already in the conversation as narration -- returning the
     join too would print the whole run again inside the reply bubble."""
     posted = []
-    text, _, _ = _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    text, _, _ = _run_story(tmp_path, posted, activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert text == "They are all up."
     assert "First I look at the pods." not in text
 
@@ -1977,7 +1977,7 @@ def test_run_turn_does_not_narrate_the_closing_passage(tmp_path):
     narration as well would show it twice, once in the drawer and once in
     the bubble underneath."""
     posted = []
-    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    _run_story(tmp_path, posted, activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert all(p.get("detail") != "They are all up." for p in posted)
 
 
@@ -2081,7 +2081,7 @@ def test_a_passage_is_streamed_at_every_paragraph_break(tmp_path):
     conversation, so one per token would be thousands of both for one turn."""
     posted = []
     _run_lines(tmp_path, posted, _streamed_narration_lines(),
-               activity={"url": "http://runner/x", "token": "tok"})
+               activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     streamed = [p for p in posted if p["capability"] == "assistant_text"]
     # One flush at the paragraph break inside the first passage, one at the
     # break inside the second, the final whole first passage when it is
@@ -2101,7 +2101,7 @@ def test_every_step_of_one_passage_shares_one_id_and_carries_the_whole_text(tmp_
     which only works if each carries the whole passage rather than a delta."""
     posted = []
     _run_lines(tmp_path, posted, _streamed_narration_lines(),
-               activity={"url": "http://runner/x", "token": "tok"})
+               activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     first = [p for p in posted if p["capability"] == "assistant_text"
              and p.get("toolUseId") == "text-1"]
     assert [p["detail"] for p in first] == [
@@ -2115,7 +2115,7 @@ def test_two_passages_in_one_turn_do_not_share_a_stream_id(tmp_path):
     id built from that index would merge two unrelated passages into one."""
     posted = []
     _run_lines(tmp_path, posted, _streamed_narration_lines(),
-               activity={"url": "http://runner/x", "token": "tok"})
+               activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     ids = {p.get("toolUseId") for p in posted
            if p["capability"] == "assistant_text"}
     assert ids == {"text-1", "text-2"}
@@ -2126,7 +2126,7 @@ def test_the_passage_that_became_the_reply_is_retracted(tmp_path):
     reads his answer twice: once growing in the drawer, once in the bubble."""
     posted = []
     text, _, _ = _run_lines(tmp_path, posted, _streamed_narration_lines(),
-                            activity={"url": "http://runner/x", "token": "tok"})
+                            activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert text == "They are all up.\n\nNothing to do."
     retractions = [p for p in posted if p.get("retracted")]
     assert len(retractions) == 1
@@ -2142,7 +2142,7 @@ def test_a_failed_retraction_says_so(tmp_path):
     posted, logged = [], []
     with patch.object(activity, "log", lambda m: logged.append(m)):
         _run_lines(tmp_path, posted, _streamed_narration_lines(),
-                   activity={"url": "http://runner/x", "token": "tok"},
+                   activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"},
                    post_result=lambda payload: not payload.get("retracted"))
     assert [p for p in posted if p.get("retracted")], "the retraction was still sent"
     assert any("retraction failed" in m and "text-2" in m for m in logged), logged
@@ -2155,7 +2155,7 @@ def test_a_retraction_that_lands_logs_nothing(tmp_path):
     posted, logged = [], []
     with patch.object(activity, "log", lambda m: logged.append(m)):
         _run_lines(tmp_path, posted, _streamed_narration_lines(),
-                   activity={"url": "http://runner/x", "token": "tok"})
+                   activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert not any("retraction failed" in m for m in logged), logged
 
 
@@ -2163,7 +2163,7 @@ def test_the_narration_passage_is_not_retracted(tmp_path):
     """Retracting a passage that stays in the drawer would erase it."""
     posted = []
     _run_lines(tmp_path, posted, _streamed_narration_lines(),
-               activity={"url": "http://runner/x", "token": "tok"})
+               activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert all(p.get("toolUseId") != "text-1"
                for p in posted if p.get("retracted"))
 
@@ -2173,7 +2173,7 @@ def test_the_retraction_survives_the_reporter_being_closed(tmp_path):
     the worker thread, so a queued retraction would be put onto a queue
     nobody drains again -- silently dropped, with the duplication back."""
     posted = []
-    reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+    reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     reporter.start()
     reporter.close()
     with patch.object(activity, "_post",
@@ -2196,7 +2196,7 @@ def test_a_subagents_partials_are_not_streamed(tmp_path):
         {"type": "result", "session_id": "sess-1", "subtype": "success"},
     ]
     text, _, _ = _run_lines(tmp_path, posted, lines,
-                            activity={"url": "http://runner/x", "token": "tok"})
+                            activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert text == "the persona's answer"
     assert all("child thinking" not in str(p.get("detail", "")) for p in posted)
 
@@ -2219,7 +2219,7 @@ def test_a_thinking_block_never_claims_a_stream_id(tmp_path):
         {"type": "result", "session_id": "sess-1", "subtype": "success"},
     ]
     _run_lines(tmp_path, posted, lines,
-               activity={"url": "http://runner/x", "token": "tok"})
+               activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     streamed = [p for p in posted if p["capability"] == "assistant_text"]
     assert streamed[0]["toolUseId"] == "text-1"
     assert all("reasoning" not in p["detail"] for p in streamed)
@@ -2229,7 +2229,7 @@ def test_a_passage_the_cli_never_streamed_still_narrates(tmp_path):
     """An older CLI, or a message whose partials were lost. No stream id, and
     Agora leaves a passage without one exactly as it always rendered."""
     posted = []
-    _run_story(tmp_path, posted, activity={"url": "http://runner/x", "token": "tok"})
+    _run_story(tmp_path, posted, activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     narration = [p for p in posted if p["capability"] == "assistant_text"]
     assert narration[0]["detail"] == "First I look at the pods."
     assert "toolUseId" not in narration[0]
@@ -2248,7 +2248,7 @@ def test_run_turn_keeps_a_lone_passage_intact(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
-        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert text == "just an answer"
     assert posted == []
 
@@ -2269,7 +2269,7 @@ def test_run_turn_falls_back_rather_than_replying_with_nothing(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True), \
          patch.object(cli.subprocess, "Popen", return_value=FakeProc(lines)):
-        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner/x", "token": "tok"})
+        text, _, _ = cli.run_turn("hello", activity={"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
     assert text == "on it"
 
 
@@ -2280,7 +2280,7 @@ def test_report_text_does_not_truncate_a_passage(tmp_path):
     posted = []
     long_passage = "word " * 400
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report_text(long_passage)
         reporter.close()
@@ -2291,7 +2291,7 @@ def test_report_text_does_not_truncate_a_passage(tmp_path):
 def test_report_text_skips_a_blank_passage():
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report_text("   \n  ")
         reporter.close()
@@ -2574,7 +2574,7 @@ def test_write_mcp_config_is_not_world_readable(tmp_path):
 # ordering a background subagent actually produced.
 # ---------------------------------------------------------------------------
 
-ACTIVITY_BLOCK = {"url": "http://runner/tool-activity", "token": "tok"}
+ACTIVITY_BLOCK = {"url": "http://runner.agents.svc.cluster.local/tool-activity", "token": "tok"}
 
 
 def _run_with_reporter(tmp_path, lines):
@@ -2832,7 +2832,7 @@ def test_concurrent_turns_do_not_share_their_mcp_config_path(tmp_path):
     with patch.object(cli, "refresh_window_clear", return_value=True), \
          patch.object(cli, "MCP_CONFIG_FILE", shared), \
          patch.object(cli, "write_mcp_config", side_effect=spy):
-        mcp = {"url": "http://runner/mcp", "token": "t"}
+        mcp = {"url": "http://runner.agents.svc.cluster.local/mcp", "token": "t"}
         _lock_probe(tmp_path, allow_concurrent=True, mcp=mcp)
         _lock_probe(tmp_path, allow_concurrent=True, mcp=mcp)
         _lock_probe(tmp_path, mcp=mcp)
