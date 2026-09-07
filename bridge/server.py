@@ -14,8 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bridge.config import BRIDGE_TOKEN, PORT
 from bridge.log import log
 from bridge.sessions import clear_session_id, get_session_id, set_session_id
+from bridge import cancel as cancel_registry
 from bridge.cli import (
-    ClaudeCliError, UsageLimitError, SESSION_NOT_FOUND, AUTH_EXPIRED,
+    ClaudeCliError, TurnCancelled, UsageLimitError, SESSION_NOT_FOUND, AUTH_EXPIRED,
     DISCOVERED_FULL_TOOL_ROSTER, run_turn,
 )
 
@@ -321,12 +322,45 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         self._send(404, {"error": "not found"})
 
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def _do_cancel(self):
+        """Stop every CLI subprocess answering this conversation.
+
+        Separate from the shutdown drain above and not a replacement for it:
+        the drain protects a turn nobody asked to end, this ends the one the
+        owner is watching go wrong. A conversation with nothing in flight is
+        answered 200 with `cancelled: 0` rather than 404 -- the turn may have
+        finished in the moment between the owner pressing stop and this call
+        arriving, and that is not a failure of anything."""
+        try:
+            payload = self._read_json_body()
+        except (ValueError, json.JSONDecodeError) as e:
+            self._send(400, {"error": str(e)[:300]})
+            return
+        conversation_id = payload.get("conversation_id")
+        if not conversation_id:
+            self._send(400, {"error": "conversation_id is required"})
+            return
+        try:
+            stopped = cancel_registry.cancel(conversation_id)
+        except Exception as e:  # noqa: BLE001 -- a failed cancel must still answer
+            log(f"/cancel failed: {e}")
+            self._send(500, {"error": str(e)[:300]})
+            return
+        self._send(200, {"cancelled": stopped})
+
     def do_POST(self):
-        if self.path != "/generate":
+        if self.path not in ("/generate", "/cancel"):
             self._send(404, {"error": "not found"})
             return
         if BRIDGE_TOKEN and self.headers.get("x-bridge-token") != BRIDGE_TOKEN:
             self._send(401, {"error": "invalid bridge token"})
+            return
+        if self.path == "/cancel":
+            self._do_cancel()
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -379,6 +413,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             finally:
                 _leave_turn()
             self._send(200, {"text": text, "thinking": thinking})
+        except TurnCancelled as e:
+            # 200, not an error status: the caller got exactly what it asked
+            # for. `stopped` is what lets the thread render the word
+            # "stopped" rather than a loader or a red failure, and `text` is
+            # whatever the session had already written -- empty when it was
+            # stopped before it said anything, which the caller renders as a
+            # bare stop rather than as a reply.
+            self._send(200, {"text": e.text, "thinking": e.thinking, "stopped": True})
         except UsageLimitError as e:
             self._send(429, {"error": "usage_limit", "detail": str(e)[:300]})
         except ClaudeCliError as e:

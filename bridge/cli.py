@@ -32,6 +32,7 @@ import time
 
 from bridge.activity import ActivityReporter, result_text
 from bridge.analytics import is_cycle_opening
+from bridge import cancel as cancel_registry
 from bridge import deadline
 from bridge.config import CLAUDE_HOME, CLAUDE_WORKSPACE, CLI_TIMEOUT_SECONDS
 from bridge.log import log
@@ -246,6 +247,27 @@ def write_mcp_config(mcp, path=None):
 class UsageLimitError(Exception):
     """Real, hours-long subscription usage cap -- distinct from a transient
     per-call error. Callers should NOT retry immediately."""
+
+
+class TurnCancelled(Exception):
+    """The owner pressed stop while this turn was running.
+
+    Carries the text the session had already written rather than being a
+    bare signal, for the same reason the timeout path below salvages
+    instead of raising: the process holding those words is the only place
+    they exist, and a stopped turn that had already merged a PR and
+    written a journal entry should not report back as nothing.
+
+    Deliberately not a ClaudeCliError. That one means the CLI failed and
+    every caller turns it into a 502; this means the caller got exactly
+    what it asked for, and server.py answers it with a 200 carrying
+    `stopped: true` so the thread can render "stopped" rather than an
+    error."""
+
+    def __init__(self, text="", thinking=""):
+        super().__init__("turn cancelled")
+        self.text = text
+        self.thinking = thinking
 
 
 class ClaudeCliError(Exception):
@@ -774,6 +796,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # this copy closes immediately.
     stdin_handle = open(input_file) if input_file else None
     timed_out = False
+    cancelled = False
     try:
         proc = subprocess.Popen(
             cmd,
@@ -787,6 +810,10 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     finally:
         if stdin_handle:
             stdin_handle.close()
+    # Tracked from here rather than from the top of the function: there is
+    # nothing to cancel until a process exists, and registering a turn whose
+    # Popen then raised would leave a row nothing ever removes.
+    turn = cancel_registry.register(conversation_id, proc)
 
     text_parts = []
     thinking_parts = []
@@ -1064,7 +1091,14 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
             timed_out = True
             log(f"CLI timed out after {CLI_TIMEOUT_SECONDS}s; "
                 f"salvaging {len(''.join(text_parts))} chars of text")
+        # Read after the wait, not before: cancel() sets this on the Turn at
+        # the moment it signals, and the reader loop above only ends once the
+        # signalled process has closed its stdout. A turn that was cancelled
+        # therefore leaves the loop looking exactly like one that finished
+        # normally, and this flag is the only thing that tells them apart.
+        cancelled = turn.cancelled
     finally:
+        cancel_registry.unregister(turn)
         if proc.stdout:
             proc.stdout.close()
         reporter.close()
@@ -1122,6 +1156,16 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         raw = " ".join(non_json_lines)
         if _detect_auth_expired(raw):
             saw_error = (AUTH_EXPIRED, raw[:300])
+
+    # Read before saw_error, deliberately. A SIGTERM'd CLI can emit an
+    # error_during_execution on its way out, and that block raises -- so
+    # checking cancellation after it would report a stop the owner asked for
+    # as a CLI failure, losing the salvaged text and putting a red error in
+    # the thread instead of the word "stopped".
+    if cancelled:
+        stopped_text = (text_parts[-1].strip() if (reporter.enabled and text_parts)
+                        else "\n".join(text_parts).strip())
+        raise TurnCancelled(stopped_text, "\n\n".join(thinking_parts).strip())
 
     if saw_error is not None:
         kind, detail = saw_error
