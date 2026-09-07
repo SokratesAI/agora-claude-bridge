@@ -609,10 +609,19 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                   if attachments else "")
 
     cmd = ["claude", "-p"]
+    # The prompt is a POSITIONAL argument and it is whatever the owner typed,
+    # so it cannot be appended here: `claude -p --version` runs the flag and
+    # prints a version instead of answering (measured on 2.1.261, this pod),
+    # which is CodeQL py/command-line-injection #6 on this repo. It goes on
+    # the end, behind a literal `--`, which the CLI honours -- `claude -p --
+    # --version` answers about the string (measured the same way). Held in a
+    # variable rather than appended immediately because `--` has to come after
+    # every flag below it, not straight after `-p`.
+    positional = None
     if input_file:
         cmd.extend(["--input-format", "stream-json"])
     else:
-        cmd.append(message)
+        positional = message
     cmd.extend([
         "--output-format", "stream-json",
         "--verbose",
@@ -745,6 +754,10 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         cmd.extend(["--resume", session_id])
     if model:
         cmd.extend(["--model", model])
+
+    # Last, and after every flag: everything past `--` is a positional.
+    if positional is not None:
+        cmd.extend(["--", positional])
 
     log(f"CLI start: session={session_id} model={model} msg={message[:120]!r} "
         f"attachments={len(attachments or [])}")
