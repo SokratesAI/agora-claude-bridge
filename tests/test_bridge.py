@@ -189,7 +189,7 @@ def test_run_turn_passes_system_as_append_system_prompt(tmp_path):
     cmd = captured["cmd"]
     assert cmd[cmd.index("--append-system-prompt") + 1] == "You are Nova."
     # and it must NOT have been smuggled into the user turn as well
-    assert cmd[cmd.index("-p") + 1] == "hello"
+    assert cmd[-2:] == ["--", "hello"]
 
 
 def test_run_turn_still_passes_system_on_a_resumed_turn(tmp_path):
@@ -331,9 +331,38 @@ def test_run_turn_without_attachments_still_passes_the_prompt_as_argv(tmp_path):
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
         cli.run_turn("hello")
     cmd = captured["cmd"]
-    assert cmd[cmd.index("-p") + 1] == "hello"
+    assert cmd[-2:] == ["--", "hello"]
     assert "--input-format" not in cmd
     assert captured["stdin"] is None
+
+
+def test_run_turn_does_not_let_a_prompt_be_read_as_a_flag(tmp_path):
+    """`claude -p --version` prints a version and never answers -- measured on
+    2.1.261 in this pod, and it is CodeQL py/command-line-injection #6. The
+    prompt is whatever the owner typed into a chat, so a message that happens
+    to start with a dash must reach the model as text. `--` is what does it,
+    and it has to sit after every flag rather than after `-p`."""
+    lines = _stream_json_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "session_id": "sess-1", "subtype": "success"},
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc(lines)
+
+    with patch.object(cli, "CLAUDE_HOME", str(tmp_path / "home")), \
+         patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
+         patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+        cli.run_turn("--version", system="You are Nova.", model="claude-opus-5")
+    cmd = captured["cmd"]
+    # The separator is the last thing before the prompt, so no flag added
+    # later can slip in between them and re-expose it.
+    assert cmd[-2:] == ["--", "--version"]
+    # And the flags it could have been mistaken for are all in front of it.
+    assert cmd.index("--") > cmd.index("--model")
+    assert cmd.index("--") > cmd.index("--append-system-prompt")
 
 
 def test_run_turn_deletes_the_input_file_after_the_turn(tmp_path):
