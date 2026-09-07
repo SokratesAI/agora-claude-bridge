@@ -166,7 +166,7 @@ def test_non_strings_pass_through():
 def test_tool_output_is_redacted_on_the_way_out():
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report_result("Read", "toolu_1", CREDENTIALS_FILE, is_error=False)
         reporter.close()
@@ -179,7 +179,7 @@ def test_chip_labels_and_narration_are_redacted_too():
     `curl -H "Authorization: Bearer ..."` is a tool INPUT."""
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
-        reporter = activity.ActivityReporter({"url": "http://runner/x", "token": "tok"})
+        reporter = activity.ActivityReporter({"url": "http://runner.agents.svc.cluster.local/x", "token": "tok"})
         reporter.start()
         reporter.report("Bash", {"command": "gh auth login --with-token ghp_0123456789abcdefghijklmnop"})
         reporter.report_text("I used sk-ant-oat01-AbCdEf0123456789AbCdEf0123456789xyz to authenticate.")
@@ -194,7 +194,7 @@ def test_the_reports_own_auth_token_is_not_redacted():
     posted = []
     with patch.object(activity, "_post", lambda url, payload: posted.append(payload) or True):
         reporter = activity.ActivityReporter(
-            {"url": "http://runner/x", "token": "act_0123456789abcdefghij"})
+            {"url": "http://runner.agents.svc.cluster.local/x", "token": "act_0123456789abcdefghij"})
         reporter.start()
         reporter.report_result("Bash", "toolu_1", "ok", is_error=False)
         reporter.close()
