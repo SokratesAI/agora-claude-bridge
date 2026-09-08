@@ -5,6 +5,7 @@ though cli.run_turn serializes internally (see cli.py) -- request parsing/
 auth/session lookup don't need to wait on each other, only the actual
 subprocess invocation does.
 """
+import hashlib
 import json
 import signal
 import threading
@@ -77,6 +78,92 @@ def install_signal_handlers():
     start_server() (start_server_background would break)."""
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
+
+
+# ---------------------------------------------------------------------------
+# one delivery, one turn
+# ---------------------------------------------------------------------------
+#
+# His report, 2026-09-08: *"you sendt me two output messages that is
+# different, but related the exact same information"* -- and, later the same
+# morning, a block of tool calls running under a reply I had already sent,
+# and a tools drawer that swapped between two runs' steps. All three are one
+# fault: the same turn was delivered to `/generate` twice.
+#
+# `_invocation_lock` in cli.py already stops two turns running at once, but
+# it SERIALISES rather than dedupes -- the second request waits for the
+# first, then runs the whole turn again against the same prompt. From the
+# outside that is one question answered twice, in two different ways,
+# because a model asked the same thing twice does not answer it identically.
+# It also spends a second turn's tokens and a second turn's wall clock.
+#
+# So an identical delivery now JOINS the turn already running instead of
+# starting another: same conversation, same prompt, same attachments. The
+# joiner blocks on the first turn's completion and is handed its answer,
+# which is what the caller would have got had its retry never been sent.
+#
+# **Only while the turn is in flight.** The record is dropped the moment the
+# turn answers, and that boundary is the whole of the design: a delivery
+# arriving after the answer was sent gets a real turn.
+#
+# I wrote it the other way first -- a two-minute memory of finished turns,
+# so a late retry could be answered from the record too -- and the existing
+# suite failed seventeen ways, which was the design telling me something the
+# tests happened to say out loud. Content is not identity. Two deliveries
+# carrying the same sentence are the same delivery only while one of them is
+# still being answered; once an answer exists, an identical sentence is far
+# more likely to be him asking again on purpose (the "ask again" button, or
+# retyping a line) than a retry, and swallowing that is a worse failure than
+# the one this fixes. Agora sends no message id for this endpoint to key on,
+# so in-flight is the only window where sameness can be inferred safely.
+
+_dedupe_lock = threading.Lock()
+_dedupe = {}
+
+
+def _delivery_key(conversation_id, prompt, attachments):
+    """What makes two deliveries the same delivery.
+
+    Attachments are folded in by their JSON, not ignored: the same sentence
+    with a different screenshot under it is a different question, and this
+    endpoint has accepted an image with no caption since the empty-turn fix
+    above.
+    """
+    body = json.dumps([conversation_id, prompt, attachments], sort_keys=True,
+                      default=str)
+    return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+
+
+def _claim_delivery(key):
+    """(entry, mine). `mine` is False when a turn for this key is already
+    running, and the caller should wait on `entry` rather than start one."""
+    with _dedupe_lock:
+        entry = _dedupe.get(key)
+        if entry is not None:
+            return entry, False
+        entry = {"event": threading.Event(), "answer": None}
+        _dedupe[key] = entry
+        return entry, True
+
+
+def _finish_delivery(key, answer):
+    """Release anyone waiting on this turn, and forget it.
+
+    `answer` is the (status, payload) this endpoint is about to send, so a
+    joiner gets the original outcome exactly -- including a 429 or a
+    cancelled turn, both of which are answers to the question asked. It is
+    None when the turn raised something unhandled, and a joiner then gets a
+    503 rather than a fabricated success.
+
+    The entry is dropped either way. Nothing is remembered past the turn:
+    see the note above `_dedupe` for why a memory of finished turns is the
+    wrong shape.
+    """
+    with _dedupe_lock:
+        entry = _dedupe.pop(key, None)
+    if entry is not None:
+        entry["answer"] = answer
+        entry["event"].set()
 
 
 def _enter_turn():
@@ -403,6 +490,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # caller can retry against the replacement pod instead.
                 self._send(503, {"error": "shutting_down"})
                 return
+            # Claimed after the drain check and before any work: a delivery
+            # refused with 503 has not been answered and must not leave a
+            # record saying it was.
+            key = _delivery_key(conversation_id, prompt, attachments)
+            entry, mine = _claim_delivery(key)
+            if not mine:
+                _leave_turn()
+                # No timeout. The wait is exactly as long as the turn the
+                # caller asked for, which is the wait it would have had if
+                # its own request had been the one that ran.
+                entry["event"].wait()
+                status, payload = entry["answer"] or (
+                    503, {"error": "duplicate_turn_failed"})
+                log(f"/generate: joined a turn already running for {conversation_id}")
+                self._send(status, payload)
+                return
+            answer = None
             try:
                 text, thinking = generate(
                     conversation_id, system, prompt, model=model, restricted=restricted,
@@ -410,9 +514,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     attachments=attachments, allow_concurrent=allow_concurrent,
                     persona_id=persona_id,
                 )
+                answer = (200, {"text": text, "thinking": thinking})
+            except TurnCancelled as e:
+                answer = (200, {"text": e.text, "thinking": e.thinking, "stopped": True})
+            except UsageLimitError as e:
+                answer = (429, {"error": "usage_limit", "detail": str(e)[:300]})
+            except ClaudeCliError as e:
+                answer = (502, {"error": "cli_error", "detail": str(e)[:300]})
             finally:
                 _leave_turn()
-            self._send(200, {"text": text, "thinking": thinking})
+                _finish_delivery(key, answer)
+            self._send(*answer)
         except TurnCancelled as e:
             # 200, not an error status: the caller got exactly what it asked
             # for. `stopped` is what lets the thread render the word
