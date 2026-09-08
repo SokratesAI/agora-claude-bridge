@@ -24,7 +24,7 @@ import threading
 
 import pytest
 
-from bridge import deadline, quota
+from bridge import deadline, lifecycle_log, quota
 
 
 LEAKED_MESSAGE = (
@@ -143,3 +143,24 @@ def no_ambient_vault_routing():
         yield
     finally:
         os.environ.update(ambient)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def isolated_lifecycle_log(tmp_path_factory):
+    """Keeps the suite's fake shutdowns out of the live lifecycle ledger.
+
+    Fourth of the same kind as the three above, and the one with the
+    sharpest consequence, because the file it writes to is an instrument
+    for reading the past rather than a cache. `test_bridge.py` drives a
+    real SIGTERM through `start_server` to prove the drain works, so a
+    suite run on the bridge pod appends a `started`/`signal`/`drained`
+    life of its own to `bridge-lifecycle.jsonl` -- measured cycle 1246,
+    which found five such rows in the live file after one run. Those rows
+    are indistinguishable from the real ones, and a `started` injected
+    between a real `signal` and its real `drained` turns a clean shutdown
+    into a reported kill: the tests would manufacture exactly the finding
+    the file exists to make.
+    """
+    path = str(tmp_path_factory.mktemp("lifecycle") / "bridge-lifecycle.jsonl")
+    with patch.object(lifecycle_log, "LIFECYCLE_FILE", path):
+        yield

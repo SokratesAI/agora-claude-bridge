@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bridge.config import BRIDGE_TOKEN, PORT
 from bridge.log import log
+from bridge import lifecycle_log
 from bridge.sessions import clear_session_id, get_session_id, set_session_id
 from bridge import cancel as cancel_registry
 from bridge.cli import (
@@ -70,6 +71,13 @@ def _request_shutdown(signum, _frame):
     global _shutdown_requested
     _shutdown_requested = True
     log(f"received signal {signum}, draining: finishing the in-flight turn, then exiting")
+    # On the PVC, because stdout dies with the Pod and this line is the only
+    # thing that separates "SIGTERM arrived and the drain did not hold" from
+    # "no SIGTERM ever arrived" after the fact. `_in_flight` is read without
+    # the condition's lock on purpose: this runs on the main thread inside a
+    # signal handler, and blocking here to make an int read tidy would stall
+    # the shutdown behind whatever holds that lock.
+    lifecycle_log.record("signal", signal=signum, in_flight=_in_flight)
 
 
 def install_signal_handlers():
@@ -594,6 +602,7 @@ def start_server():
     stays free to notice the flag and do the shutdown."""
     server = ThreadingHTTPServer(("0.0.0.0", PORT), BridgeHandler)
     log(f"agora-claude-bridge listening on :{PORT}")
+    lifecycle_log.record("started", port=PORT)
     serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5},
                                daemon=True)
     serving.start()
@@ -602,9 +611,13 @@ def start_server():
         time.sleep(0.5)
 
     server.shutdown()  # stop accepting; in-flight handler threads keep running
+    drain_started = time.monotonic()
     _await_drain()
     server.server_close()
     log("drain complete, exiting")
+    # Last line written by this process. Its absence between a `signal` row
+    # and the next `started` row is what names a kill that outran the drain.
+    lifecycle_log.record("drained", waited_seconds=round(time.monotonic() - drain_started, 3))
 
 
 def start_server_background():
