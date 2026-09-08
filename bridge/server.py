@@ -117,6 +117,11 @@ def install_signal_handlers():
 # the one this fixes. Agora sends no message id for this endpoint to key on,
 # so in-flight is the only window where sameness can be inferred safely.
 
+# How long an answer whose delivery failed is kept for the retry that is
+# almost certainly coming. Two minutes covers a caller reconnecting and
+# asking again; past that, an identical prompt is him, not a retry.
+DELIVERY_RETRY_SECONDS = 120
+
 _dedupe_lock = threading.Lock()
 _dedupe = {}
 
@@ -136,34 +141,63 @@ def _delivery_key(conversation_id, prompt, attachments):
 
 def _claim_delivery(key):
     """(entry, mine). `mine` is False when a turn for this key is already
-    running, and the caller should wait on `entry` rather than start one."""
+    running -- or has finished with an answer the caller never received --
+    and the caller should wait on `entry` rather than start one."""
+    now = time.time()
     with _dedupe_lock:
+        # Cheap sweep, here rather than on a timer: entries only appear on a
+        # delivery, so a delivery is the only moment one can go stale.
+        for stale in [k for k, e in _dedupe.items()
+                      if e.get("undelivered_at")
+                      and now - e["undelivered_at"] > DELIVERY_RETRY_SECONDS]:
+            del _dedupe[stale]
         entry = _dedupe.get(key)
         if entry is not None:
             return entry, False
-        entry = {"event": threading.Event(), "answer": None}
+        entry = {"event": threading.Event(), "answer": None, "undelivered_at": 0.0}
         _dedupe[key] = entry
         return entry, True
 
 
-def _finish_delivery(key, answer):
-    """Release anyone waiting on this turn, and forget it.
+def _finish_delivery(key, answer, delivered=True):
+    """Release anyone waiting on this turn, and forget it -- unless the
+    answer never reached the caller.
 
-    `answer` is the (status, payload) this endpoint is about to send, so a
-    joiner gets the original outcome exactly -- including a 429 or a
-    cancelled turn, both of which are answers to the question asked. It is
-    None when the turn raised something unhandled, and a joiner then gets a
-    503 rather than a fabricated success.
+    `answer` is the (status, payload) this endpoint sent, so a joiner gets
+    the original outcome exactly -- including a 429 or a cancelled turn,
+    both of which are answers to the question asked. It is None when the
+    turn raised something unhandled, and a joiner then gets a 503 rather
+    than a fabricated success.
 
-    The entry is dropped either way. Nothing is remembered past the turn:
-    see the note above `_dedupe` for why a memory of finished turns is the
-    wrong shape.
+    **`delivered=False` is the redelivery case, and it is the one worth
+    remembering.** Measured from this pod's own log, 2026-09-08:
+
+        [12:20:46] /generate failed: [Errno 32] Broken pipe
+
+    The turn had run to completion; the caller had stopped waiting for it,
+    so writing the response failed. From Agora's side the turn produced
+    nothing, so it delivered the same message again -- and he got two
+    replies to one question, which is exactly what he reported that
+    morning.
+
+    The first version of this shipped an hour earlier and did not cover it:
+    it deduped only while a turn was in flight, on the argument that content
+    is not identity and an identical prompt after an answer is more likely
+    him asking again on purpose. That argument holds when the answer was
+    delivered. A broken pipe says it was not -- so this is not a guess about
+    sameness any more, it is a fact about the connection, and the entry is
+    kept until someone asks for it again or `DELIVERY_RETRY_SECONDS` passes.
     """
     with _dedupe_lock:
-        entry = _dedupe.pop(key, None)
-    if entry is not None:
+        entry = _dedupe.get(key)
+        if entry is None:
+            return
         entry["answer"] = answer
-        entry["event"].set()
+        if delivered or answer is None:
+            del _dedupe[key]
+        else:
+            entry["undelivered_at"] = time.time()
+    entry["event"].set()
 
 
 def _enter_turn():
@@ -507,7 +541,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send(status, payload)
                 return
             answer = None
+            delivered = False
             try:
+              try:
                 text, thinking = generate(
                     conversation_id, system, prompt, model=model, restricted=restricted,
                     stateless=stateless, activity=activity, mcp=mcp,
@@ -515,16 +551,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     persona_id=persona_id,
                 )
                 answer = (200, {"text": text, "thinking": thinking})
-            except TurnCancelled as e:
+              except TurnCancelled as e:
                 answer = (200, {"text": e.text, "thinking": e.thinking, "stopped": True})
-            except UsageLimitError as e:
+              except UsageLimitError as e:
                 answer = (429, {"error": "usage_limit", "detail": str(e)[:300]})
-            except ClaudeCliError as e:
+              except ClaudeCliError as e:
                 answer = (502, {"error": "cli_error", "detail": str(e)[:300]})
-            finally:
+              finally:
                 _leave_turn()
-                _finish_delivery(key, answer)
-            self._send(*answer)
+              self._send(*answer)
+              delivered = True
+            finally:
+                # After the send, not before: whether the caller received the
+                # answer is the whole of what decides whether it is kept. An
+                # unhandled error reaches here with `answer` still None, and
+                # `_finish_delivery` releases the joiner with a 503 rather
+                # than leaving it waiting on a turn that will never finish.
+                _finish_delivery(key, answer, delivered)
         except TurnCancelled as e:
             # 200, not an error status: the caller got exactly what it asked
             # for. `stopped` is what lets the thread render the word

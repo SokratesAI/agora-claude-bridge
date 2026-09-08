@@ -12,6 +12,7 @@ first and then ran the whole turn again, so one question was answered twice
 and, because a model asked the same thing twice does not answer identically,
 answered differently.
 """
+import contextlib
 import json
 import threading
 import time
@@ -56,6 +57,16 @@ def _deliver(payload, results):
 
 
 TURN = {"conversation_id": "conv-1", "prompt": "fix the drawer"}
+
+
+def _post_over_a_dead_socket(payload, results):
+    """One /generate whose response cannot be written -- the caller has
+    stopped waiting. This is the shape behind his duplicate replies."""
+    handler = _FakeHandler("/generate", json.dumps(payload))
+    handler._send = MagicMock(side_effect=BrokenPipeError(32, "Broken pipe"))
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+            patch.object(server, "generate", side_effect=results):
+        handler.do_POST()
 
 
 def test_the_same_question_after_an_answer_is_a_new_turn():
@@ -237,3 +248,73 @@ def test_nothing_is_remembered_once_the_turn_is_over():
     _deliver(TURN, lambda *a, **k: ("the answer", ""))
     with server._dedupe_lock:
         assert server._dedupe == {}, "a finished turn was left in the registry"
+
+
+def test_an_answer_the_caller_never_received_is_kept_for_the_retry():
+    """The case the in-flight window did not cover, and the one he actually
+    hit. From this pod's own log, 2026-09-08:
+
+        [12:20:46] /generate failed: [Errno 32] Broken pipe
+
+    The turn had finished; the caller had stopped waiting, so writing the
+    response failed. Agora saw nothing come back and delivered the same
+    message again -- and he got two replies to one question.
+
+    A broken pipe is not a guess about whether two prompts are "the same
+    question". It is a fact about the connection: this answer was never
+    received, so the delivery that follows it is a retry.
+    """
+    calls = []
+
+    def once(*a, **k):
+        calls.append(a)
+        return ("the answer", "")
+
+    # The 500 the outer handler then tries to send fails on the same dead
+    # socket, which is why the pod's log line is the last word on that turn.
+    with contextlib.suppress(BrokenPipeError):
+        _post_over_a_dead_socket(TURN, once)
+    assert len(calls) == 1
+
+    # The retry Agora sends because it believes it got nothing.
+    second = _deliver(TURN, once)
+    assert second == (200, {"text": "the answer", "thinking": ""}), \
+        "the retry was answered with something other than the turn's own answer"
+    assert len(calls) == 1, "the retry ran the turn a second time"
+
+
+def test_a_kept_answer_is_dropped_once_the_retry_window_passes():
+    """Past the window an identical prompt is him asking again, not a
+    retry -- the same line the in-flight rule draws, one step later."""
+    calls = []
+
+    def counted(*a, **k):
+        calls.append(a)
+        return (f"answer {len(calls)}", "")
+
+    with contextlib.suppress(BrokenPipeError):
+        _post_over_a_dead_socket(TURN, counted)
+
+    with server._dedupe_lock:
+        for entry in server._dedupe.values():
+            entry["undelivered_at"] = time.time() - server.DELIVERY_RETRY_SECONDS - 1
+    second = _deliver(TURN, counted)
+    assert len(calls) == 2, "the same question could never be asked again"
+    assert second == (200, {"text": "answer 2", "thinking": ""})
+
+
+def test_a_delivered_answer_is_still_forgotten_immediately():
+    """The negative control for the pair above: retention is for the failed
+    send and nothing else. A delivered answer must not be replayed, or
+    tapping "ask again" would hand him the previous reply."""
+    calls = []
+
+    def counted(*a, **k):
+        calls.append(a)
+        return (f"answer {len(calls)}", "")
+
+    _deliver(TURN, counted)
+    with server._dedupe_lock:
+        assert server._dedupe == {}, "a delivered turn was kept for replay"
+    assert _deliver(TURN, counted) == (200, {"text": "answer 2", "thinking": ""})
+    assert len(calls) == 2
