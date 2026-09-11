@@ -206,6 +206,38 @@ RUN pip install --no-cache-dir xxhash
 RUN apt-get update && apt-get install -y --no-install-recommends tini \
     && rm -rf /var/lib/apt/lists/*
 
+# Headless Chromium for agora-persona-runner's `tools.see_page` / `tools.poke_page`
+# -- the only way a cycle can check that a page actually paints (idea #248).
+# Until this layer it lived only as 1.2GB of hand-built, untracked bytes in
+# /data/workspace/nova-browser on the workspace volume, which no image carried.
+#
+# Same four pieces `see_page.missing_pieces` checks, laid down natively as root
+# rather than by tools/browser/bootstrap.sh's no-root sysroot: an empty
+# libdirs.txt (the libraries are on the system path), fonts.conf pointing at
+# /usr/share/fonts, playwright-core, and a chromium build under browsers/.
+# The package list is bootstrap.sh's, which stays as the rebuild path for a
+# pod without this layer -- change one and change the other.
+# Owned by uid 10001 (the `bridge` user below) because see_page copies
+# shot.js into the root and writes screenshots under it. Before `COPY bridge/`
+# so a bridge code change does not re-download 1.2GB.
+ENV NOVA_BROWSER_ROOT=/opt/nova-browser
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libnss3 libnspr4 libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+      libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 libdbus-1-3 \
+      libdrm2 libgbm1 libglib2.0-0t64 libxcb1 libxkbcommon0 libexpat1 \
+      fontconfig fonts-dejavu-core libfreetype6 libfontconfig1 fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p "$NOVA_BROWSER_ROOT/fontconf" && cd "$NOVA_BROWSER_ROOT" \
+    && npm init -y >/dev/null \
+    && npm i playwright-core@1.49.1 --no-audit --no-fund \
+    && PLAYWRIGHT_BROWSERS_PATH="$NOVA_BROWSER_ROOT/browsers" PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 \
+       node node_modules/playwright-core/cli.js install chromium \
+    && ls -d browsers/chromium-* \
+    && : > libdirs.txt \
+    && cp /etc/fonts/fonts.conf fontconf/fonts.conf \
+    && rm -rf /root/.npm \
+    && chown -R 10001:10001 "$NOVA_BROWSER_ROOT"
+
 WORKDIR /app
 # No requirements.txt otherwise -- the bridge itself is stdlib-only at runtime.
 COPY bridge/ bridge/
