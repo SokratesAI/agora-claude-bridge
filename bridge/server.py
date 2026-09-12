@@ -314,11 +314,44 @@ def render_prior_turns(history):
     while len(lines) > 1 and sum(len(line) + 2 for line in lines) > PRIOR_TURNS_BUDGET:
         lines.pop(0)
         dropped += 1
+    # My reviewer's first finding, and it is the motivating case rather than a
+    # corner: the loop above stops at one line however large that line is, and
+    # merge_history joins consecutive same-role messages into ONE entry -- so a
+    # `needs_input` question, which is deliberately long and is the whole prior
+    # half of exactly these conversations, can be the single survivor and blow
+    # the budget the comment above promises to keep. Trim the oldest end of the
+    # text itself, for the same reason the loop trims the oldest lines.
+    body = "\n\n".join(lines)
+    truncated = False
+    if len(body) > PRIOR_TURNS_BUDGET:
+        body = body[-PRIOR_TURNS_BUDGET:]
+        truncated = True
     head = ("This conversation already has messages in it that you cannot see -- "
             "this session is starting fresh. Here is what was said before, oldest first.")
     if dropped:
         head += f" The {dropped} oldest message(s) were left out to fit."
-    return head + "\n\n" + "\n\n".join(lines)
+    if truncated:
+        head += " The beginning of what remains was cut off to fit."
+    return head + "\n\n" + body
+
+
+def _hydrate(conversation_id, prompt, history):
+    """`prompt` with the conversation so far in front of it, or `prompt`
+    unchanged when there is nothing to put there. One function because
+    generate() starts a cold session from two places -- no stored id, and the
+    retry after the stored id turned out to point at nothing -- and my reviewer
+    was right that writing the separator out twice is a drift waiting to
+    happen."""
+    prior = render_prior_turns(history)
+    if not prior:
+        return prompt
+    # Counted off the rendered transcript, not off the raw list: a blank entry
+    # is dropped by render_prior_turns and a log line that counted the input
+    # would claim more than the model was actually shown.
+    shown = prior.count("\n\n")
+    log(f"conversation={conversation_id}: no stored session, "
+        f"hydrating the first turn from {shown} prior message(s)")
+    return prior + "\n\n---\n\n" + prompt
 
 
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
@@ -421,13 +454,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     # A cold start is the only time the transcript is worth anything: with a
     # session_id the CLI already holds every one of these turns, and sending
     # them again would be the same words twice.
-    cold_prompt = prompt
-    if not session_id:
-        prior = render_prior_turns(history)
-        if prior:
-            log(f"conversation={conversation_id}: no stored session, "
-                f"hydrating the first turn from {len(history or [])} prior message(s)")
-            cold_prompt = prior + "\n\n---\n\n" + prompt
+    cold_prompt = _hydrate(conversation_id, prompt, history) if not session_id else prompt
 
     try:
         text, thinking, new_session_id = _run_turn_with_auth_retry(
@@ -444,8 +471,7 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
             # Same reason as above, and this is the path that actually loses a
             # long-running chat: the stored id pointed at a session the CLI no
             # longer has, so the retry is every bit as blind as a first turn.
-            retry_prior = render_prior_turns(history)
-            retry_prompt = (retry_prior + "\n\n---\n\n" + prompt) if retry_prior else prompt
+            retry_prompt = _hydrate(conversation_id, prompt, history)
             text, thinking, new_session_id = _run_turn_with_auth_retry(
                 message=retry_prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
                 restricted=restricted,
