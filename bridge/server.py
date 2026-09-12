@@ -272,9 +272,58 @@ def _run_turn_with_auth_retry(**kwargs):
         return run_turn(**kwargs)
 
 
+# How many characters of prior conversation a cold session is handed. There
+# is no cap on the number of turns -- the caller's window is already bounded
+# (agora-persona-runner turns.MAX_HISTORY) and inventing a second bound here
+# would be a number nobody measured. This one exists because the transcript
+# becomes a CLI argv-sized prompt and a conversation that has run for months
+# can be megabytes; it trims from the OLDEST end, so the messages nearest the
+# question survive, and it says in the text that it did.
+PRIOR_TURNS_BUDGET = 60000
+
+
+def render_prior_turns(history):
+    """The conversation so far, as text to prepend to a cold session's first
+    prompt. Returns "" when there is nothing to say.
+
+    Why this exists (filed 2026-09-12): the bridge resumes a stored CLI
+    session per conversation_id, and a conversation whose FIRST message was
+    posted by the runner rather than run through here has no stored session at
+    all -- `needs_input` opens a thread and writes the question with Agora's
+    notify API, so when the owner replies hours later `get_session_id` returns
+    None and the turn starts cold with only his reply as the prompt. He had
+    been asked a question and got an answer from something that could see
+    neither the question nor his own earlier words. `--resume` was doing
+    exactly what it was built to do; nothing had ever supplied the case where
+    there was no session to resume.
+
+    Roles are the caller's (user = the owner, assistant = the persona) and are
+    rendered as labels rather than as real turns on purpose: this is one user
+    message containing a transcript, not a reconstructed session, so it can
+    never be mistaken for something the CLI itself remembers."""
+    lines = []
+    for entry in history or []:
+        content = (entry or {}).get("content") or ""
+        if not content.strip():
+            continue
+        who = "Owner" if (entry or {}).get("role") == "user" else "You"
+        lines.append(f"{who}: {content.strip()}")
+    if not lines:
+        return ""
+    dropped = 0
+    while len(lines) > 1 and sum(len(line) + 2 for line in lines) > PRIOR_TURNS_BUDGET:
+        lines.pop(0)
+        dropped += 1
+    head = ("This conversation already has messages in it that you cannot see -- "
+            "this session is starting fresh. Here is what was said before, oldest first.")
+    if dropped:
+        head += f" The {dropped} oldest message(s) were left out to fit."
+    return head + "\n\n" + "\n\n".join(lines)
+
+
 def generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
              activity=None, mcp=None, attachments=None, allow_concurrent=False,
-             persona_id=""):
+             persona_id="", history=None):
     """One turn for one conversation. The system/persona prompt goes to the
     CLI as --append-system-prompt on every turn, resumed or not (see
     cli.run_turn) -- it reaches the model as an operator instruction rather
@@ -336,6 +385,17 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
     no memory pin, and the CLI's per-working-directory default, which on a
     concurrent slot is a fresh empty directory every turn.
 
+    history (2026-09-12, absent by default): the conversation's earlier
+    messages, oldest first, NOT including this turn's own prompt --
+    [{"role": "user"|"assistant", "content": str}]. Used for one thing and
+    only when it can matter: if there is no stored session to resume, the
+    transcript is prepended to the prompt so the turn is not blind to a
+    conversation it is standing in the middle of. A resumed session already
+    has all of it and is handed none of it. `stateless` is deliberately
+    exempt -- that flag means "carry only what this prompt gives you", which
+    is what Ask and the Evolve steps are for, and hydrating it would undo the
+    thing it was built to do.
+
     allow_concurrent (2026-08-10, off by default): let this turn run
     alongside one already in flight instead of queueing behind the
     process-wide invocation lock. For short turns a caller would rather
@@ -358,10 +418,20 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
 
     session_id = get_session_id(conversation_id)
     disallowed_tools = DISCOVERED_FULL_TOOL_ROSTER if restricted else None
+    # A cold start is the only time the transcript is worth anything: with a
+    # session_id the CLI already holds every one of these turns, and sending
+    # them again would be the same words twice.
+    cold_prompt = prompt
+    if not session_id:
+        prior = render_prior_turns(history)
+        if prior:
+            log(f"conversation={conversation_id}: no stored session, "
+                f"hydrating the first turn from {len(history or [])} prior message(s)")
+            cold_prompt = prior + "\n\n---\n\n" + prompt
 
     try:
         text, thinking, new_session_id = _run_turn_with_auth_retry(
-            message=prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
+            message=cold_prompt, session_id=session_id, model=model, disallowed_tools=disallowed_tools,
             restricted=restricted,
             activity=activity, mcp=mcp, system=system, attachments=attachments,
             allow_concurrent=allow_concurrent, conversation_id=conversation_id,
@@ -371,8 +441,13 @@ def generate(conversation_id, system, prompt, model=None, restricted=False, stat
         if str(e) == SESSION_NOT_FOUND:
             log(f"conversation={conversation_id}: stored session gone, retrying fresh")
             clear_session_id(conversation_id)
+            # Same reason as above, and this is the path that actually loses a
+            # long-running chat: the stored id pointed at a session the CLI no
+            # longer has, so the retry is every bit as blind as a first turn.
+            retry_prior = render_prior_turns(history)
+            retry_prompt = (retry_prior + "\n\n---\n\n" + prompt) if retry_prior else prompt
             text, thinking, new_session_id = _run_turn_with_auth_retry(
-                message=prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
+                message=retry_prompt, session_id=None, model=model, disallowed_tools=disallowed_tools,
                 restricted=restricted,
                 activity=activity, mcp=mcp, system=system, attachments=attachments,
                 allow_concurrent=allow_concurrent, conversation_id=conversation_id,
@@ -525,6 +600,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # returns "" for anything that is not a plain id -- this string
             # becomes a directory name.
             persona_id = payload.get("persona_id") or ""
+            # Earlier messages in this conversation, oldest first, without
+            # this turn's own prompt. Only read when there is no session to
+            # resume -- see generate() and render_prior_turns().
+            history = payload.get("history") or []
 
             if not _enter_turn():
                 # Starting a 45-minute turn on a pod that is already
@@ -556,7 +635,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     conversation_id, system, prompt, model=model, restricted=restricted,
                     stateless=stateless, activity=activity, mcp=mcp,
                     attachments=attachments, allow_concurrent=allow_concurrent,
-                    persona_id=persona_id,
+                    persona_id=persona_id, history=history,
                 )
                 answer = (200, {"text": text, "thinking": thinking})
               except TurnCancelled as e:

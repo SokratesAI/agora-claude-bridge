@@ -1055,7 +1055,7 @@ def test_do_post_passes_restricted_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -1071,7 +1071,7 @@ def test_do_post_restricted_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["restricted"] = restricted
         return "answer", ""
 
@@ -1089,7 +1089,7 @@ def test_do_post_passes_stateless_flag_through_to_generate():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -1105,7 +1105,7 @@ def test_do_post_stateless_defaults_false_when_omitted():
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, stateless=False,
                       mcp=None,
-                      activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["stateless"] = stateless
         return "answer", ""
 
@@ -1488,7 +1488,7 @@ def test_do_post_passes_activity_through_to_generate():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1505,7 +1505,7 @@ def test_do_post_activity_defaults_to_none_when_omitted():
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["activity"] = activity
         return "answer", ""
 
@@ -1521,7 +1521,7 @@ def _capture_generate_attachments(payload):
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["attachments"] = attachments
         captured["prompt"] = prompt
         return "answer", ""
@@ -1628,7 +1628,7 @@ def _capture_generate_allow_concurrent(payload):
     captured = {}
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
-                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id=""):
+                      stateless=False, activity=None, attachments=None, allow_concurrent=False, persona_id="", history=None):
         captured["allow_concurrent"] = allow_concurrent
         return "answer", ""
 
@@ -3343,7 +3343,7 @@ def _capture_generate_persona_id(payload):
 
     def fake_generate(conversation_id, system, prompt, model=None, restricted=False, mcp=None,
                       stateless=False, activity=None, attachments=None, allow_concurrent=False,
-                      persona_id=""):
+                      persona_id="", history=None):
         captured["persona_id"] = persona_id
         return "answer", ""
 
