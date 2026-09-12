@@ -132,3 +132,46 @@ def test_roles_are_labelled_from_the_persona_point_of_view():
     rendered = server.render_prior_turns(PRIOR)
     assert "You: Should I close idea #106?" in rendered
     assert "Owner: What does it cost to keep it open?" in rendered
+
+
+# --- the payload -> generate() wiring, which a mutation walked straight past --
+
+def test_do_post_passes_history_through_to_generate():
+    """Found by mutation: replacing the payload read with a literal `[]` broke
+    nothing in the whole suite, so the route that carries the transcript was
+    pinned at neither end. Every test above calls generate() directly."""
+    from tests.test_bridge import _make_handler
+
+    handler, sent = _make_handler({
+        "conversation_id": "c1", "prompt": "hi",
+        "history": [{"role": "user", "content": "said earlier"}],
+    })
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, **kwargs):
+        captured["history"] = kwargs.get("history")
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    assert sent["status"] == 200
+    assert captured["history"] == [{"role": "user", "content": "said earlier"}]
+
+
+def test_do_post_history_is_empty_when_a_caller_omits_it():
+    """A runner that predates this field gets exactly what it had before."""
+    from tests.test_bridge import _make_handler
+
+    handler, sent = _make_handler({"conversation_id": "c1", "prompt": "hi"})
+    captured = {}
+
+    def fake_generate(conversation_id, system, prompt, **kwargs):
+        captured["history"] = kwargs.get("history")
+        return "answer", ""
+
+    with patch.object(server, "BRIDGE_TOKEN", ""), \
+         patch.object(server, "generate", fake_generate):
+        handler.do_POST()
+    assert sent["status"] == 200
+    assert captured["history"] == []
