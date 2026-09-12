@@ -182,14 +182,22 @@ def test_one_oversized_turn_is_trimmed_too():
     a corner. The drop loop stops at one line however large that line is, and
     the runner's merge_history joins consecutive same-role messages into ONE
     entry -- so a `needs_input` question, deliberately long and the whole prior
-    half of exactly these conversations, can be the single survivor."""
-    rendered = server.render_prior_turns(
-        [{"role": "assistant", "content": "q" * (server.PRIOR_TURNS_BUDGET * 3)}])
+    half of exactly these conversations, can be the single survivor.
+
+    Written the second time round: my first cut filled the turn with one
+    repeated character, so clamping the WRONG end of it passed the test --
+    both ends looked identical. The marker has to sit at one end only."""
+    rendered = server.render_prior_turns([{
+        "role": "assistant",
+        "content": "q" * (server.PRIOR_TURNS_BUDGET * 3) + "THE-NEWEST-WORDS",
+    }])
     assert len(rendered) <= server.PRIOR_TURNS_BUDGET + 500
     assert "cut off to fit" in rendered
     # Trimmed from the oldest end, same as the loop above it -- the text
-    # nearest the question is what survives.
-    assert rendered.rstrip().endswith("q")
+    # nearest the question is what survives, and the opening label is what
+    # goes, so a clamp on the wrong end fails here rather than passing.
+    assert rendered.rstrip().endswith("THE-NEWEST-WORDS")
+    assert "You: q" not in rendered
 
 
 def test_a_transcript_that_fits_is_not_reported_as_cut():
