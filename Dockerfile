@@ -106,7 +106,42 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
 #
 # npm install --prefix on a real v24.20.0 node exits 0 with no engine warning
 # and the installed `claude --version` prints `2.1.261 (Claude Code)`.
-ARG CLAUDE_CODE_VERSION=2.1.261
+#
+# Re-run 2026-09-15 for 2.1.261 -> 2.1.272, same prompt through both input
+# paths again. tools.changelog_watch read 397 entries across the nine releases
+# in that gap and marked three, all of them fixes: 2.1.269 restores Read/Edit/
+# Write calls blocked by a path-scoped deny rule to `permission_denials` in a
+# stream-json result, and 2.1.265 fixes forked skills not streaming their
+# kickoff prompt as progress events, plus non-interactive `-p` sessions
+# resetting the shell working directory at each new user message. Only the
+# last is reachable from here and it is a fix for something this loop
+# actually hits -- a `cd` in one Bash call no longer has to be repeated in
+# the next.
+#
+# The diff: event types, subtypes and content-block types identical on both
+# paths. Top-level keys are a strict superset with no removal -- 2.1.272 adds
+# `wire_tool_inputs` to the `assistant` event and `result_index` to `result`,
+# and neither name appears anywhere in this repo (grep: 0 hits each). Every
+# field cli.py reads was present under the same name on all four captures:
+# `id`/`name`/`input`, `tool_use_id`/`is_error`, `rate_limit_info`,
+# `session_id`.
+#
+# One difference is deliberately NOT a finding, and it is the same shape as
+# the 2.1.261 entry above. The first capture showed 2.1.261 emitting
+# `thinking` blocks and `system/thinking_tokens` events (carrying
+# `estimated_tokens`/`estimated_tokens_delta`) that 2.1.272 did not, which
+# reads as a removal. It is the model: a re-run of 2.1.261 on the same prompt
+# emitted no thinking block either, and three runs of 2.1.272 agreed with it,
+# so the block varies inside one version. cli.py does read `thinking` blocks,
+# which is why this needed a control rather than a shrug.
+#
+# Mutation-checked the same way: dropping `session_id` and `tool_use.input`
+# out of the 2.1.272 capture made the diff report six further differences, so
+# a clean diff here was not guaranteed in advance.
+#
+# npm install --prefix on a real v24.20.0 node exits 0 with no engine warning
+# and the installed `claude --version` prints `2.1.272 (Claude Code)`.
+ARG CLAUDE_CODE_VERSION=2.1.272
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # kubectl -- 2026-08-01 design call: this service should be as capable as
