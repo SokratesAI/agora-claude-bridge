@@ -270,8 +270,28 @@ def test_get_records_the_revision_it_was_served(couch, tmp_path, capsys):
     rev_file = tmp_path / "d.rev"
     code, out, _err = _cli(["get", PATH, "--rev-file", str(rev_file)], capsys)
     assert code == 0
-    assert out == "# Issues\n\n- one\n\n"
+    assert out == "# Issues\n\n- one\n"
     assert rev_file.read_text().strip() == "1-x"
+
+
+def test_a_get_redirected_and_put_back_leaves_the_document_unchanged(
+        couch, tmp_path, capsys):
+    """`get > f; put f` is how every hand-run edit in `prompt.md` works.
+
+    `get` used to hand the document to `print`, which appends a newline the
+    document does not have, so each round trip grew it by one blank line.
+    Three round trips here, because a single one could hide a pad that a
+    later read happened to strip.
+    """
+    body = tmp_path / "live.md"
+    for original in ("# Notes\n\n- one\n", "no final newline"):
+        couch.seed(couch.client, PATH, original)
+        for _ in range(3):
+            _code, out, _err = _cli(["get", PATH], capsys)
+            body.write_text(out, encoding="utf-8")
+            code, _out, _err = _cli(["put", PATH, str(body)], capsys)
+            assert code == 0
+        assert couch.text(PATH) == original
 
 
 def test_a_paired_get_and_put_refuses_to_overwrite_a_writer_in_between(
