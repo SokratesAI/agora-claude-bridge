@@ -1413,7 +1413,13 @@ def _dispatch(argv=None):
             # tombstone (no content, but a live revision) records the
             # revision, because overwriting one has to carry it.
             Path(rev_file).write_text(f"{rev or ABSENT_REV}\n", encoding="utf-8")
-        print(content if content is not None else f"[not found: {argv[1]}]")
+        if content is None:
+            print(f"[not found: {argv[1]}]")
+        else:
+            # The document exactly as stored. `print` added a newline it does
+            # not have, so every `get > f; put f` grew it by a blank line --
+            # comments.md had reached 139 of them by 2026-09-16.
+            sys.stdout.write(content)
     elif cmd == "put":
         if_rev_file, argv = _take_option(argv, "--if-rev-file")
         allow_shrink, argv = _take_flag(argv, "--allow-shrink")
