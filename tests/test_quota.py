@@ -570,9 +570,13 @@ def drive_hook(stdin_text, tmp_path, snapshot):
     return json.loads(printed[0])["hookSpecificOutput"]["additionalContext"]
 
 
-def run_hook(tmp_path, remaining, event, session_id="sess-1", fetched_at=None, resets=""):
+def run_hook(tmp_path, remaining, event, session_id="sess-1", fetched_at=None, resets="",
+             pace=None):
+    tightest = {"window": "five_hour", "remaining_pct": remaining, "resets_at": resets}
+    if pace is not None:
+        tightest["pace"] = pace
     snapshot = {
-        "tightest": {"window": "five_hour", "remaining_pct": remaining, "resets_at": resets},
+        "tightest": tightest,
         "fetched_at": fetched_at if fetched_at is not None else time.time(),
     }
     stdin = json.dumps({"hook_event_name": event, "session_id": session_id})
@@ -634,6 +638,78 @@ def test_a_stale_reading_is_reported_with_its_age_not_suppressed(tmp_path):
     stale = time.time() - (12 * 60)
     out = run_hook(tmp_path, 9.0, "PostToolUse", fetched_at=stale)
     assert "12 min old" in out
+
+
+@pytest.mark.parametrize("pace,expected", [
+    (0.0, True), (0.5, True), (1.0, True), (1.0001, False), (1.5, False),
+    (None, False), ("0.5", False),
+])
+def test_on_budget_is_pace_at_or_under_one_and_nothing_else(pace, expected):
+    """A missing or unreadable pace is not an argument for softening -- it is
+    the absence of one, so the warning keeps the shape it always had."""
+    assert quota_notice.on_budget({"pace": pace}) is expected
+
+
+def test_severity_is_monotone_so_soft_low_sorts_below_hard_low():
+    levels = [quota_notice.severity(0, False), quota_notice.severity(1, True),
+              quota_notice.severity(1, False), quota_notice.severity(2, False),
+              quota_notice.severity(3, False)]
+    assert levels == sorted(levels) and len(set(levels)) == len(levels)
+
+
+def test_a_low_window_on_budget_is_reported_without_ordering_a_wrap_up(tmp_path):
+    """2026-09-16, the reading that produced this: the seven-day window at 10%
+    remaining, pace 0.962, and the reset 10.8 hours out. The budget outlives
+    the window, and telling ~27 cycles to ship nothing but a journal entry
+    would have cost a working day of the loop."""
+    out = run_hook(tmp_path, 10.0, "PostToolUse", pace=0.962)
+    assert out.startswith("QUOTA LOW, ON BUDGET —")
+    assert "10% of your 5-hour Claude quota remains" in out
+    assert "pace 0.96" in out
+    assert "nova/journal/" not in out and "Wrap up now" not in out
+
+
+def test_a_low_window_burning_faster_than_its_clock_still_orders_a_wrap_up(tmp_path):
+    out = run_hook(tmp_path, 10.0, "PostToolUse", pace=1.4)
+    assert out.startswith("QUOTA LOW —")
+    assert "nova/journal/" in out and "reply to the owner" in out
+
+
+def test_a_snapshot_with_no_pace_warns_the_way_it_always_did(tmp_path):
+    out = run_hook(tmp_path, 9.0, "PostToolUse")
+    assert out.startswith("QUOTA LOW —") and "nova/journal/" in out
+
+
+def test_a_soft_low_that_turns_hard_speaks_again_inside_the_same_band(tmp_path):
+    """The dedupe only re-announces when severity rises, and this rise happens
+    without the band moving -- which is the whole reason severity exists."""
+    assert run_hook(tmp_path, 9.0, "PostToolUse", pace=0.8).startswith("QUOTA LOW, ON BUDGET")
+    out = run_hook(tmp_path, 9.0, "PostToolUse", pace=1.6)
+    assert out.startswith("QUOTA LOW —") and "Wrap up now" in out
+    # ...and having gone hard, it does not then repeat itself.
+    assert run_hook(tmp_path, 9.0, "PostToolUse", pace=1.6) is None
+
+
+def test_a_hard_low_does_not_soften_back_when_the_pace_recovers(tmp_path):
+    """Announcements only ever escalate. A session already told to wrap up is
+    not talked back out of it by a pace that dipped under 1.0 for one tick."""
+    assert run_hook(tmp_path, 9.0, "PostToolUse", pace=1.6) is not None
+    assert run_hook(tmp_path, 9.0, "PostToolUse", pace=0.4) is None
+
+
+def test_being_on_budget_never_softens_critical_or_spent(tmp_path):
+    """pace is window-to-date, so it dilutes a burst with whatever was quiet
+    before it. At 4% left that dilution is the difference between finishing
+    and not."""
+    assert run_hook(tmp_path, 4.0, "PostToolUse", pace=0.3).startswith("QUOTA CRITICAL")
+    assert "Wrap up now" in run_hook(tmp_path, 0.0, "PostToolUse", pace=0.3)
+
+
+def test_prompt_submit_reports_the_soft_low_too(tmp_path):
+    """A cycle hears the top-of-turn message once, and it is the one that
+    decides how big the cycle is allowed to be."""
+    out = run_hook(tmp_path, 10.0, "UserPromptSubmit", pace=0.9)
+    assert out.startswith("QUOTA LOW, ON BUDGET —") and "Wrap up now" not in out
 
 
 def test_hook_is_silent_when_there_is_no_snapshot(tmp_path):

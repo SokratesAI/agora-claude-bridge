@@ -56,6 +56,49 @@ STALE_AFTER_SECONDS = 300
 WINDOW_LABELS = {"five_hour": "5-hour", "seven_day": "7-day"}
 
 
+# Break-even, exactly. `pace` is used-share divided by elapsed-share, so
+# `pace <= 1.0` is algebraically the same statement as "what is left of the
+# budget covers what is left of the window at the rate spent so far": with
+# r = 100*pace the spend per unit of elapsed share, the rest of the window
+# costs r*(1-elapsed) and the budget left is 100 - r*elapsed, and those two
+# meet exactly at pace == 1.
+#
+# Without this the band is a percentage and nothing else, and 10% remaining
+# reads identically at hour 1 of a window and at hour 160 of 168. On
+# 2026-09-16 the seven-day window sat at 10% remaining with pace 0.962 and
+# the reset 10.8 hours away -- healthy by every instrument this loop owns,
+# and `tools.quota_runway` said so in as many words -- while every cycle for
+# the rest of that day was being told to start nothing and ship only a
+# journal entry. The threshold was right about the number and wrong about
+# the clock.
+#
+# Only band 1 softens. `pace` is window-to-date, so it dilutes a burst with
+# whatever was quiet before it; at 5% left that dilution is the difference
+# between finishing and not, and there is no margin there to spend on being
+# clever.
+def on_budget(tightest):
+    """True when the window is spending at or under its own clock."""
+    pace = tightest.get("pace")
+    if not isinstance(pace, (int, float)):
+        return False  # no pace, no argument -- warn the way it always did
+    return pace <= 1.0
+
+
+def severity(band, soft):
+    """What has been announced, as one monotone number.
+
+    The band alone cannot carry this. The dedupe only speaks again when the
+    number goes up, and soft-to-hard happens *inside* band 1 -- so a window
+    that starts on budget at 9% and then burns hard would never be allowed
+    to say so.
+    """
+    if band == 0:
+        return 0
+    if band == 1 and soft:
+        return 1
+    return band * 2
+
+
 def band_for(remaining_pct):
     """Which warning band a remaining-percentage falls in. 0 = fine."""
     if remaining_pct <= 0.5:
@@ -89,10 +132,10 @@ def read_state():
         return {}
 
 
-def write_state(session_id, band):
+def write_state(session_id, level):
     try:
         with open(STATE_FILE, "w") as handle:
-            json.dump({"session_id": session_id, "band": band}, handle)
+            json.dump({"session_id": session_id, "level": level}, handle)
     except Exception:
         pass
 
@@ -136,11 +179,18 @@ WRAP_UP = (
 )
 
 
-def message_for(band, report):
+def message_for(band, report, soft=False, pace=None):
     if band >= 3:
         return f"QUOTA SPENT — {report} Further calls will be refused." + WRAP_UP
     if band == 2:
         return f"QUOTA CRITICAL — {report}" + WRAP_UP
+    if band == 1 and soft:
+        return (
+            f"QUOTA LOW, ON BUDGET — {report} The window is spending at or under its "
+            f"own clock (pace {pace:.2f}), so what is left of the budget covers what "
+            "is left of the window at the rate spent so far. Work at normal size; you "
+            "will hear from me again if the pace goes above 1.0."
+        )
     if band == 1:
         return f"QUOTA LOW — {report}" + WRAP_UP
     return f"Quota check: {report}"
@@ -161,22 +211,25 @@ def main():
     if not report:
         return
 
-    band = band_for(snapshot["tightest"]["remaining_pct"])
+    tightest = snapshot["tightest"]
+    band = band_for(tightest["remaining_pct"])
+    soft = band == 1 and on_budget(tightest)
+    level = severity(band, soft)
     state = read_state()
-    # A new session starts with a clean slate: bands announced to the
+    # A new session starts with a clean slate: levels announced to the
     # cycle before this one were heard by a process that no longer exists.
-    announced = state.get("band", 0) if state.get("session_id") == session_id else 0
+    announced = state.get("level", 0) if state.get("session_id") == session_id else 0
 
     if event == "UserPromptSubmit":
-        write_state(session_id, band)
-    elif band > announced:
-        write_state(session_id, band)
+        write_state(session_id, level)
+    elif level > announced:
+        write_state(session_id, level)
     else:
         return
 
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event,
-        "additionalContext": message_for(band, report),
+        "additionalContext": message_for(band, report, soft, tightest.get("pace")),
     }}))
 
 
