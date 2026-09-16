@@ -205,7 +205,7 @@ jobs:
             type=sha,prefix=sha-
       # The container driver, because the docker driver cannot export a
       # cache at all -- `cache-to` below is refused outright without this.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
