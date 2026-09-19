@@ -24,6 +24,7 @@ no upside to async here since we want serialization, not parallelism.
 """
 import json
 import os
+import queue
 import shutil
 import stat
 import subprocess
@@ -562,6 +563,65 @@ def _provision_workspace(workspace):
     return provisioned
 
 
+# How long the reader keeps waiting for the CLI's stdout to close after the
+# CLI itself has exited. Anything the CLI started that inherited that pipe
+# holds it open for as long as it lives, and until then `for line in
+# proc.stdout` never ends: the process is gone, the turn still looks live, and
+# the next message on every conversation waits behind it (idea #303).
+ORPHANED_PIPE_GRACE_SECONDS = 30
+
+
+def _stdout_lines(proc, timeout, state, grace=ORPHANED_PIPE_GRACE_SECONDS, tick=1.0):
+    """Yield the CLI's stdout lines, and stop when it can no longer answer.
+
+    The turn's time limit used to be a `proc.wait(timeout=...)` that ran only
+    after the loop over stdout had ended, which is only once stdout closes. So
+    a CLI that hung without closing it was never killed at the limit, and one
+    that exited while something else held the pipe was never noticed at all.
+    A thread reads the pipe here so this loop can keep a clock: past `timeout`
+    it kills the CLI and sets `state["timed_out"]`; `grace` seconds after the
+    CLI has exited with the pipe still open it sets `state["orphaned"]` and
+    stops reading. The reader thread is left blocked on that pipe and ends
+    when whoever holds it does."""
+    lines = queue.Queue()
+    eof = object()
+
+    def pump():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            lines.put(eof)
+
+    threading.Thread(target=pump, name="cli-stdout", daemon=True).start()
+    deadline = time.monotonic() + timeout
+    exited_at = None
+    while True:
+        if time.monotonic() >= deadline:
+            state["timed_out"] = True
+            proc.kill()
+            return
+        try:
+            item = lines.get(timeout=tick)
+        except queue.Empty:
+            now = time.monotonic()
+            if proc.poll() is None:
+                continue
+            if exited_at is None:
+                exited_at = now
+            elif now - exited_at >= grace:
+                state["orphaned"] = True
+                log(f"CLI exited {grace}s ago and its stdout is still open; "
+                    "something it started holds the pipe, ending the turn")
+                return
+            continue
+        if item is eof:
+            return
+        yield item
+
+
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
                   system=None, attachments=None, slot="", conversation_id="",
                   persona_id="", restricted=False):
@@ -891,7 +951,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
             reporter.report_text(passage, stream_id)
 
     try:
-        for line in proc.stdout:
+        reading = {}
+        for line in _stdout_lines(proc, CLI_TIMEOUT_SECONDS, reading):
             line = line.strip()
             if not line:
                 continue
@@ -1074,6 +1135,9 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                         saw_error = ("error", error_text[:300])
 
         try:
+            if reading.get("timed_out"):
+                proc.wait(timeout=10)
+                raise subprocess.TimeoutExpired(cmd, CLI_TIMEOUT_SECONDS)
             proc.wait(timeout=CLI_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             proc.kill()
