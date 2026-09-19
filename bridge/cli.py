@@ -143,6 +143,19 @@ MCP_SERVER_NAME = "agora"
 BASH_MAX_OUTPUT_LENGTH = 150_000
 TASK_MAX_OUTPUT_LENGTH = 160_000
 
+# How long one WebFetch may run before the CLI gives up on it, in ms. Before
+# 2.1.268 there was no deadline at all, so a server that held the response
+# open hung the call until the turn itself was killed -- no reply and no
+# journal entry, which from outside is a silent cycle (idea #293). 2.1.268
+# added one: 300_000 unless this variable is set, read in the 2.1.272 binary
+# as `Math.min(env, 2147483647)`. Five minutes is a ninth of a 45-minute turn
+# for one call. Measured 2026-09-19 over every WebFetch in the bridge's
+# transcripts, subagents included: 223 calls, median 4.8s, 99th percentile
+# 38s, slowest 72s, none over 120s -- so this cuts no call that has ever
+# finished and still leaves the slowest real one 48s of room. Same override
+# rule as the two above.
+WEBFETCH_DEADLINE_MS = 120_000
+
 # Where a turn carrying attachments writes its stream-json user message.
 # Same directory and same lifecycle as MCP_CONFIG_FILE above, deleted in
 # _run_cli_once's finally. A fixed path is safe because _invocation_lock
@@ -709,14 +722,17 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     if runtime_dir:
         env["XDG_RUNTIME_DIR"] = runtime_dir
     for name, ceiling in (("BASH_MAX_OUTPUT_LENGTH", BASH_MAX_OUTPUT_LENGTH),
-                          ("TASK_MAX_OUTPUT_LENGTH", TASK_MAX_OUTPUT_LENGTH)):
+                          ("TASK_MAX_OUTPUT_LENGTH", TASK_MAX_OUTPUT_LENGTH),
+                          ("CLAUDE_CODE_WEBFETCH_DEADLINE_MS",
+                           WEBFETCH_DEADLINE_MS)):
         if not env.get(name, "").strip():
             env[name] = str(ceiling)
     # Logged because this is the one value here somebody can change from
     # outside the image. An override that took effect and an override that
     # was ignored look identical from anywhere else.
-    log("tool result caps: BASH={} TASK={}".format(
-        env["BASH_MAX_OUTPUT_LENGTH"], env["TASK_MAX_OUTPUT_LENGTH"]))
+    log("tool result caps: BASH={} TASK={} WEBFETCH_DEADLINE_MS={}".format(
+        env["BASH_MAX_OUTPUT_LENGTH"], env["TASK_MAX_OUTPUT_LENGTH"],
+        env["CLAUDE_CODE_WEBFETCH_DEADLINE_MS"]))
 
     # Only a turn that actually carries attachments switches to stdin. The
     # text path is what every Nova cycle and every ordinary chat turn runs,

@@ -3243,10 +3243,20 @@ def test_run_turn_raises_the_bash_and_task_result_caps(tmp_path):
         # after I had merged it.
         os.environ.pop("BASH_MAX_OUTPUT_LENGTH", None)
         os.environ.pop("TASK_MAX_OUTPUT_LENGTH", None)
+        os.environ.pop("CLAUDE_CODE_WEBFETCH_DEADLINE_MS", None)
         cli.run_turn("hello")
     env = captured["env"]
     assert env["BASH_MAX_OUTPUT_LENGTH"] == "150000"
     assert env["TASK_MAX_OUTPUT_LENGTH"] == "160000"
+    assert env["CLAUDE_CODE_WEBFETCH_DEADLINE_MS"] == "120000"
+
+
+def test_webfetch_deadline_is_under_the_cli_default_and_over_every_real_call():
+    """Idea #293. The CLI's own deadline is 300_000 ms (2.1.268+), a ninth
+    of a turn for one call. Lower than that or the variable does nothing
+    worth having; higher than 72s -- the slowest WebFetch in 223 measured
+    on 2026-09-19 -- or it would cut a call that does finish."""
+    assert 72_000 < cli.WEBFETCH_DEADLINE_MS < 300_000
 
 
 def test_result_caps_stay_inside_the_cli_ceiling(tmp_path):
@@ -3279,8 +3289,11 @@ def test_a_result_cap_set_in_the_environment_wins(tmp_path):
          patch.object(cli, "CLAUDE_WORKSPACE", str(tmp_path / "workspace")), \
          patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
         os.environ.pop("TASK_MAX_OUTPUT_LENGTH", None)
+        os.environ["CLAUDE_CODE_WEBFETCH_DEADLINE_MS"] = "0"
         cli.run_turn("hello")
     assert captured["env"]["BASH_MAX_OUTPUT_LENGTH"] == "40000"
+    # "0" is the CLI's own "no deadline", and a real override, not a blank
+    assert captured["env"]["CLAUDE_CODE_WEBFETCH_DEADLINE_MS"] == "0"
     # the one nobody overrode still gets the ceiling
     assert captured["env"]["TASK_MAX_OUTPUT_LENGTH"] == "160000"
 
