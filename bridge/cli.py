@@ -622,6 +622,38 @@ def _stdout_lines(proc, timeout, state, grace=ORPHANED_PIPE_GRACE_SECONDS, tick=
         yield item
 
 
+# Where the CLI binds its cross-session messaging socket. The CLI refuses a
+# socket directory if any directory above it is group- or world-writable
+# without the sticky bit, and on this pod both /tmp and /data are volumes
+# mounted 2777 -- so every session logged `refusing to bind -- cross-session
+# messaging is OFF` and ListAgents answered "No reachable agents." for all of
+# them (measured on 2.1.272). /dev/shm is root-owned and sticky, so a 0700
+# directory under it passes the check.
+MESSAGING_RUNTIME_BASE = "/dev/shm"
+
+
+def _messaging_runtime_dir(base=None):
+    """Return a private 0700 directory for the CLI's XDG_RUNTIME_DIR, or "".
+
+    "" means leave the variable alone: the CLI then keeps messaging off, as
+    it did before, instead of the turn failing.
+    """
+    base = MESSAGING_RUNTIME_BASE if base is None else base
+    path = os.path.join(base, "claude-run-{}".format(os.getuid()))
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            log("messaging runtime dir {} is not ours; messaging stays off".format(path))
+            return ""
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.chmod(path, 0o700)
+    except OSError as exc:
+        log("messaging runtime dir {} unusable ({}); messaging stays off".format(path, exc))
+        return ""
+    return path
+
+
 def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, mcp=None,
                   system=None, attachments=None, slot="", conversation_id="",
                   persona_id="", restricted=False):
@@ -673,6 +705,9 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # while the constant, the comment above and the tests all read 150_000.
     # Measured on 2.1.245 with `claude doctor`: "" prints nothing at all,
     # i.e. unset; "abc" prints `Invalid value "abc" (using default: 30000)`.
+    runtime_dir = _messaging_runtime_dir()
+    if runtime_dir:
+        env["XDG_RUNTIME_DIR"] = runtime_dir
     for name, ceiling in (("BASH_MAX_OUTPUT_LENGTH", BASH_MAX_OUTPUT_LENGTH),
                           ("TASK_MAX_OUTPUT_LENGTH", TASK_MAX_OUTPUT_LENGTH)):
         if not env.get(name, "").strip():
