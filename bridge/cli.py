@@ -461,6 +461,53 @@ def _sweep_stale_slots():
             _git(["worktree", "prune"], os.path.join(CLAUDE_WORKSPACE, repo))
         except Exception as exc:
             log(f"worktree prune failed for {repo}: {type(exc).__name__}: {exc}")
+    _sweep_stale_turn_files(cutoff)
+
+
+def _sweep_stale_turn_files(cutoff):
+    """Drop per-turn files in ~/.claude that a killed turn never removed.
+
+    The same hole as the slot directories above, one directory across:
+    _run_cli_once's `finally` deletes this turn's mcp config, stream-json
+    input and hook settings, and does not run at all when the process is
+    killed. Five leftover `bridge-mcp.config.<slot>.json` were on the PVC
+    on 2026-09-20, four of them stale since early September, and each one
+    holds that turn's bearer token -- inert, because the caller revokes
+    the grant as its own call returns, but a credential-shaped file has no
+    business outliving the turn that wrote it.
+
+    Only the *slotted* names are swept. The three unslotted paths belong
+    to the serialized lane, where `_invocation_lock` guarantees at most
+    one turn in this process, and the next turn rewrites each of them
+    before use -- so an age test on those would be judging a file that is
+    about to be overwritten anyway, and could race a turn this process
+    does not know about.
+
+    Same cutoff as the slot sweep, and for the same reason: a turn is
+    killed at CLI_TIMEOUT_SECONDS, so anything older than that plus a
+    margin cannot belong to a turn still running.
+    """
+    claude_dir = os.path.join(CLAUDE_HOME, ".claude")
+    unslotted = {os.path.basename(p) for p in
+                 (MCP_CONFIG_FILE, CLI_INPUT_FILE, quota.HOOK_SETTINGS_FILE)}
+    # `bridge-mcp.config.json` itself starts with `bridge-mcp.config.`, so
+    # the prefix test alone would sweep the serialized lane's own file.
+    prefixes = tuple(os.path.splitext(n)[0] + "." for n in unslotted)
+    try:
+        names = os.listdir(claude_dir)
+    except OSError:
+        return
+    for name in names:
+        if name in unslotted or not name.startswith(prefixes):
+            continue
+        path = os.path.join(claude_dir, name)
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue
+            os.remove(path)
+        except OSError:
+            continue
+        log(f"swept stale per-turn file: {name}")
 
 
 def _start_point(src):
@@ -1236,6 +1283,19 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
                 os.remove(input_file)
             except OSError as exc:
                 log(f"cli input cleanup failed: {type(exc).__name__}: {exc}")
+        # The third per-turn file, and the only one that was never deleted:
+        # 566 of these had accumulated in ~/.claude by 2026-09-20, one per
+        # concurrent turn since 2026-08-19. It carries no credential -- it
+        # is hook paths and a memory directory -- but it is written fresh
+        # every turn and read only by the CLI this turn started, so it has
+        # exactly the lifecycle of the two above and belongs in the same
+        # finally. A serialized turn's path is the fixed one, which the
+        # next turn rewrites before use, so deleting it is safe there too.
+        if hook_settings:
+            try:
+                os.remove(hook_settings)
+            except OSError as exc:
+                log(f"hook settings cleanup failed: {type(exc).__name__}: {exc}")
         # The shared CLAUDE_WORKSPACE (slot == "") is never torn down --
         # it's the persistent checkout every serialized turn reuses, same
         # as before this existed. Only a concurrent turn's own isolated
