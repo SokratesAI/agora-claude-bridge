@@ -157,14 +157,49 @@ def test_the_suite_never_writes_to_the_live_lifecycle_ledger():
 
     The precondition is asserted first, because without it this passes for
     free the day someone renames CLAUDE_HOME or the file: a test that only
-    checks two strings differ proves nothing about which two."""
+    checks two strings differ proves nothing about which two.
+
+    It asks whether the live ledger *changed*, not whether it exists. The
+    previous version asserted the live path was absent afterwards, and that
+    is a question with a different answer in each of the two places this
+    suite runs. On the bridge pod the file is always there -- the running
+    bridge writes it, that is the whole point of the instrument -- so the
+    test failed on every clean checkout regardless of the fixture. On CI
+    there is no `/data/claude-home` at all, so a broken fixture would send
+    `record` at a path whose directory does not exist, `record` swallows
+    the error by design, nothing is created and the assertion passes. It
+    could not fail for the right reason in the one place it was green.
+
+    So the write has to be observed rather than inferred from an absence,
+    and the positive control is what makes the negative mean anything:
+    the row must land in the redirected file. Without it, "the live ledger
+    did not grow" is also what a `record` that wrote nothing at all looks
+    like."""
     from bridge.config import CLAUDE_HOME
 
     live = os.path.join(CLAUDE_HOME, "bridge-lifecycle.jsonl")
     assert live.startswith("/data/") or CLAUDE_HOME != "/data/claude-home", (
         "the live path this guards is no longer under CLAUDE_HOME")
     assert lifecycle_log.LIFECYCLE_FILE != live
+    before = _ledger_state(live)
+    rows_before = len(lifecycle_log.read())
+
     lifecycle_log.record("started", port=0)
-    assert not os.path.exists(live), (
+
+    rows_after = lifecycle_log.read()
+    assert len(rows_after) == rows_before + 1 and rows_after[-1] == {
+        **rows_after[-1], "event": "started", "port": 0}, (
+        "record() did not land in the redirected ledger, so this test proves "
+        "nothing about where it would have written")
+    assert _ledger_state(live) == before, (
         "a test just wrote a fake life into the ledger a cycle reads to find "
         "out why a real turn was lost")
+
+
+def _ledger_state(path):
+    """(exists, size) -- enough to catch an append, and nothing that varies
+    between two runs of a suite that never touches the file."""
+    try:
+        return True, os.path.getsize(path)
+    except OSError:
+        return False, None
