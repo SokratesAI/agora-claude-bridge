@@ -110,6 +110,9 @@ MCP_CONFIG_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-mcp.config.json")
 # What the runner's MCP server is called on the CLI side. Its tools reach
 # the model as mcp__agora__<tool_name>.
 MCP_SERVER_NAME = "agora"
+# The environment variable the --mcp-config header reads the grant token
+# out of, so the token is never written to disk. See write_mcp_config.
+MCP_TOKEN_ENV = "AGORA_MCP_TOKEN"
 
 # How much of a tool result reaches the model before the CLI cuts it, in
 # characters. Both are the CLI's own ceiling on 2.1.245, measured rather than
@@ -207,9 +210,31 @@ def write_stream_json_input(message, attachments, path=None):
         fh.write(json.dumps(event) + "\n")
     return path
 
-def write_mcp_config(mcp, path=None):
+def write_mcp_config(mcp, path=None, env=None):
     """Render the caller's {"url", "token"} into a --mcp-config file and
     return its path, or "" meaning "run this turn without it".
+
+    The token is NOT written into that file. The config carries the literal
+    string "${AGORA_MCP_TOKEN}" and the token itself is put into `env`, which
+    the caller hands to Popen -- the CLI expands ${VAR} in an --mcp-config
+    header out of its own process environment. That is idea #239: for a month
+    every turn wrote a live bearer token to a file in ~/.claude, and a turn
+    killed before its finally block left it there (five of them were sitting
+    on this pod when Cycle 1914 looked). A token that is never written cannot
+    be left behind.
+
+    Measured on CLI 2.1.272 in this pod, 2026-09-20, against a probe server
+    that logged the Authorization header it actually received:
+
+      * with the variable set, all four requests (server/discover, initialize,
+        notifications/initialized, tools/list) carried the expanded secret;
+      * with the variable UNSET, they carried the literal "${AGORA_MCP_TOKEN}"
+        and `claude -p` still exited 0.
+
+    That second line is why this is safe to ship rather than a new way to
+    kill a turn: a missing variable degrades to the harmless half of the
+    asymmetry below -- the server 401s, the session loses its capability
+    tools, the turn completes. It does not produce invalid JSON.
 
     Every failure mode here returns "" rather than raising, and that is
     the entire job of this function. Measured against CLI 2.1.197 on
@@ -240,18 +265,21 @@ def write_mcp_config(mcp, path=None):
     config = {"mcpServers": {MCP_SERVER_NAME: {
         "type": "http",
         "url": url,
-        "headers": {"Authorization": f"Bearer {token}"},
+        "headers": {"Authorization": "Bearer ${%s}" % MCP_TOKEN_ENV},
     }}}
     path = path or MCP_CONFIG_FILE
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
             json.dump(config, handle)
-        # 600 -- for the length of the turn this file is a live bearer
-        # token for the runner's tool endpoint, so it gets the same
-        # treatment credentials.py gives .credentials.json rather than the
-        # 644 the quota hook's settings file is fine with.
+        # 600 -- the token is no longer in here, but the URL of the tool
+        # endpoint still is, and this file costs nothing to keep private.
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        # Only after the file exists: a caller whose write failed gets ""
+        # and must not also be carrying a token in its environment for a
+        # config that was never passed to the CLI.
+        if env is not None:
+            env[MCP_TOKEN_ENV] = token
         return path
     except Exception as exc:
         log(f"mcp config write failed: {type(exc).__name__}: {exc}")
@@ -888,7 +916,7 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
     # roughly 1.5s in. The only turn that can miss them is one whose first
     # and last action both happen inside that window; a persona cycle runs
     # for tens of minutes and cannot.
-    mcp_config = write_mcp_config(mcp, _slotted(MCP_CONFIG_FILE, slot))
+    mcp_config = write_mcp_config(mcp, _slotted(MCP_CONFIG_FILE, slot), env=env)
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
     if restricted:

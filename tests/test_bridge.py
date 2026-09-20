@@ -2530,7 +2530,9 @@ def test_run_turn_passes_a_strict_mcp_config_when_given_a_block(tmp_path):
     assert captured["config"] == {"mcpServers": {"agora": {
         "type": "http",
         "url": "http://runner.agents.svc:8082/mcp",
-        "headers": {"Authorization": "Bearer tok-abc"},
+        # The token itself is in the CLI's environment, not in this file --
+        # see tests/test_mcp_token_never_hits_disk.py (idea #239).
+        "headers": {"Authorization": "Bearer ${AGORA_MCP_TOKEN}"},
     }}}
 
 
@@ -2544,17 +2546,24 @@ def test_write_mcp_config_is_always_valid_json(tmp_path):
     """The one hazard worth a test of its own. Measured on CLI 2.1.197: an
     unreachable MCP server is harmless (the turn completes, exit 0), but a
     --mcp-config file that is not valid JSON aborts the CLI before the
-    model is called at all. A token carrying a quote or a newline must
+    model is called at all. A URL carrying a quote or a newline must
     therefore never be able to break the file -- which is what building it
-    with json.dump instead of interpolation buys."""
+    with json.dump instead of interpolation buys. The token is no longer
+    written here at all (idea #239), so it can no longer break the file
+    either; it is still passed in, because the env it travels in must not
+    change what lands on disk."""
     path = str(tmp_path / "mcp.json")
+    env = {}
     written = cli.write_mcp_config(
-        {"url": 'http://x/mcp?a="b"', "token": 'tok"with\nnasty\\chars'}, path=path)
+        {"url": 'http://x/mcp?a="b"', "token": 'tok"with\nnasty\\chars'},
+        path=path, env=env)
     assert written == path
     with open(path) as handle:
         config = json.load(handle)  # raises if this ever stops being valid JSON
     server = config["mcpServers"]["agora"]
-    assert server["headers"]["Authorization"] == 'Bearer tok"with\nnasty\\chars'
+    assert server["url"] == 'http://x/mcp?a="b"'
+    assert server["headers"]["Authorization"] == 'Bearer ${AGORA_MCP_TOKEN}'
+    assert env["AGORA_MCP_TOKEN"] == 'tok"with\nnasty\\chars'
 
 
 @pytest.mark.parametrize("block", [
@@ -2853,9 +2862,9 @@ def test_concurrent_turns_do_not_share_their_mcp_config_path(tmp_path):
     paths = []
     real_write = cli.write_mcp_config
 
-    def spy(mcp, path=None):
+    def spy(mcp, path=None, env=None):
         paths.append(path)
-        return real_write(mcp, path)
+        return real_write(mcp, path, env=env)
 
     shared = str(tmp_path / "bridge-mcp.config.json")
     with patch.object(cli, "refresh_window_clear", return_value=True), \
