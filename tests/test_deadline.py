@@ -6,6 +6,7 @@ halves existed only as a silent `raise` before Cycle 82.
 """
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -496,3 +497,57 @@ def test_the_clock_is_running_while_the_turn_is(tmp_path):
 
     assert seen["record"] is not None
     assert seen["record"]["timeout_seconds"] == cli.CLI_TIMEOUT_SECONDS
+
+
+def test_the_suite_never_touches_the_live_turn_clock():
+    """Pins `isolated_turn_deadline` in tests/conftest.py.
+
+    That fixture is the one with the sharpest consequence of the four and
+    it was the only one with nothing pinning it. `cli.run_turn` writes a
+    deadline record on every invocation and `clear()`s it in its finally,
+    so a suite run on the bridge pod with the fixture broken would delete
+    the clock of whatever cycle is running -- and `hooks/deadline_notice`
+    reads exactly that file, so the running cycle would simply stop being
+    told how much of its 45 minutes was left, with nothing to say why.
+    I run this suite on the bridge pod every time I touch this repo.
+
+    Built the way the lifecycle-ledger guard had to be rebuilt: ask
+    whether the live file *changed*, never whether it exists. Its resting
+    state is different in the two places this suite runs -- present on the
+    bridge pod whenever a turn is in flight, absent always on CI -- so an
+    existence check is a different question in each and can only do its
+    job in one. And the positive control comes first: `write` then `clear`
+    have to be seen landing in the redirected path, because "the live
+    clock did not change" is equally what a `write` that wrote nothing
+    anywhere looks like, and both of these functions swallow their own
+    errors by design.
+    """
+    from bridge.config import CLAUDE_HOME
+
+    live = os.path.join(CLAUDE_HOME, "turn-deadline.json")
+    assert live.startswith("/data/") or CLAUDE_HOME != "/data/claude-home", (
+        "the live path this guards is no longer under CLAUDE_HOME")
+    assert deadline.DEADLINE_FILE != live
+    before = _clock_state(live)
+
+    assert deadline.write(60) is True
+    assert os.path.exists(deadline.DEADLINE_FILE), (
+        "write() landed nowhere, so this test proves nothing about where it "
+        "would have landed")
+    deadline.clear()
+    assert not os.path.exists(deadline.DEADLINE_FILE), (
+        "clear() removed nothing, so this test proves nothing about what it "
+        "would have removed")
+
+    assert _clock_state(live) == before, (
+        "a test just wrote or deleted the turn clock a running cycle reads to "
+        "find out how long it has left")
+
+
+def _clock_state(path):
+    """(exists, size) -- enough to catch a write or a delete, and nothing
+    that varies between two runs of a suite that never touches the file."""
+    try:
+        return True, os.path.getsize(path)
+    except OSError:
+        return False, None
