@@ -593,3 +593,45 @@ def test_a_publish_logs_the_free_space_next_to_the_window(tmp_path, monkeypatch)
     publish_costs.build_payload(history_path=str(tmp_path / "none.jsonl"))
     assert any("disk holds 2.0h / 221MB on disk, 21.0GB free" in line
                for line in lines)
+
+
+def test_cycle_row_publishes_the_cli_version(tmp_path, monkeypatch):
+    """The ledger in the vault is the record; the transcripts on the PVC are
+    a window onto the last few hours. A pin roll that moves the median has
+    to be readable off the record months later, not grepped off the PVC."""
+    rows = [
+        {"session": "a", "kind": "cycle", "started_at": "2026-09-15T11:00:00Z",
+         "ended_at": "2026-09-15T11:20:00Z", "duration_seconds": 1200.0,
+         "turns": 60, "subagent_turns": 0, "tool_calls": 33,
+         "weighted_tokens": 900000.0, "models": ["claude-opus-5"],
+         "cli_version": "2.1.272",
+         "input_tokens": 1, "output_tokens": 2,
+         "cache_read_tokens": 3, "cache_write_5m_tokens": 0,
+         "cache_write_1h_tokens": 4},
+    ]
+    monkeypatch.setattr(publish_costs.analytics, "scan", lambda d=None: rows)
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: None)
+    payload = publish_costs.build_payload(
+        history_path=_history(tmp_path, [json.dumps({"at": 1.0, "seven_day": 47.0})]))
+
+    assert payload["cycles"][0]["cliVersion"] == "2.1.272"
+
+
+def test_a_row_scanned_before_this_column_existed_still_publishes(tmp_path, monkeypatch):
+    """Every row already in the vault predates the column, and `merge_cycles`
+    keeps them. A row with no `cli_version` must not take the publish down."""
+    rows = [
+        {"session": "a", "kind": "cycle", "started_at": "2026-08-11T09:00:00Z",
+         "ended_at": "2026-08-11T09:20:00Z", "duration_seconds": 1200.0,
+         "turns": 60, "subagent_turns": 0, "tool_calls": 70,
+         "weighted_tokens": 900000.0, "models": ["claude-opus-5"],
+         "input_tokens": 1, "output_tokens": 2,
+         "cache_read_tokens": 3, "cache_write_5m_tokens": 0,
+         "cache_write_1h_tokens": 4},
+    ]
+    monkeypatch.setattr(publish_costs.analytics, "scan", lambda d=None: rows)
+    monkeypatch.setattr(publish_costs, "read_stored", lambda p=None: None)
+    payload = publish_costs.build_payload(
+        history_path=_history(tmp_path, [json.dumps({"at": 1.0, "seven_day": 47.0})]))
+
+    assert payload["cycles"][0]["cliVersion"] == ""

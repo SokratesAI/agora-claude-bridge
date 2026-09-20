@@ -107,6 +107,11 @@ def _cycle_row(row):
         "toolCalls": row["tool_calls"],
         "weightedTokens": row["weighted_tokens"],
         "models": row["models"],
+        # One more column rather than four: a CLI pin is a cost lever the
+        # loop does not choose for itself, and without it on the row a
+        # step change in the median cannot be told from a step change in
+        # how the loop works.
+        "cliVersion": row.get("cli_version", ""),
     }
 
 
