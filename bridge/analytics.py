@@ -289,6 +289,9 @@ def parse_transcript(path):
     first_ts = last_ts = None
     tool_calls = 0
     subagent_turns = 0
+    # The CLI build this session ran on. Every transcript line carries it,
+    # and a cycle never changes binary mid-session, so the first one wins.
+    cli_version = ""
 
     with open(path, errors="replace") as handle:
         for line in handle:
@@ -311,6 +314,11 @@ def parse_transcript(path):
 
             if record.get("type") == "user" and not opening:
                 opening = _first_user_text(record)
+
+            if not cli_version:
+                version = record.get("version")
+                if isinstance(version, str) and version:
+                    cli_version = version
 
             message = record.get("message")
             if not isinstance(message, dict):
@@ -368,6 +376,13 @@ def parse_transcript(path):
         "subagent_weighted_tokens": 0.0,
         "tool_calls": tool_calls,
         "models": sorted(models),
+        # Read on 2026-09-20: the pin roll from 2.1.261 to 2.1.272 at
+        # 09-15T10Z cut the median cycle's tool calls from 86 to 33 within
+        # the hour, and finding that meant grepping 2,371 transcripts off
+        # the PVC by hand, because the ledger recorded every column of what
+        # a cycle cost and nothing about what it ran on. The transcripts are
+        # a window onto the last few hours; this document is the record.
+        "cli_version": cli_version,
     }
     row.update(totals)
     # Kept on the row because `summarize` cannot re-derive it: the ledger

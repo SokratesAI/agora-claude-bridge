@@ -372,3 +372,42 @@ def test_summarize_reports_delegated_spend_apart_from_the_cycles(tmp_path):
     assert summary["other_sessions"] == 0
     assert summary["subagent_sessions"] == 1
     assert summary["subagent_weighted"] > 0
+
+
+def test_cli_version_is_read_off_the_transcript(tmp_path):
+    """A CLI pin roll is a cost lever the loop does not choose for itself.
+    On 2026-09-15T10Z the pin went 2.1.261 -> 2.1.272 and the median cycle's
+    tool calls fell from 86 to 33 inside the hour; the ledger could not say
+    so, because it carried no column for what the cycle ran on."""
+    path = _write(tmp_path, "s.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE, version="2.1.272"),
+    ])
+
+    assert analytics.parse_transcript(path)["cli_version"] == "2.1.272"
+
+
+def test_cli_version_takes_the_first_one_seen(tmp_path):
+    """A cycle does not change binary mid-session, so a later differing
+    value is the record being odd, not the session upgrading. First wins,
+    and an empty string never displaces a real one."""
+    path = _write(tmp_path, "s.jsonl", [
+        {"type": "queue-operation", "timestamp": "2026-09-15T11:00:00.000Z",
+         "version": ""},
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE, version="2.1.272"),
+        _assistant("msg_b", USAGE, version="2.1.999"),
+    ])
+
+    assert analytics.parse_transcript(path)["cli_version"] == "2.1.272"
+
+
+def test_cli_version_is_empty_when_the_transcript_carries_none(tmp_path):
+    """Best-effort by contract, like every other column here: a transcript
+    with no version line still produces a row."""
+    path = _write(tmp_path, "s.jsonl", [
+        _user("[Automatic heartbeat trigger"),
+        _assistant("msg_a", USAGE),
+    ])
+
+    assert analytics.parse_transcript(path)["cli_version"] == ""
