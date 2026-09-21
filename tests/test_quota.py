@@ -1134,6 +1134,17 @@ def test_a_persona_pin_is_written_into_the_settings_file(tmp_path):
     assert json.load(open(path))["autoMemoryDirectory"] == d
 
 
+def test_both_nova_personas_share_the_cycle_memory_dir():
+    """Agora has two personas named Nova; both must write the one brain a
+    cycle reads (idea #186), and any other persona must still get its own."""
+    for nova in ("08ffac94-7c4a-4506-897f-968c592358cb",
+                 "8972a54d-cafa-4f07-a527-d8686cea51ca"):
+        assert quota.persona_memory_dir(nova) == quota.AUTO_MEMORY_DIR, nova
+    other = quota.persona_memory_dir("b3333cf8-abfa-4ee3-a91b-e57fd40332ed")
+    assert other != quota.AUTO_MEMORY_DIR
+    assert other.endswith("b3333cf8-abfa-4ee3-a91b-e57fd40332ed")
+
+
 def test_server_forwards_persona_id_from_the_request_to_the_turn():
     """The wiring mutation on the HTTP side: the field can be read off the
     payload and then dropped before it reaches run_turn, which every test
