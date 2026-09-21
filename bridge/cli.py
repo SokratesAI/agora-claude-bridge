@@ -897,6 +897,8 @@ def _run_cli_once(message, session_id, model, disallowed_tools, activity=None, m
         _slotted(quota.HOOK_SETTINGS_FILE, slot),
         memory_dir=(quota.AUTO_MEMORY_DIR if is_cycle_opening(message)
                     else quota.persona_memory_dir(persona_id)),
+        advisor_model=(quota.CYCLE_ADVISOR_MODEL if is_cycle_opening(message)
+                       else None),
     )
     if hook_settings:
         cmd.extend(["--settings", hook_settings])

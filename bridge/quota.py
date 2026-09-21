@@ -505,6 +505,17 @@ HOOK_SETTINGS_FILE = os.path.join(CLAUDE_HOME, ".claude", "bridge-hooks.settings
 #    directory. flagSettings still wins, so the pin holds; the reason it has
 #    to live here is precedence, not a refusal.
 AUTO_MEMORY_DIR = os.path.join(CLAUDE_HOME, "nova-memory")
+
+# The model a Nova cycle may consult as a second opinion (idea #246). The CLI
+# reads `advisorModel` from the --settings file and exposes a server-side
+# `advisor` tool the model calls at will; the advisor sees the whole
+# transcript and answers once. Measured Cycle 1979 on CLI 2.1.272, headless,
+# on this pod's subscription login (apiKeySource "none"): Opus advised by Opus
+# ran and caught a planted bug, and the same prompt without the key answered
+# "NO ADVISOR". Opus and not Fable on purpose: the binary says Fable "uses
+# usage credits", which is paid spend and rule 9's line. The CLI also refuses
+# an advisor weaker than the main model, so this is a floor for an Opus loop.
+CYCLE_ADVISOR_MODEL = "opus"
 # Where a chat persona's own memories go. Nova's directory above is a
 # constant because there is exactly one Nova; a persona's is derived from
 # its Agora id, because the whole point of the split is that a note one
@@ -555,7 +566,7 @@ def persona_memory_dir(persona_id):
     return os.path.join(PERSONA_MEMORY_ROOT, str(persona_id))
 
 
-def write_hook_settings(path=None, memory_dir=None):
+def write_hook_settings(path=None, memory_dir=None, advisor_model=None):
     """Generate the --settings file that attaches the bridge's hooks, and
     return its path (or "" if it could not be written, which the caller
     treats as "run without the hooks").
@@ -602,6 +613,11 @@ def write_hook_settings(path=None, memory_dir=None):
     }}
     if memory_dir:
         settings["autoMemoryDirectory"] = memory_dir
+    # Cycles only, same split as the memory pin: an advisor call re-sends the
+    # whole transcript uncached to the advisor model, so it is quota, and his
+    # chat personas were never asked whether they want to spend it.
+    if advisor_model:
+        settings["advisorModel"] = advisor_model
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
