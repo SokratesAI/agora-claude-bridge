@@ -550,6 +550,17 @@ PERSONA_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{2,63}\Z")
 NOVA_PERSONA_ID = os.environ.get(
     "NOVA_PERSONA_ID", "08ffac94-7c4a-4506-897f-968c592358cb"
 )
+# Agora holds a second persona named "Nova" (8972a54d, Sonnet) that the
+# owner talks to in live chat. Pinning only the id above left it writing
+# persona-memory/8972a54d, a store no cycle reads -- 34 files by 2026-09-21,
+# and a cycle's own memory noted "that store is not mine". Every id here
+# resolves to AUTO_MEMORY_DIR. Comma-separated to override.
+NOVA_PERSONA_IDS = frozenset(
+    i.strip() for i in os.environ.get(
+        "NOVA_PERSONA_IDS",
+        NOVA_PERSONA_ID + ",8972a54d-cafa-4f07-a527-d8686cea51ca",
+    ).split(",") if i.strip()
+)
 
 
 def persona_memory_dir(persona_id):
@@ -557,13 +568,13 @@ def persona_memory_dir(persona_id):
     sent no usable id -- which is what a caller that predates this field
     sends, and what a malformed one gets.
 
-    Nova's id resolves to AUTO_MEMORY_DIR, the same directory a cycle gets,
+    Each of Nova's ids resolves to AUTO_MEMORY_DIR, the same directory a cycle gets,
     so a live chat turn and a heartbeat turn write one brain. The id is
     validated first: an unusable id gets nothing, whoever it claims to be.
     """
     if not persona_id or not PERSONA_ID_RE.match(str(persona_id)):
         return ""
-    if str(persona_id) == NOVA_PERSONA_ID:
+    if str(persona_id) in NOVA_PERSONA_IDS:
         return AUTO_MEMORY_DIR
     return os.path.join(PERSONA_MEMORY_ROOT, str(persona_id))
 
