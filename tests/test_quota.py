@@ -766,6 +766,29 @@ def test_hook_settings_omits_the_memory_key_for_a_non_cycle_turn(tmp_path):
     assert "autoMemoryDirectory" not in json.load(open(path))
 
 
+def test_hook_settings_carries_the_advisor_only_when_asked(tmp_path):
+    """idea #246: a cycle gets `advisorModel`, every other turn does not.
+    Asserted against the literal "opus" rather than the constant, because
+    "fable" would also be a valid advisor and is paid usage credits."""
+    path = quota.write_hook_settings(str(tmp_path / "s.json"),
+                                     advisor_model=quota.CYCLE_ADVISOR_MODEL)
+    assert json.load(open(path))["advisorModel"] == "opus"
+    path = quota.write_hook_settings(str(tmp_path / "t.json"))
+    assert "advisorModel" not in json.load(open(path))
+
+
+def test_cli_passes_the_advisor_to_cycles_only():
+    """The wiring mutation for the advisor: the call site must name it and
+    gate it on `is_cycle_opening`, so a chat persona never gets one."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "bridge", "cli.py")).read()
+    call = src[src.index("hook_settings = write_hook_settings("):]
+    call = call[:call.index("\n    )") + 6]
+    adv = call[call.index("advisor_model="):]
+    assert "quota.CYCLE_ADVISOR_MODEL if is_cycle_opening(message)" in adv
+    assert "else None" in adv
+
+
 def test_cli_passes_the_memory_pin_per_identity():
     """The wiring mutation, which is the first one to run on a change whose
     whole content is "call X from Y": deleting the argument at the call site
@@ -789,7 +812,11 @@ def test_cli_passes_the_memory_pin_per_identity():
     # shared one -- a pin computed from anything else would be the
     # cross-contamination this whole split exists to prevent, renamed.
     assert "quota.persona_memory_dir(persona_id)" in call
-    assert "else None" not in call
+    # Scoped to the memory_dir argument alone, so the advisor argument's own
+    # `else None` beside it cannot mask or trip this, in either order.
+    mem = call[call.index("memory_dir="):]
+    mem = mem[:mem.index("),") + 2]
+    assert "else None" not in mem
 
 
 def test_auto_memory_directory_does_not_move_with_the_workspace(tmp_path):
