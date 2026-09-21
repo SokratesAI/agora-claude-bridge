@@ -812,7 +812,11 @@ def test_cli_passes_the_memory_pin_per_identity():
     # shared one -- a pin computed from anything else would be the
     # cross-contamination this whole split exists to prevent, renamed.
     assert "quota.persona_memory_dir(persona_id)" in call
-    assert "else None" not in call[:call.index("advisor_model=")]
+    # Scoped to the memory_dir argument alone, so the advisor argument's own
+    # `else None` beside it cannot mask or trip this, in either order.
+    mem = call[call.index("memory_dir="):]
+    mem = mem[:mem.index("),") + 2]
+    assert "else None" not in mem
 
 
 def test_auto_memory_directory_does_not_move_with_the_workspace(tmp_path):

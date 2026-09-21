@@ -514,7 +514,9 @@ AUTO_MEMORY_DIR = os.path.join(CLAUDE_HOME, "nova-memory")
 # ran and caught a planted bug, and the same prompt without the key answered
 # "NO ADVISOR". Opus and not Fable on purpose: the binary says Fable "uses
 # usage credits", which is paid spend and rule 9's line. The CLI also refuses
-# an advisor weaker than the main model, so this is a floor for an Opus loop.
+# an advisor weaker than the main model; measured the same cycle with sonnet
+# advised by haiku, the turn still completes and the tool is simply absent, so
+# a cycle moved to a stronger model loses the advisor rather than failing.
 CYCLE_ADVISOR_MODEL = "opus"
 # Where a chat persona's own memories go. Nova's directory above is a
 # constant because there is exactly one Nova; a persona's is derived from
