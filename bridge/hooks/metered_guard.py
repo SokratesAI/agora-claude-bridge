@@ -70,6 +70,7 @@ the call is already a metered persona running, which is a spend this hook
 was never the thing standing in front of.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -129,8 +130,14 @@ def resolve_persona(persona_id, opener=None):
     """
     opener = opener or urllib.request.urlopen
     url = PERSONA_URL.format(id=persona_id)
+    # Carry the agent token when the pod holds one, so this lookup survives
+    # Agora refusing untokened reads on :8080 (issue #287). Without it the
+    # guard would refuse every persona-addressed create once the lock lands.
+    token = os.environ.get("AGORA_TOKEN", "")
+    request = urllib.request.Request(
+        url, headers={"x-agora-token": token} if token else {})
     try:
-        with opener(url, timeout=LOOKUP_TIMEOUT) as response:
+        with opener(request, timeout=LOOKUP_TIMEOUT) as response:
             body = json.load(response)
     except Exception as exc:
         return "", f"{type(exc).__name__}: {exc}"
