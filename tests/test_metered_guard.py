@@ -189,3 +189,30 @@ def test_the_guard_is_actually_registered(tmp_path):
     for event in ("UserPromptSubmit", "PostToolUse"):
         attached = " ".join(h["command"] for h in hooks[event][0]["hooks"])
         assert quota.METERED_GUARD_SCRIPT not in attached
+
+
+def test_the_persona_lookup_carries_the_agent_token(monkeypatch):
+    """Agora is to refuse an untokened read on :8080 (issue #287); without
+    the token this lookup fails and the guard refuses every persona-addressed
+    create, metered or not."""
+    monkeypatch.setenv("AGORA_TOKEN", "tok")
+    seen = []
+
+    def open_it(request, timeout=None):
+        seen.append(request)
+        return _Answer({"persona": {"id": "p-2", "model": "claude-cli:claude-sonnet-5"}})
+
+    assert metered_guard.resolve_persona("p-2", opener=open_it) == ("claude-cli:claude-sonnet-5", "")
+    assert seen[0].get_header("X-agora-token") == "tok"
+
+
+def test_the_persona_lookup_sends_no_token_header_when_the_pod_holds_none(monkeypatch):
+    monkeypatch.delenv("AGORA_TOKEN", raising=False)
+    seen = []
+
+    def open_it(request, timeout=None):
+        seen.append(request)
+        return _Answer({"persona": {"id": "p-2", "model": "claude-cli:claude-sonnet-5"}})
+
+    metered_guard.resolve_persona("p-2", opener=open_it)
+    assert seen[0].get_header("X-agora-token") is None
